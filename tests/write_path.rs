@@ -200,16 +200,19 @@ fn embedding_similarity_only_creates_similar_edges() {
 
 #[test]
 fn weak_lexical_guards_keep_entities_separate() {
-    for (a, b) in [
-        ("Paris TX", "Paris"),
-        ("API v1", "API v2"),
-        ("mother", "guardian"),
+    // ER-07: near names never merge silently (entities stay separate); a
+    // blocked or cosine-unsure par surfaces the candidate, a far name is a
+    // plain new entity.
+    for (a, b, want) in [
+        ("Paris TX", "Paris", "ambiguous"), // near, cosine disagrees
+        ("API v1", "API v2", "ambiguous"),  // digits blocker
+        ("mother", "guardian", "new"),      // far below the near tier
     ] {
         // Longer keys first so "Paris TX" is not shadowed by "Paris".
         let engine = engine_with(Arc::new(MapEmbedder::new(vec![(a, axis(0)), (b, axis(1))])));
         let first = remember(&engine, "first note", vec![named(a)], vec![]);
         let second = remember(&engine, "second note", vec![named(b)], vec![]);
-        assert_eq!(second.entities[0].status, "new", "{a} vs {b}");
+        assert_eq!(second.entities[0].status, want, "{a} vs {b}");
         assert_ne!(second.entities[0].id, first.entities[0].id, "{a} vs {b}");
         assert_eq!(
             count(&engine, "SELECT count(*) FROM entities"),

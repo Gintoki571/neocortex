@@ -215,6 +215,13 @@ history.
 ## How names and phrases resolve
 
 - Same name, different type: two entity rows (casing folds), one per type.
+- Typos, diacritic spellings and other scripts: names are compared on a
+  transliteration key that is never stored ("Мюллер", "Müller", "Mueller" key
+  to the same string). A near name that passes the hard blockers and the
+  entity-cosine check joins the existing card with `near` status ("Bergn" for
+  "Bergen"); a lookalike that hits a blocker stays a separate card and is
+  reported as `ambiguous` with the candidate, never silently merged
+  ("Alex"/"Alexis", "Room 101"/"Room 102", "Teresa Mota"/"Teresa Moura").
 - Same name + conflicting description: the match keeps `ambiguous` status with
   a ranked candidate; neocortex never pastes one description over the other.
 - Same name among homonyms: a typed mention of a single match is a normal

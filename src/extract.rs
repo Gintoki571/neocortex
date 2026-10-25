@@ -367,7 +367,11 @@ pub fn is_status_word(word: &str) -> bool {
 fn is_all_caps_status_word(name: &str) -> bool {
     name.split_whitespace().any(|word| {
         is_status_word(word)
-            || (word.chars().count() >= 5
+            // The >= 5 catch rejects English status shouts (MERGED, BUILD);
+            // other cased scripts have no English status words, so their
+            // all-caps names (ЕВРОПА, МОСКВА) are kept.
+            || (word.is_ascii()
+                && word.chars().count() >= 5
                 && word.chars().all(|c| !c.is_lowercase())
                 && !word.chars().any(|c| c.is_ascii_digit()))
     })
@@ -475,13 +479,23 @@ fn has_inner_capital_or_digit(word: &str) -> bool {
 
 fn is_acronym(word: &str) -> bool {
     let count = word.chars().count();
-    (2..=6).contains(&count)
-        && word.chars().all(|c| c.is_ascii_uppercase())
-        && !is_status_word(word)
+    (2..=6).contains(&count) && word.chars().all(|c| c.is_uppercase()) && !is_status_word(word)
 }
 
 fn is_single_capital_letter(word: &str) -> bool {
-    word.chars().count() == 1 && word.chars().next().unwrap().is_ascii_uppercase()
+    word.chars().count() == 1 && word.chars().next().unwrap().is_uppercase()
+}
+
+/// Non-ASCII title-case word (Latin with diacritics, Greek, Cyrillic,
+/// Armenian): a borrowed name the stopword/openers lists cannot contain, so
+/// sentence position alone must not reject it. Caseless scripts (CJK, Arabic)
+/// stay a documented limit - they carry no capitalisation to detect.
+fn is_foreign_title_case(word: &str) -> bool {
+    let cs: Vec<char> = word.chars().collect();
+    cs.len() >= 2
+        && cs[0].is_uppercase()
+        && cs[1..].iter().all(|c| !c.is_uppercase())
+        && cs.iter().any(|c| !c.is_ascii())
 }
 
 fn word_candidates(text: &str, consumed: &[(usize, usize)]) -> Vec<Candidate> {
@@ -560,9 +574,13 @@ fn word_candidates(text: &str, consumed: &[(usize, usize)]) -> Vec<Candidate> {
             // the same word also appears capitalised NOT at a sentence start elsewhere in the text,
             // or it has an inner capital/digit (ReMem, PostgreSQL, k8s),
             // or it is an acronym (SQL, MCP, CPU).
+            // Non-ASCII title-case words (Ålesund, Москва, Νίκος) are kept: the
+            // stopword/openers lexicons are English, so position is their only
+            // English-word signal.
             let keep = if is_sentence_start(text, w.start) {
                 is_acronym(w.text)
                     || has_inner_capital_or_digit(w.text)
+                    || is_foreign_title_case(w.text)
                     || appears_capitalised_not_at_sentence_start(text, w.text)
             } else {
                 true
@@ -895,6 +913,53 @@ mod tests {
                 c.iter().all(|x| norm_name(&x.name) != n),
                 "{bad:?} leaked into {c:#?}"
             );
+        }
+    }
+
+    // S-03: cased scripts beyond plain ASCII-Latin must yield entities.
+    #[test]
+    fn heuristic_entities_yields_non_english_names() {
+        for (text, kept, rejected) in [
+            // Sentence-initial and mid-sentence Cyrillic names.
+            ("Мюллер позвонил Астрид.", &["Мюллер", "Астрид"][..], &[]),
+            (
+                "Борис Жуков приехал в Москву.",
+                &["Борис Жуков", "Москву"][..],
+                &[],
+            ),
+            // Greek: tonos on alpha, sentence-initial and mid-sentence.
+            ("Νίκος μένει στην Αθήνα.", &["Νίκος", "Αθήνα"][..], &[]),
+            // Armenian sentence-initial.
+            ("Արամ ապրում է Երևանում.", &["Արամ"][..], &[]),
+            // Latin with diacritics.
+            ("Ålesund er vakker.", &["Ålesund"][..], &[]),
+            ("Zoë werkt in Łódź.", &["Zoë", "Łódź"][..], &[]),
+        ] {
+            let cands = heuristic_entities(text);
+            let names: Vec<&str> = cands.iter().map(|c| c.name.as_str()).collect();
+            for want in kept {
+                assert!(
+                    names.iter().any(|n| n == want),
+                    "{want:?} missing from {names:?} in {text:?}"
+                );
+            }
+            for bad in rejected {
+                assert!(!names.contains(bad), "{bad:?} present in {names:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn heuristic_entities_keeps_all_caps_non_english_names() {
+        // All-caps Cyrillic/Greek names are not English status shouts.
+        let cands = heuristic_entities("ЕВРОПА продала ПОРТ.");
+        let names: Vec<&str> = cands.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"ЕВРОПА"), "got {names:?}");
+        // English all-caps status words stay rejected.
+        let cands = heuristic_entities("PRINT MERGED STATUS BUILD42");
+        let names: Vec<&str> = cands.iter().map(|c| c.name.as_str()).collect();
+        for bad in ["MERGED", "STATUS", "PRINT"] {
+            assert!(!names.contains(&bad), "{bad:?} present in {names:?}");
         }
     }
 

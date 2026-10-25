@@ -50,6 +50,17 @@ fn push_ascii(out: &mut String, c: char) {
         'œ' => "oe",
         'þ' => "th",
         'ð' => "d",
+        // Greek: strip tonos/dialytika accents, final sigma -> sigma.
+        'ά' | 'ά' => "α",
+        'έ' | 'έ' => "ε",
+        'ή' | 'ή' => "η",
+        'ί' | 'ί' | 'ΐ' | 'ϊ' => "ι",
+        'ό' | 'ό' => "ο",
+        'ύ' | 'ύ' | 'ΰ' | 'ϋ' => "υ",
+        'ώ' | 'ώ' => "ω",
+        'ς' => "σ",
+        // Cyrillic: ё folds to е (Иосиф/Иóсиф-style spelling variants).
+        'ё' => "е",
         _ => {
             out.push(c);
             return;
@@ -251,6 +262,150 @@ pub fn trigram_jaccard(a: &str, b: &str) -> f64 {
         return 1.0;
     }
     a.intersection(&b).count() as f64 / union as f64
+}
+
+/// Near-name comparison key (ER-07): the normalised name passed through a
+/// transliteration table. Applied only when comparing two candidates, never
+/// to stored names ("Mueller" and "Müller" both key to "muller"). Cyrillic
+/// maps to basic Latin, German umlaut digraphs collapse (ue/oe/ae), and
+/// common Slavic surname endings unify (-sky/-ski, -ov/-ow).
+pub fn translit_norm(s: &str) -> String {
+    fn cyr(c: char) -> Option<&'static str> {
+        Some(match c {
+            'а' => "a",
+            'б' => "b",
+            'в' => "v",
+            'г' => "g",
+            'д' => "d",
+            'е' => "e",
+            'ё' => "e",
+            'ж' => "zh",
+            'з' => "z",
+            'и' => "i",
+            'й' => "y",
+            'к' => "k",
+            'л' => "l",
+            'м' => "m",
+            'н' => "n",
+            'о' => "o",
+            'п' => "p",
+            'р' => "r",
+            'с' => "s",
+            'т' => "t",
+            'у' => "u",
+            'ф' => "f",
+            'х' => "h",
+            'ц' => "ts",
+            'ч' => "ch",
+            'ш' => "sh",
+            'щ' => "shch",
+            'ы' => "y",
+            'э' => "e",
+            // ю as "yu" breaks Мюллер/Müller; the German loan is the common case.
+            'ю' => "u",
+            'я' => "ya",
+            'і' => "i",
+            'ї' => "yi",
+            'є' => "e",
+            'ґ' => "g",
+            'ў' => "u",
+            'ј' => "j",
+            'љ' => "lj",
+            'њ' => "nj",
+            'ћ' => "c",
+            'ђ' => "dj",
+            'џ' => "dz",
+            // Hard/soft sign drop out of basic transliteration.
+            'ъ' | 'ь' => "",
+            _ => return None,
+        })
+    }
+    let mapped: String = fold(s)
+        .chars()
+        .map(|c| match c {
+            c if c.is_ascii() => c.to_string(),
+            'ъ' | 'ь' => String::new(),
+            _ => cyr(c).map(str::to_string).unwrap_or_else(|| c.to_string()),
+        })
+        .collect();
+    let mut flattened = mapped;
+    for (from, to) in [("ue", "u"), ("oe", "o"), ("ae", "a")] {
+        flattened = flattened.replace(from, to);
+    }
+    flattened
+        .split_whitespace()
+        .map(slavic_ending)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Slavic surname ending unified per token: -ky/-ski, -w endings (-ow -> -ov).
+fn slavic_ending(token: &str) -> String {
+    if token.chars().count() > 2 && token.ends_with("ky") {
+        return format!("{}i", &token[..token.len() - 1]);
+    }
+    if token.chars().count() > 2 && token.ends_with("ow") {
+        return format!("{}v", &token[..token.len() - 1]);
+    }
+    token.to_string()
+}
+
+/// ER-07 hard blockers: a pair of normalised names that merely look alike but
+/// must not merge. Any differing digit run ("Room 101"/"Room 102", "Widget
+/// v1"/"v2"), any label under 4 letters, a single-token prefix extension with
+/// a tail of >= 2 letters ("Alex"/"Alexis"), and multi-token names whose
+/// differing tokens are both >= 4 chars and themselves not near ("Teresa Mota"
+/// and "Teresa Moura" stay separate; token floor matches the REL-19 near
+/// tier).
+pub fn name_blocker(a: &str, b: &str) -> Option<&'static str> {
+    let digit_runs = |s: &str| -> Vec<String> {
+        let mut runs = Vec::new();
+        for word in s.split_whitespace() {
+            let run: String = word.chars().filter(|c| c.is_ascii_digit()).collect();
+            if !run.is_empty() {
+                runs.push(run);
+            }
+        }
+        runs
+    };
+    let (da, db) = (digit_runs(a), digit_runs(b));
+    if !da.is_empty() && !db.is_empty() && da != db {
+        return Some("digits");
+    }
+    if a.chars().count() < 4 || b.chars().count() < 4 {
+        return Some("short");
+    }
+    // A single-token sibling that extends the other as a strict prefix by a
+    // tail of >= 2 letters is a different name, not a typo ("Alex"/"Alexis").
+    // One-char tails stay merge-eligible: trailing typo variants grow by a
+    // single letter ("Kristen Odegaard"/"Odegaardt").
+    if !a.contains(' ') && !b.contains(' ') {
+        let (shorter, longer) = if a.chars().count() <= b.chars().count() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        if longer.starts_with(shorter) && longer.chars().count() - shorter.chars().count() >= 2 {
+            return Some("extension");
+        }
+    }
+    let only = |x: &str, y: &str| -> Vec<String> {
+        let tx: std::collections::HashSet<&str> = x.split_whitespace().collect();
+        let ty: std::collections::HashSet<&str> = y.split_whitespace().collect();
+        tx.difference(&ty).map(|t| (*t).to_string()).collect()
+    };
+    let (only_a, only_b) = (only(a, b), only(b, a));
+    if only_a.len() == 1 && only_b.len() == 1 {
+        let x = &only_a[0];
+        let y = &only_b[0];
+        if x.chars().count() >= 4
+            && y.chars().count() >= 4
+            && jaro_winkler(&translit_norm(x), &translit_norm(y)) < 0.85
+        {
+            return Some("tokens");
+        }
+    }
+    None
 }
 
 /// Uppercase initials of a multi-token name ("New York City" -> "NYC");
@@ -894,6 +1049,80 @@ mod regression_tests {
             ("lives in", "live in"),
         ] {
             assert_eq!(norm_predicate(p), k, "{p}");
+        }
+    }
+
+    #[test]
+    fn fold_strips_greek_accent_and_final_sigma() {
+        // σ is the plain sigma the fold emits; never a final sigma (U+03C2).
+        assert_eq!(fold("Νίκος"), "νικοσ");
+        assert_eq!(fold("Νικος"), "νικοσ");
+        assert_eq!(fold("Νίκος"), fold("Νικος"));
+        assert_eq!(fold("Οδυσσέας"), "οδυσσεασ");
+        assert_eq!(fold("festívál"), "festival");
+        // é keyed in from the old table still holds.
+        assert_eq!(fold("Möbius"), "mobius");
+    }
+
+    #[test]
+    fn translit_norm_maps_cyrillic_german_and_slavic_endings() {
+        for (a, b) in [
+            ("Москва", "Moskva"),
+            ("Мюллер", "Müller"),
+            ("Kowalski", "Kowalsky"),
+            ("Novák", "Novak"),
+        ] {
+            let (ka, kb) = (translit_norm(a), translit_norm(b));
+            assert_eq!(ka, kb, "keys of {a:?} and {b:?}");
+            assert_eq!(jaro_winkler(&ka, &kb), 1.0);
+        }
+        // Spelling variants whose keys differ may stay near, never far.
+        // (Достоевский's "ое" passes the German oe-digraph on the Cyrillic side.)
+        for (a, b) in [
+            ("Tchaikovsky", "Chaikovsky"),
+            ("Tschaikowsky", "Tchaikovsky"),
+            ("Достоевский", "Dostoevsky"),
+        ] {
+            let (ka, kb) = (translit_norm(a), translit_norm(b));
+            assert!(
+                jaro_winkler(&ka, &kb) >= 0.92,
+                "jw({a:?}, {b:?}) = {ka:?}/{kb:?}"
+            );
+            assert!(name_blocker(&norm_name(a), &norm_name(b)).is_none());
+        }
+        // Non-mapped scripts pass through the key folded, never drop out.
+        assert_eq!(translit_norm("Արամ"), "արամ");
+        assert!(translit_norm("Νίκος").contains('ν'));
+        // Digraph pass is consistent for plain English words that contain one.
+        assert_eq!(translit_norm("blue"), translit_norm("blu"));
+    }
+
+    #[test]
+    fn name_blocker_fires_on_hard_negative_pairs() {
+        for (a, b) in [
+            ("Room 101", "Room 102"),
+            ("iPhone 14", "iPhone 15"),
+            ("Widget v1", "Widget v2"),
+            ("Teresa Mota", "Teresa Moura"),
+            ("Alex", "Alexis"),
+        ] {
+            let cause = name_blocker(&norm_name(a), &norm_name(b));
+            assert!(
+                cause.is_some(),
+                "{a:?}/{b:?} must be blocked, got {cause:?}"
+            );
+        }
+        // Free-of-blocker positive pairs must pass.
+        for (a, b) in [
+            ("Jonathon Smith", "Jonathan Smith"),
+            ("Aleksandr", "Alexander"),
+            // A one-char tail is a trailing typo, not a sibling name.
+            ("Kristen Odegaard", "Kristen Odegaardt"),
+        ] {
+            assert!(
+                name_blocker(&norm_name(a), &norm_name(b)).is_none(),
+                "{a}/{b}"
+            );
         }
     }
 }

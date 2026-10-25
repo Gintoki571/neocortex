@@ -844,18 +844,73 @@ fn write_prepared(
             && (relation.exclusive == Some(true) || resolved.exclusive)
         {
             let mut st = db.sql().prepare(
-                "SELECT r.id,r.valid_from,r.valid_to FROM relations r
+                "SELECT r.id,r.valid_from,r.valid_to,r.src,r.dst,es.norm,ed.norm,r.fact
+                 FROM relations r
                  JOIN predicates p ON p.id=r.predicate_id
+                 JOIN entities es ON es.id=r.src
+                 JOIN entities ed ON ed.id=r.dst
                  WHERE r.subj=?1 AND COALESCE(NULLIF(p.group_id,0),p.id)=?2
-                   AND r.dst!=?3 AND r.polarity=1 AND r.expired_at IS NULL",
+                   AND r.polarity=1 AND r.expired_at IS NULL",
             )?;
-            let olds: Vec<(i64, i64, Option<i64>)> = st
-                .query_map(params![subj, group_id, dst], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            /// One live exclusive relation: (id, valid_from, valid_to, src,
+            /// dst, src norm, dst norm, fact).
+            type OldRel = (i64, i64, Option<i64>, i64, i64, String, String, String);
+            let olds: Vec<OldRel> = st
+                .query_map(params![subj, group_id], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
+            // The exclusive value is the endpoint that is not the subject; an
+            // inverted predicate (e.g. "reports to", stored as its inverse
+            // "manages") keeps it on the src side. REL-19: a near-duplicate
+            // new value ("Bergn") never ends the correct one; blocked or
+            // cosine-unsure near targets are reported as conflict candidates
+            // instead.
+            let value_new = if swap { src } else { dst };
+            let value_norm = text::norm_name(if swap { src_name } else { dst_name });
+            let value_vector = if swap {
+                endpoint_vector(src_name)
+            } else {
+                endpoint_vector(dst_name)
+            };
             let mut later: Option<(i64, i64)> = None;
-            for (old, old_from, old_to) in olds {
+            for (old, old_from, old_to, o_src, o_dst, s_norm, d_norm, old_fact) in olds {
+                let (value_old, value_old_norm) = if o_dst == subj {
+                    (o_src, s_norm)
+                } else {
+                    (o_dst, d_norm)
+                };
+                if value_old == value_new {
+                    // Re-assertion of the same value: the evidence path dedupes it.
+                    continue;
+                }
+                let judge = resolve::NearJudge {
+                    embedding: value_vector,
+                    context: &vectors[0],
+                    cfg,
+                    semantic,
+                };
+                let verdict =
+                    resolve::near_name(db, &value_norm, &value_old_norm, value_old, &judge);
+                if !matches!(verdict, resolve::Verdict::Below) {
+                    if !matches!(verdict, resolve::Verdict::Merge) {
+                        conflicts.push(crate::engine::Conflict {
+                            relation_id: old,
+                            fact: old_fact,
+                            valid_from: old_from,
+                        });
+                    }
+                    continue;
+                }
                 if old_from == rf {
                     // Equal start: the newer write wins.
                     db.sql().execute(

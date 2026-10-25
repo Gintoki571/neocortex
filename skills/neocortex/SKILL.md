@@ -53,6 +53,9 @@ Store something when it will still matter next week:
   entity; it splits off a new card). Real different people with the same name
   and type are separate entities: do not `merge_entities` them without
   checking the facts on both cards.
+- Status `near` means a typo'd or transliterated spelling ("Bergn", "Мюллер")
+  already joined the right card — nothing to do. When `ambiguous` names a
+  lookalike as a candidate, pick with `same_as`/`distinct_from` as above.
 - **Structured when known**: pass `entities` and `relations`. Mark single-valued
   relations (`lives in`, `works at`, `is married to`, `has phone number`)
   `exclusive: true` so the previous value is ended and kept as history.
