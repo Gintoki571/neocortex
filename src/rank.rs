@@ -77,6 +77,22 @@ pub fn rrf(channels: &[Channel], k: f64) -> Vec<Fused> {
     result.into_iter().map(|(fused, _)| fused).collect()
 }
 
+/// Agentmemory's retention score, used only as a small ranking nudge (E5):
+/// `min(1, salience*exp(-0.01*days_since_created) + 0.3*sum(1/days_since_access))`.
+/// An access at the same instant contributes nothing (the reference skips
+/// non-positive ages), so repeated recall within one second cannot dominate.
+pub fn retention(salience: f64, created_at: i64, accesses: &[i64], now: i64) -> f64 {
+    let days = (now - created_at).max(0) as f64 / 86_400.0;
+    let mut score = salience.clamp(0.0, 1.0) * (-0.01 * days).exp();
+    for &at in accesses {
+        let since = (now - at) as f64 / 86_400.0;
+        if since > 0.0 {
+            score += 0.3 / since;
+        }
+    }
+    score.min(1.0)
+}
+
 /// Cosine of two equal-length vectors (0 when either has zero norm).
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "cosine vectors must have equal lengths");

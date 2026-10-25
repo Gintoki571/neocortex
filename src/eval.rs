@@ -547,7 +547,24 @@ pub const CONFIG_KEYS: &[&str] = &[
     "history_boost",
     "fact_entity_boost",
     "fact_memory_seed",
+    "w_tlink",
+    "tlink_window_hours",
+    "tlink_cap",
+    "w_causal",
+    "causal_extract",
+    "w_retention",
+    "access_keep",
 ];
+
+fn boolean(key: &str, value: &str) -> Result<bool> {
+    match value {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(crate::err!(
+            "invalid boolean '{value}' for {key}; use 1/0, true/false, on/off"
+        )),
+    }
+}
 
 fn number(key: &str, value: &str) -> Result<f64> {
     value
@@ -576,6 +593,13 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "history_boost" => cfg.history_boost = number(key, value)?,
         "fact_entity_boost" => cfg.fact_entity_boost = number(key, value)?,
         "fact_memory_seed" => cfg.fact_memory_seed = number(key, value)?,
+        "w_tlink" => cfg.w_tlink = number(key, value)?,
+        "tlink_window_hours" => cfg.tlink_window_hours = number(key, value)?.max(0.0),
+        "tlink_cap" => cfg.tlink_cap = number(key, value)? as usize,
+        "w_causal" => cfg.w_causal = number(key, value)?,
+        "causal_extract" => cfg.causal_extract = boolean(key, value)?,
+        "w_retention" => cfg.w_retention = number(key, value)?,
+        "access_keep" => cfg.access_keep = number(key, value)? as usize,
         other => {
             return Err(crate::err!(
                 "unknown config key '{other}'; valid: {}",

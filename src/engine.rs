@@ -53,6 +53,23 @@ pub struct Config {
     pub w_temporal: f64,
     /// RRF weight of semantic multi-hop paths (`paths::search_semantic`).
     pub w_sempath: f64,
+    /// RRF weight of temporal memory-memory links (E4a); 0 disables the
+    /// channel while the links are still written.
+    pub w_tlink: f64,
+    /// How far apart two memories may be (hours) to get a temporal link.
+    pub tlink_window_hours: f64,
+    /// Temporal links kept per memory (fan-out cap).
+    pub tlink_cap: usize,
+    /// RRF weight of the causal channel on why/intent questions (E4b).
+    pub w_causal: f64,
+    /// Extract cause relations from in-memory text cues (E4b). Off by default:
+    /// the calling agent is the reliable extractor.
+    pub causal_extract: bool,
+    /// Retention blend (E5). 0.05 measured neutral on fixtures, +0.007 MRR on
+    /// holdout, flat on world-300 and multihop-holdout2.
+    pub w_retention: f64,
+    /// Recent access times kept per memory for the retention score (E5).
+    pub access_keep: usize,
     pub rrf_k: f64,
     /// PPR teleport probability.
     pub alpha: f64,
@@ -95,6 +112,13 @@ impl Default for Config {
             w_graph: 1.5,
             w_temporal: 1.0,
             w_sempath: 0.25,
+            w_tlink: 0.0,
+            tlink_window_hours: 24.0,
+            tlink_cap: 20,
+            w_causal: 0.0,
+            causal_extract: false,
+            w_retention: 0.05,
+            access_keep: 8,
             rrf_k: 5.0,
             alpha: 0.5,
             eps: 1e-5,
@@ -440,6 +464,9 @@ pub struct Stats {
     pub similar_edges: i64,
     pub predicates: i64,
     pub db_bytes: i64,
+    /// Live memories whose retention score is below the cold tier (E5).
+    /// A hint only: nothing is ever evicted.
+    pub cold_memories: i64,
     pub embedder: String,
     pub version: String,
 }
@@ -816,6 +843,37 @@ impl Engine {
 
     pub fn stats(&self) -> Result<Stats> {
         let c = self.db.sql();
+        let now = self.clock().now;
+        // One scan, then retention in Rust: the SQLite build cannot assume
+        // math functions. This is a report, not a recall-path cost.
+        let mut retained: std::collections::HashMap<i64, (f64, i64, Vec<i64>)> =
+            std::collections::HashMap::new();
+        {
+            let mut st = c.prepare(
+                "SELECT m.id,m.importance,m.created_at,a.at FROM memories m
+                 LEFT JOIN memory_access a ON a.memory_id=m.id
+                 WHERE m.expired_at IS NULL",
+            )?;
+            let mut rows = st.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let importance: f64 = row.get(1)?;
+                let created_at: i64 = row.get(2)?;
+                let at: Option<i64> = row.get(3)?;
+                let entry = retained
+                    .entry(id)
+                    .or_insert((importance, created_at, Vec::new()));
+                if let Some(at) = at {
+                    entry.2.push(at);
+                }
+            }
+        }
+        let cold_memories = retained
+            .values()
+            .filter(|(importance, created_at, access)| {
+                crate::rank::retention(*importance, *created_at, access, now) < 0.15
+            })
+            .count() as i64;
         Ok(Stats {
             memories: c.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?,
             live_memories: c.query_row(
@@ -837,6 +895,7 @@ impl Engine {
                 [],
                 |r| r.get(0),
             )?,
+            cold_memories,
             embedder: self.emb.name().into(),
             version: env!("CARGO_PKG_VERSION").into(),
         })

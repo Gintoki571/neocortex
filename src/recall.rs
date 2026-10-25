@@ -98,6 +98,62 @@ fn fetch_rows(db: &Db, ids: &[i64]) -> Result<HashMap<i64, MemoryRow>> {
     Ok(out)
 }
 
+/// E4a: expand the best dense hits through temporal links. A memory one day
+/// away from the anchor is a weak neighbour; a memory minutes away is nearly
+/// as relevant as the anchor itself.
+fn temporal_link_ids(db: &Db, seeds: &[(i64, f64)], keep: usize, depth: usize) -> Result<Vec<i64>> {
+    let seeds: Vec<(i64, f64)> = seeds.iter().take(keep).copied().collect();
+    if seeds.is_empty() || depth == 0 {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<i64> = seeds.iter().map(|(id, _)| *id).collect();
+    let rank: HashMap<i64, usize> = ids.iter().enumerate().map(|(i, id)| (*id, i + 1)).collect();
+    let cosine: HashMap<i64, f64> = seeds.iter().copied().collect();
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+    for chunk in ids.chunks(400) {
+        let marks = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("SELECT a,b,weight FROM memory_links WHERE a IN ({marks}) OR b IN ({marks})");
+        let mut st = db.sql().prepare(&sql)?;
+        let mut p: Vec<Box<dyn rusqlite::ToSql>> = chunk
+            .iter()
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        p.extend(
+            chunk
+                .iter()
+                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
+        );
+        for row in st.query_map(
+            rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            },
+        )? {
+            let (a, b, weight) = row?;
+            let (anchor, other) = if rank.contains_key(&a) {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let strength = cosine.get(&anchor).copied().unwrap_or(0.0).max(0.05)
+                / rank.get(&anchor).copied().unwrap_or(1) as f64;
+            let entry = scores.entry(other).or_insert(0.0);
+            *entry = entry.max(weight * strength);
+        }
+    }
+    let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.truncate(depth);
+    Ok(ranked.into_iter().map(|(id, _)| id).collect())
+}
+
 fn fetch_vectors(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<f32>>> {
     // vec0 serves `rowid = ?` as a point lookup but `rowid IN (...)` as a full
     // scan of the table, so fetch one row at a time.
@@ -353,6 +409,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let k = input.k.unwrap_or(8).clamp(1, 50);
     let budget = input.budget.unwrap_or(1200).min(20_000);
     let negated = paths::negation_intent(&input.query);
+    let causal_query = paths::causal_intent(&input.query);
     let query_text = input
         .query
         .split_whitespace()
@@ -713,6 +770,46 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let path_hits: Vec<paths::PathHit> = lexical_hits.into_iter().chain(sem_hits).collect();
     path_ids.truncate(depth);
 
+    // ---------------------------------------------------------- causal
+    // E4b: a why-question asks for the cause, so the evidence of a causal
+    // relation is a first-class channel, not just another fact in the list.
+    let mut causal_ids = if engine.cfg.w_causal > 0.0 && causal_query {
+        paths::causal_memories(&engine.db, &query_vec, &query_text, vis, 12)?
+    } else {
+        Vec::new()
+    };
+    let missing: Vec<i64> = causal_ids
+        .iter()
+        .copied()
+        .filter(|id| !rows.contains_key(id))
+        .collect();
+    rows.extend(fetch_rows(&engine.db, &missing)?);
+    causal_ids.retain(|id| {
+        rows.get(id)
+            .is_some_and(|row| eligible(row, as_of, history, input, since, until))
+    });
+    causal_ids.truncate(depth);
+
+    // ----------------------------------------------------------- tlink
+    // E4a: the dense hits are anchors; memories that happened around the same
+    // entity within a day are candidates even when they share no query words.
+    let mut tlink_ids = if engine.cfg.w_tlink > 0.0 {
+        temporal_link_ids(&engine.db, &vec_ranked, engine.cfg.mem_seed_top, depth)?
+    } else {
+        Vec::new()
+    };
+    let missing: Vec<i64> = tlink_ids
+        .iter()
+        .copied()
+        .filter(|id| !rows.contains_key(id))
+        .collect();
+    rows.extend(fetch_rows(&engine.db, &missing)?);
+    tlink_ids.retain(|id| {
+        rows.get(id)
+            .is_some_and(|row| eligible(row, as_of, history, input, since, until))
+    });
+    tlink_ids.truncate(depth);
+
     let channels = [
         rank::Channel {
             name: "bm25",
@@ -744,8 +841,49 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             weight: engine.cfg.w_sempath,
             ids: &sem_ids,
         },
+        rank::Channel {
+            name: "causal",
+            weight: engine.cfg.w_causal,
+            ids: &causal_ids,
+        },
+        rank::Channel {
+            name: "tlink",
+            weight: engine.cfg.w_tlink,
+            ids: &tlink_ids,
+        },
     ];
     let fused = rank::rrf(&channels, engine.cfg.rrf_k);
+    // E5: retention only nudges scores when the knob is on. Reads are batched
+    // once for the whole candidate set; a zero weight never queries the table.
+    let retention_scores: HashMap<i64, f64> = if engine.cfg.w_retention != 0.0 {
+        let ids: Vec<i64> = fused.iter().map(|f| f.id).collect();
+        let mut times: HashMap<i64, Vec<i64>> = HashMap::new();
+        for chunk in ids.chunks(400) {
+            let marks = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql =
+                format!("SELECT memory_id,at FROM memory_access WHERE memory_id IN ({marks})");
+            let mut st = engine.db.sql().prepare(&sql)?;
+            for row in st.query_map(params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })? {
+                let (id, at) = row?;
+                times.entry(id).or_default().push(at);
+            }
+        }
+        fused
+            .iter()
+            .filter_map(|f| {
+                let row = rows.get(&f.id)?;
+                let empty = Vec::new();
+                let access = times.get(&f.id).unwrap_or(&empty);
+                Some((f.id, rank::retention(row.4, row.8, access, now)))
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
     let cutoff = as_of.unwrap_or(now);
     let mut candidates = Vec::new();
     for f in fused {
@@ -768,6 +906,9 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         let age = (now - row.9).max(0) as f64 / 86_400.0;
         score *= 0.9 + 0.1 * 2f64.powf(-age / engine.cfg.half_life_days);
         score *= 0.9 + 0.2 * row.4;
+        if let Some(retention) = retention_scores.get(&f.id) {
+            score *= 1.0 + engine.cfg.w_retention * retention;
+        }
         candidates.push((f.id, score, f.ranks));
     }
     candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -800,6 +941,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         || !ent_seeds.is_empty()
         || relation_support
         || !path_ids.is_empty()
+        || !causal_ids.is_empty()
         || window.is_some()
         || best_vector >= ABSTAIN_COSINE;
     if !supported || candidates.is_empty() {
@@ -866,26 +1008,51 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     }
     let tokens_used: usize = kept.iter().map(|&i| costs[i]).sum();
     let over_budget = tokens_used > budget;
-    if !selected.is_empty() {
-        let marks = std::iter::repeat_n("?", selected.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "UPDATE memories SET access_count=access_count+1,last_access=?1 WHERE id IN ({marks})"
-        );
-        let mut p: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
-        p.extend(
-            selected
-                .iter()
-                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-        );
-        let _ = engine.db.sql().execute(
-            &sql,
-            rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
-        );
+    // E5: access is recorded for memories the caller actually receives
+    // (`memories`, after packing), in one write transaction. The second
+    // statement keeps only the most recent `access_keep` timestamps.
+    let returned_memory_ids: Vec<i64> = memories.iter().map(|memory| memory.id).collect();
+    if !returned_memory_ids.is_empty() {
+        let _ = engine.db.write(|db| {
+            let marks = std::iter::repeat_n("?", returned_memory_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE memories SET access_count=access_count+1,last_access=?1 WHERE id IN ({marks})"
+            );
+            let mut p: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
+            p.extend(
+                returned_memory_ids
+                    .iter()
+                    .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
+            );
+            db.sql().execute(
+                &sql,
+                rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
+            )?;
+            let mut insert = db
+                .sql()
+                .prepare_cached("INSERT OR IGNORE INTO memory_access(memory_id,at) VALUES (?1,?2)")?;
+            let mut trim = db.sql().prepare_cached(
+                "DELETE FROM memory_access WHERE memory_id=?1 AND at <
+                 (SELECT at FROM memory_access WHERE memory_id=?1
+                  ORDER BY at DESC LIMIT 1 OFFSET ?2)",
+            )?;
+            for id in &returned_memory_ids {
+                insert.execute(params![id, now])?;
+                if engine.cfg.access_keep == 0 {
+                    db.sql().execute(
+                        "DELETE FROM memory_access WHERE memory_id=?1",
+                        [id],
+                    )?;
+                } else {
+                    trim.execute(params![id, engine.cfg.access_keep as i64 - 1])?;
+                }
+            }
+            Ok(())
+        });
     }
     let mut relevant_entities: HashSet<i64> = ent_seeds.keys().copied().collect();
-    let returned_memory_ids: Vec<i64> = memories.iter().map(|memory| memory.id).collect();
     for chunk in returned_memory_ids.chunks(400) {
         if chunk.is_empty() {
             continue;

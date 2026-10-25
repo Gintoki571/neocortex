@@ -66,6 +66,13 @@ Store something when it will still matter next week:
   as "lives in"; "reports to" and "manage" both work and render from the
   subject's side ("X reports to Y" shows as "X —reports to→ Y" on X's card and
   "Y —manages→ X" on Y's). Use whichever phrase is natural.
+- **Causes are relations too**: state them explicitly (`{"source": "disk full",
+  "predicate": "caused", "target": "deploy failed"}`); `causes`, `led to`,
+  `resulted in`, `caused by` and `because of` share one seeded family, and an
+  inverse write is stored from the cause side. Why-questions then surface the
+  cause evidence first. When you pass no relations, `causal_extract=1` can pull
+  one conservative "A because B" / "A due to B" relation, but do not rely on it:
+  you are the extractor.
 - Pass `negated: true` for retractions such as "no longer likes" or "X does not
   support Y"; negative relations render as `—NOT→` and end the matching
   positive interval of the same fact (reasserting the positive later is normal
@@ -85,6 +92,8 @@ Store something when it will still matter next week:
 - at the start of a task, before planning
 - before a decision that may depend on past context
 - when the user refers to something from before ("as we discussed", "last time")
+- when asked why something happened: recall the event and its cause together;
+  a stored `causes` relation is the strongest evidence
 - when stuck: the answer or a past fix may already be stored
 
 ## How to read results
@@ -95,7 +104,8 @@ Store something when it will still matter next week:
   `retracted` means the source was forgotten, not that it stopped being true.
   Current facts have `since <date>` or no end.
 - `(bm25#2 vec#1 graph#1)` says which channels matched; more agreeing channels
-  means a stronger hit.
+  means a stronger hit. `tlink` (temporal neighbours) and `causal` (why-answer
+  evidence) appear only when those optional channels are enabled.
 - "no memories matched" means broaden the query or drop filters, not that the
   memory does not exist.
 
@@ -113,7 +123,7 @@ the installed binary is `~/.neocortex/bin/neocortex` (DB `~/.neocortex/neocortex
 | `forget` | `neocortex forget <mID> [--hard]` | retire/delete (facts it alone stated are retracted) |
 | `merge_entities` | `neocortex merge <keep> <merge> [--force]` / `alias <entity> <alias>` | fix names (+ `distinct_from` on the `remember` entities array to split a homonym) |
 | `overview` | `neocortex overview [query]` | clusters of the graph |
-| `stats` | `neocortex stats` | counts and model status |
+| `stats` | `neocortex stats` | counts, model status and the cold-tier hint |
 
 Every tool takes `format: "text"` (default) or `"json"`.
 Use `overview` for a compact global view of related entities, facts and a

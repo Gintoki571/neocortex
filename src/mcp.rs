@@ -801,7 +801,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "stats",
-            "description": "Counts, database size and embedder status. Cheap; use it to confirm neocortex is reachable and to see how much memory exists.",
+            "description": "Counts, database size and embedder status. The `cold` count is a retention hint (memories whose salience/decay score is below 0.15); it costs one scan and nothing is ever evicted. Use it to confirm neocortex is reachable and to see how much memory exists.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"format": format_property()}

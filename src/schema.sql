@@ -142,6 +142,27 @@ CREATE TABLE IF NOT EXISTS communities (
   computed_at INTEGER NOT NULL
 );
 
+-- E4a: temporal links between memories close in valid_from that share an
+-- entity. One undirected row per pair (a < b); `reindex` does not need them
+-- because recall reads this table directly.
+CREATE TABLE IF NOT EXISTS memory_links (
+  a INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  b INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  weight REAL NOT NULL,
+  PRIMARY KEY (a, b),
+  CHECK (a < b)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_links_b ON memory_links(b);
+
+-- E5: recent access times, capped by the engine. memories.access_count /
+-- last_access stay the totals; this table drives the retention score.
+CREATE TABLE IF NOT EXISTS memory_access (
+  memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (memory_id, at)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_access_at ON memory_access(at);
+
 -- one row: the neocortex schema version (graphqlite owns PRAGMA user_version)
 CREATE TABLE IF NOT EXISTS schema_meta (
   version INTEGER NOT NULL
