@@ -1,7 +1,8 @@
 //! Entity and predicate resolution (design §7).
 //!
 //! Entities merge only on strong evidence: an exact name/alias, a lexical
-//! match, an acronym match (with a cosine floor), `same_as`, or an explicit
+//! match, an acronym match (with a cosine floor), a near-name match (ER-07
+//! layered dedup: JW + blockers + entity cosine), `same_as`, or an explicit
 //! merge tool. Embedding similarity alone only creates soft `similar` edges.
 
 use crate::{
@@ -32,7 +33,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// Cosine of `mention` against each of `ids` in one query. Missing vectors
 /// score 0.
-fn embeddings_for(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<f32>>> {
+pub(crate) fn embeddings_for(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<f32>>> {
     let mut out = HashMap::new();
     if ids.is_empty() {
         return Ok(out);
@@ -190,7 +191,7 @@ fn score_against(db: &Db, ids: &[i64], embedding: &[f32]) -> Result<HashMap<i64,
 /// memories that mention a candidate entity: the memory-level context signal
 /// from design §7's "pick by embedding cosine with the mention's context".
 /// Capped at the 40 newest live mentions (D3's hub-entity guard).
-fn memory_context_scores(
+pub(crate) fn memory_context_scores(
     db: &Db,
     candidates: &[i64],
     context: &[f32],
@@ -399,6 +400,95 @@ fn candidates(db: &Db, norm: &str, embedding: &[f32]) -> Result<Candidates> {
     Ok((out, knn_order))
 }
 
+// ----------------------------------------------- ER-07 layered near-name dedup
+
+/// Verdict of a near-name comparison between a mention norm and a stored
+/// entity (Graphify layered dedup, ER-07).
+pub(crate) enum Verdict {
+    /// JW >= name_merge, typo-sized edit, no blocker, entity cosine agrees.
+    Merge,
+    /// name_near <= JW < name_merge with no blocker, or a pass-everything
+    /// pair whose differing tokens sit over the typo-edit allowance: near,
+    /// but not a merge.
+    Near,
+    /// A hard blocker fired (digits, subset, short label, extension token -
+    /// see `text::name_blocker` for the list).
+    Blocked,
+    /// JW >= name_merge, name layer passed, but the entity cosine disagreed
+    /// (or no vector to judge with) - the cosine is a veto, never a cause.
+    Unsure,
+    /// JW < name_near.
+    Below,
+}
+impl std::fmt::Debug for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Verdict::Merge => "Merge",
+            Verdict::Near => "Near",
+            Verdict::Blocked => "Blocked",
+            Verdict::Unsure => "Unsure",
+            Verdict::Below => "Below",
+        })
+    }
+}
+
+/// Cosine/name-judging inputs the ER-07 layer needs alongside the pair itself
+/// (the resolver item's card vector, its memory-context vector and the config
+/// that decides `semantic` embedder gating).
+pub(crate) struct NearJudge<'a> {
+    pub embedding: &'a [f32],
+    pub context: &'a [f32],
+    pub cfg: &'a Config,
+    pub semantic: bool,
+}
+
+/// Compare a mention against one stored entity: Jaro-Winkler on the
+/// transliteration keys, the hard blockers, the typo-sized-edit gate (ER-07,
+/// 2026-10-25 fix: topic-agreeing cosines are not identity - "Bergen Airport
+/// South" is not "Bergen Airport" even when every vector agrees), and only
+/// then (for a semantic embedder) the F2 entity_conflict cosine as a veto
+/// against the candidate card, falling back to the memory-context cosine of
+/// the candidate's own memories. A hash embedder cannot judge identity, so
+/// the name layer alone decides "Merge".
+pub(crate) fn near_name(
+    db: &Db,
+    a_norm: &str,
+    b_norm: &str,
+    entity_id: i64,
+    judge: &NearJudge<'_>,
+) -> Verdict {
+    let jw = text::jaro_winkler(&text::translit_norm(a_norm), &text::translit_norm(b_norm));
+    if jw < f64::from(judge.cfg.name_near) {
+        return Verdict::Below;
+    }
+    if text::name_blocker(a_norm, b_norm).is_some() {
+        return Verdict::Blocked;
+    }
+    if jw < f64::from(judge.cfg.name_merge) {
+        return Verdict::Near;
+    }
+    if !text::name_typo_ok(a_norm, b_norm) {
+        return Verdict::Near;
+    }
+    if !judge.semantic {
+        return Verdict::Merge;
+    }
+    let card = embeddings_for(db, &[entity_id])
+        .ok()
+        .and_then(|mut m| m.remove(&entity_id))
+        .map(|v| cosine(judge.embedding, &v) >= judge.cfg.entity_conflict)
+        .unwrap_or(false);
+    let context_ok = memory_context_scores(db, &[entity_id], judge.context)
+        .ok()
+        .and_then(|m| m.get(&entity_id).copied())
+        .is_some_and(|c| c >= judge.cfg.entity_conflict);
+    if card || context_ok {
+        Verdict::Merge
+    } else {
+        Verdict::Unsure
+    }
+}
+
 pub fn resolve_entity(
     db: &Db,
     item: &EntityIn,
@@ -546,6 +636,54 @@ pub fn resolve_entity(
             status: status.into(),
             similar: Vec::new(),
             candidates: Vec::new(),
+        });
+    }
+
+    // ER-07 layered dedup inside the candidate pool: a near-name pair merges
+    // only when JW passes, no blocker fires, the change is typo-sized and the
+    // entity cosine agrees. Near/Blocked/Unsure pairs surface as ambiguous
+    // candidates instead of a silent `new` (never silent).
+    let mut merged: Option<(i64, f64)> = None;
+    let mut flagged: Vec<i64> = Vec::new();
+    let judge = NearJudge {
+        embedding,
+        context,
+        cfg,
+        semantic,
+    };
+    for (id, entity_norm, _, _) in &details {
+        let verdict = near_name(db, &norm, entity_norm, *id, &judge);
+        match verdict {
+            Verdict::Merge => {
+                merged.get_or_insert((*id, 1.0));
+            }
+            Verdict::Near | Verdict::Blocked | Verdict::Unsure
+                if flagged.len() < 5 && !flagged.contains(id) =>
+            {
+                flagged.push(*id);
+            }
+            _ => {}
+        }
+    }
+    if let Some((id, _)) = merged {
+        add_aliases(db, id, item, "near")?;
+        enrich(db, id, item, now)?;
+        return Ok(Resolved {
+            id,
+            status: "near".into(),
+            similar: Vec::new(),
+            candidates: Vec::new(),
+        });
+    }
+    if !flagged.is_empty() {
+        let id = insert_entity(db, item, &norm, &kind, embedding, now)?;
+        let meta = entity_meta(db, &flagged)?;
+        let scores = score_against(db, &flagged, embedding)?;
+        return Ok(Resolved {
+            id,
+            status: "ambiguous".into(),
+            similar: Vec::new(),
+            candidates: candidates_with_scores(&flagged, &meta, &scores),
         });
     }
 

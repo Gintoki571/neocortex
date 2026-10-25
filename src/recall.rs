@@ -1539,8 +1539,10 @@ pub fn entity(engine: &Engine, name: &str, limit: usize) -> Result<EntityOutput>
 }
 
 /// Fallbacks after an exact alias miss: the unique-best alias prefix
-/// ("UltraBERT" -> "UltraBERT-Embed-150M"), then the nearest entity card at
-/// cosine >= 0.8; otherwise an error that names the closest entities.
+/// ("UltraBERT" -> "UltraBERT-Embed-150M"), then the ER-07 near-name stage
+/// ("Bergn" -> "Bergen": JW on the transliteration key, blockers applied,
+/// unique winner required), then the nearest entity card at cosine >= 0.8;
+/// otherwise an error that names the closest entities.
 fn lookup_entity_fuzzy(engine: &Engine, name: &str) -> Result<i64> {
     let n = text::norm_name(name);
     if n.chars().count() >= 3 {
@@ -1557,6 +1559,44 @@ fn lookup_entity_fuzzy(engine: &Engine, name: &str) -> Result<i64> {
             .optional()?;
         if let Some(id) = prefix {
             return Ok(id);
+        }
+    }
+    // ER-07 Q-08: a typo'd query ("Bergn") must resolve the entity, not just
+    // the memory. Blockers keep "v1"/"v2"-style and person-name pairs apart;
+    // a near tie between two entities falls through to the vector stage.
+    if n.chars().count() >= 4 {
+        let key = text::translit_norm(&n);
+        let mut st = engine.db.sql().prepare(
+            "SELECT a.alias_norm, a.entity_id FROM entity_aliases a
+             JOIN entities e ON e.id = a.entity_id
+             ORDER BY e.mention_count DESC, a.alias_norm LIMIT 8000",
+        )?;
+        let matches: Vec<(f64, i64)> = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .filter_map(|row| row.ok())
+            .filter_map(|(alias, id)| {
+                let jw = text::jaro_winkler(&key, &text::translit_norm(&alias));
+                if jw < f64::from(engine.cfg.name_merge) || text::name_blocker(&n, &alias).is_some()
+                {
+                    None
+                } else {
+                    Some((jw, id))
+                }
+            })
+            .collect();
+        let best = matches
+            .iter()
+            .map(|(j, _)| *j)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let winners: std::collections::HashSet<i64> = matches
+            .iter()
+            .filter(|(j, _)| *j >= best - 0.005)
+            .map(|(_, id)| *id)
+            .collect();
+        if winners.len() == 1 {
+            if let Some(id) = winners.into_iter().next() {
+                return Ok(id);
+            }
         }
     }
     let vector = engine.emb.embed(&[name], Mode::Document)?.remove(0);

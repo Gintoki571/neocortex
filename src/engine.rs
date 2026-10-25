@@ -47,6 +47,25 @@ pub struct Config {
     /// ambiguous homonym. Measured on 22 same-entity / 22 different-entity
     /// pairs (same min 0.7404, different max 0.7275).
     pub entity_conflict: f32,
+    /// Jaro-Winkler on the transliteration key at/above which a near-name
+    /// pair auto-merges when the hard blockers pass, the differing token
+    /// keys are within the typo-edit allowance (1 Damerau-Levenshtein edit
+    /// up to 8 chars, 2 beyond - `text::name_typo_ok`; the cosine is a veto
+    /// only, never a cause - ER-07 layered dedup, 2026-10-25 fix). Measured
+    /// on the 51 labelled pairs in tests/data/name_pairs.json
+    /// (examples/name_eval): recall 0.964 (27/28 same pairs merge,
+    /// "Aleksandr Ivanov"/"Alexander Ivanov" is 4 key edits apart and lands
+    /// Near), precision 0.964 (27/28 merges are same pairs; the one false
+    /// merge is "Wisniewski"/"Wisniowski", 1 edit on 10-char keys -
+    /// name-layer isomorphic to Dostoevsky/Dostoevskij, so only the cosine or
+    /// type check can split those two shapes; accepted: a one-letter
+    /// difference in a long rare name is more often a typo than a new person).
+    pub name_merge: f32,
+    /// JW floor under which a blocked or cosine-unsure pair is silently
+    /// ignored; at/above it the pair is reported instead (ambiguous
+    /// candidate, REL-19 conflict) and never auto-merged. Over-allowance
+    /// edit pairs land here even above `name_merge`.
+    pub name_near: f32,
     pub w_bm25: f64,
     pub w_vector: f64,
     pub w_graph: f64,
@@ -107,6 +126,8 @@ impl Default for Config {
             entity_seed: 0.55,
             pred_alias: 0.80,
             entity_conflict: 0.73,
+            name_merge: 0.92,
+            name_near: 0.85,
             w_bm25: 1.0,
             w_vector: 2.0,
             w_graph: 1.5,
@@ -265,7 +286,7 @@ pub struct RememberInput {
 pub struct EntityResolution {
     pub name: String,
     pub id: i64,
-    /// "new" | "matched" | "alias" | "lexical" | "acronym" | "same_as" | "ambiguous"
+    /// "new" | "matched" | "alias" | "lexical" | "acronym" | "near" | "same_as" | "ambiguous"
     pub status: String,
     /// Soft links written for a new entity: (entity id, name, cosine).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1104,6 +1125,9 @@ fn merge_duplicate_relations(db: &Db) -> Result<()> {
 
 /// Re-apply exclusive invalidation after a merge: per `(src, exclusive
 /// predicate)` the newest `valid_from` wins; older rows end where it starts.
+/// Equal starts keep the earlier-created row (the fact already established in
+/// the store - a re-asserted row keeps its original id) and system-retire the
+/// later one.
 fn reapply_exclusivity(db: &Db, now: i64) -> Result<Vec<i64>> {
     let groups: Vec<(i64, i64)> = {
         let mut st = db.sql().prepare(
@@ -1122,7 +1146,7 @@ fn reapply_exclusivity(db: &Db, now: i64) -> Result<Vec<i64>> {
                 "SELECT id,valid_from FROM relations
                  WHERE src=?1 AND predicate_id=?2
                    AND expired_at IS NULL AND valid_to IS NULL
-                 ORDER BY valid_from DESC, id DESC",
+                 ORDER BY valid_from DESC, id ASC",
             )?;
             let rows = st.query_map(rusqlite::params![src, pid], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<rusqlite::Result<_>>()?

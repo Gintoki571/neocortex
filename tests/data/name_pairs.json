@@ -1,0 +1,311 @@
+{
+  "note": "ER-07 labelled pairs for the auto-merge threshold (lane nc-f4, 2026-10-25; 'Alex'/'Alexis' catches the single-token prefix sibling). kind: typo | transliteration | diacritic | blocker-negative | low-key-negative. All pairs live on the name layer (transliteration key + JW + hard blockers); the cosine layer is added by the resolver.",
+  "pairs": [
+    {
+      "a": "Jonathon Smith",
+      "b": "Jonathan Smith",
+      "label": "same",
+      "kind": "typo"
+    },
+    {
+      "a": "Wheelar",
+      "b": "Wheeler",
+      "label": "same",
+      "kind": "typo"
+    },
+    {
+      "a": "Seuol",
+      "b": "Seoul",
+      "label": "same",
+      "kind": "typo"
+    },
+    {
+      "a": "Bergen",
+      "b": "Bergn",
+      "label": "same",
+      "kind": "typo"
+    },
+    {
+      "a": "Kristen Odegaard",
+      "b": "Kristen Odegaardt",
+      "label": "same",
+      "kind": "typo"
+    },
+    {
+      "a": "Schwarzenegger",
+      "b": "Schwarzeneger",
+      "label": "same",
+      "kind": "typo"
+    },
+    {
+      "a": "Randers",
+      "b": "Randres",
+      "label": "same",
+      "kind": "typo"
+    },
+    {
+      "a": "Müller",
+      "b": "Mueller",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Müller",
+      "b": "Muller",
+      "label": "same",
+      "kind": "diacritic"
+    },
+    {
+      "a": "Göring",
+      "b": "Goering",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Nuernberg",
+      "b": "Nürnberg",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Istanbul",
+      "b": "İstanbul",
+      "label": "same",
+      "kind": "diacritic"
+    },
+    {
+      "a": "Cafe Central",
+      "b": "Café Central",
+      "label": "same",
+      "kind": "diacritic"
+    },
+    {
+      "a": "Grün Bau",
+      "b": "Gruen Bau",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Chloë",
+      "b": "Chloe",
+      "label": "same",
+      "kind": "diacritic"
+    },
+    {
+      "a": "Novák",
+      "b": "Novak",
+      "label": "same",
+      "kind": "diacritic"
+    },
+    {
+      "a": "Malmö",
+      "b": "Malmo",
+      "label": "same",
+      "kind": "diacritic"
+    },
+    {
+      "a": "Straße",
+      "b": "Strasse",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Tchaikovsky",
+      "b": "Chaikovsky",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Tschaikowsky",
+      "b": "Tchaikovsky",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Dostoevsky",
+      "b": "Dostoevskij",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Kowalsky",
+      "b": "Kowalski",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Москва",
+      "b": "Moskva",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Андерсен",
+      "b": "Andersen",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Достоевский",
+      "b": "Dostoevsky",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Жуков",
+      "b": "Zhukov",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Aleksandr Ivanov",
+      "b": "Alexander Ivanov",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Nikolaj Nikolajsen",
+      "b": "Nikolai Nikolajsen",
+      "label": "same",
+      "kind": "transliteration"
+    },
+    {
+      "a": "Room 101",
+      "b": "Room 102",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "iPhone 14",
+      "b": "iPhone 15",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Widget v1",
+      "b": "Widget v2",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Chapter 2",
+      "b": "Chapter 3",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Server 7",
+      "b": "Server 17",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Release 2024",
+      "b": "Release 2025",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Apt 3B",
+      "b": "Apt 3C",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Bauhaus 2",
+      "b": "Bauhaus 23",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "v1 Alpha",
+      "b": "v2 Alpha",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Teresa Mota",
+      "b": "Teresa Moura",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Jan",
+      "b": "Jans",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Ana",
+      "b": "Anas",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Jan Novak",
+      "b": "Jan Nováček",
+      "label": "different",
+      "kind": "low-key-negative"
+    },
+    {
+      "a": "Moscow",
+      "b": "Moskau",
+      "label": "different",
+      "kind": "low-key-negative"
+    },
+    {
+      "a": "Tchaikow",
+      "b": "Tchaikovsky",
+      "label": "different",
+      "kind": "low-key-negative"
+    },
+    {
+      "a": "Neil",
+      "b": "Noel",
+      "label": "different",
+      "kind": "low-key-negative"
+    },
+    {
+      "a": "Novak Group",
+      "b": "Novak Group North",
+      "label": "different",
+      "kind": "low-key-negative"
+    },
+    {
+      "a": "Bergen Airport",
+      "b": "Bergen Airport South",
+      "label": "different",
+      "kind": "low-key-negative"
+    },
+    {
+      "a": "Elise",
+      "b": "Elisebeth",
+      "label": "different",
+      "kind": "low-key-negative"
+    },
+    {
+      "a": "Wisniewski",
+      "b": "Wisniowski",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Anna Tomczak",
+      "b": "Anna Tomczuka",
+      "label": "different",
+      "kind": "blocker-negative"
+    },
+    {
+      "a": "Nowak",
+      "b": "Nowata",
+      "label": "different",
+      "kind": "low-key-negative"
+    },
+    {
+      "a": "Alex",
+      "b": "Alexis",
+      "label": "different",
+      "kind": "blocker-negative"
+    }
+  ]
+}
