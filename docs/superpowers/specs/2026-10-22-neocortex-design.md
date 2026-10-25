@@ -55,7 +55,7 @@ src/
   temporal.rs   date/time parsing (absolute + relative), intervals, bi-temporal predicates
   extract.rs    heuristic entity extraction + alias gazetteer matching
   resolve.rs    entity and predicate resolution
-  graph.rs      graphqlite projection, adjacency load, ACL push PPR, Louvain communities
+  graph.rs      graphqlite projection, adjacency load, ACL push PPR, deterministic Leiden communities
   remember.rs   write pipeline
   recall.rs     channels, fusion, context assembly, budget packing
   mcp.rs        JSON-RPC 2.0 stdio MCP server
@@ -82,7 +82,7 @@ Ids are integers, shown to agents with a prefix (`m12`, `e7`, `r33`). Short ids 
 - `similar(a, b, score)`: soft near-synonym links between entities (a < b).
 - `memory_links(a, b, weight)`: undirected temporal links between memories that share an entity and sit within 24 h of each other in `valid_from` (E4a; one row with `a < b`, weight `max(0.3, 1 − gap/24h)`, fan-out capped on both endpoints). Additive: ensured on every v4 open, not part of the version ladder.
 - `memory_access(memory_id, at)`: recent access instants for the retention score (E5), capped per memory; `memories.access_count`/`last_access` remain the totals. Additive, like `memory_links`.
-- `communities(entity_id, community, computed_at)` (Louvain, recomputed lazily).
+- `communities(entity_id, community, computed_at)` (deterministic Leiden over the live weighted snapshot, ids remapped by member overlap so they stay stable, recomputed lazily).
 - graphqlite projection in the same file: nodes `e:<id>` (label Entity) and `m:<id>` (label Memory); edges `MENTIONS` (m→e), `SIMILAR` (e–e, score), and one edge per relation typed by sanitised predicate with `rid`. The projection is derived from the relational tables, which are the source of truth for attributes and time. `neocortex reindex` rebuilds it. `validate` reports drift.
 
 ## 6. Write path — `remember`
@@ -234,7 +234,7 @@ Agent skill doc `skills/neocortex/SKILL.md`: when to remember (decisions, prefer
 - Agent-supplied JSON is the primary extraction path and the heuristic extractor is the fallback (user approved). GLiNER is deferred.
 - Clean rewrite as one crate in the same git history (repo renamed ReMem -> Gintoki571/neocortex, `main`); old code at tag `remem-final`.
 - Embedding-only similarity never merges entities; it only creates soft `similar` edges.
-- Relational tables are the source of truth; the graphqlite graph is a rebuildable projection used for Cypher (`cypher` command), paths and Louvain communities. The PPR adjacency snapshot is read from the relational tables (mentions, relations, similar), so as-of validity filtering is plain SQL and does not depend on graphqlite's internal table layout; it is cached per write generation.
+- Relational tables are the source of truth; the graphqlite graph is a rebuildable projection used for Cypher (`cypher` command) and paths; communities are computed by the in-crate deterministic Leiden (`graph::leiden`) over the relational snapshot. The PPR adjacency snapshot is read from the relational tables (mentions, relations, similar), so as-of validity filtering is plain SQL and does not depend on graphqlite's internal table layout; it is cached per write generation.
 - Integer ids with prefixes.
 - Closed `kind` set.
 - No automatic deletion or decay of memories; time affects ranking only.
