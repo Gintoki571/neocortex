@@ -77,7 +77,7 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 | `merge <keep> <merge>` | merge one entity into another (`--force` crosses types) |
 | `alias <entity> <alias>` | add another name to an entity |
 | `overview [query...]` | clusters of the entity graph |
-| `stats` | counts, database size, embedder |
+| `stats` | counts, database size, embedder, cold-tier hint |
 | `reindex` | rebuild the graph projection from the relational tables |
 | `validate` | report integrity problems (exit 1 when any) |
 | `cypher <query>` | read-only Cypher over the graph projection |
@@ -205,6 +205,14 @@ that memory states; `forget` retracts them without an end date. Without
 `--when`, one explicit date in the text (`March 5, 2025`, `2019`, `yesterday`)
 becomes the start; several dates, or none, leave it at today.
 
+The channel set is extensible: two measured experiments are built in but off by
+default (`--set w_tlink=…` temporal neighbours, `--set w_causal=…` why-question
+causal evidence; `--set causal_extract=1` also extracts one conservative
+"because" relation when you pass no relations). Recall records which memories
+it returned (totals plus a capped access history), applies a small retention
+weight (0.05) to salience and recent access, and `stats` reports a cold
+tier; nothing is ever evicted automatically.
+
 Relation writes use tri-state `exclusive`: `true` ends competing values,
 `false` keeps this write without conflict reporting, and omitted uses the
 predicate policy or returns candidates. `false` can clear a sticky exclusive
@@ -228,18 +236,22 @@ history.
   renders its own view: `entity` shows the phrase that starts with the profile.
 - Predicates live in families ("resides in" and "based in" count as "lives
   in"): exclusivity and negative assertions are checked per family, and a
-  brand new phrase joins a family when its vector is close enough.
+  brand new phrase joins a family when its vector is close enough. The seeded
+  `cause` family (`causes`, `led to`, `resulted in`, with `caused by` and
+  `because of` as inverses) makes why-questions follow causal evidence first
+  when `w_causal` is on.
 
 ## Quality
 
-On 84 queries, recall is **0.953** and MRR is **0.894**; on the independent
-holdout set (88 queries) **0.924 / 0.794** (measured 2026-10-23; the ablation
+On 84 queries, recall is **0.953** and MRR is **0.896**; on the independent
+holdout set (88 queries) **0.913 / 0.798** (measured 2026-10-25; the ablation
 numbers live in `neocortex eval <fixtures> --ablation`). Recall p50 with
 UltraBERT on a 12-core laptop CPU is about **160 ms**; the 10k-memory
 hash-embedder benchmark reports **~100 ms p50 / ~220-360 ms p95** including
 embedding.
-Retrieval uses four channels, then RRF (`k=5`), modifiers, MMR and graph
-context.
+Retrieval uses four base channels, then RRF (`k=5`), modifiers, MMR and graph
+context; access history is recorded but only changes ranking when
+`w_retention` is non-zero.
 
 ## Environment
 

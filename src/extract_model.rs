@@ -10,6 +10,7 @@
 use crate::engine::{EntityIn, RelationIn};
 use crate::extract;
 use crate::temporal::{self, Clock};
+use crate::text;
 
 #[derive(Clone, Debug, Default)]
 pub struct Extraction {
@@ -36,6 +37,54 @@ const PATTERNS: &[(&str, &str)] = &[
     ("uses", "uses"),
     ("owns", "owns"),
 ];
+
+/// Conservative causal cue: at most one relation, only when each side of the
+/// cue names exactly one of the supplied entities. Returns (cause, effect).
+pub fn causal_cue(text: &str, names: &[String]) -> Option<(String, String)> {
+    // Longest cue first so "because of" never fires as "because".
+    const CUES: &[(&str, bool)] = &[
+        ("as a result of", true),
+        ("because of", true),
+        ("because", true),
+        ("due to", true),
+        ("so that", false),
+        ("led to", false),
+        ("resulted in", false),
+    ];
+    let folded = text::fold(text);
+    // Earliest cue wins; the list is longest-first so "because of" beats the
+    // "because" that is a prefix of it at the same position.
+    let mut best: Option<(&str, bool, usize)> = None;
+    for (cue, reverse) in CUES {
+        if let Some(at) = folded.find(cue) {
+            if best.is_none_or(|(_, _, best_at)| at < best_at) {
+                best = Some((cue, *reverse, at));
+            }
+        }
+    }
+    let (cue, reverse, at) = best?;
+    let (left, right) = (&folded[..at], &folded[at + cue.len()..]);
+    let only = |side: &str| -> Option<String> {
+        let hits: Vec<&String> = names
+            .iter()
+            .filter(|name| {
+                let norm = text::fold(name);
+                !norm.is_empty() && side.contains(&norm)
+            })
+            .collect();
+        (hits.len() == 1).then(|| hits[0].clone())
+    };
+    let left_name = only(left)?;
+    let right_name = only(right)?;
+    if left_name.eq_ignore_ascii_case(&right_name) {
+        return None;
+    }
+    Some(if reverse {
+        (right_name, left_name)
+    } else {
+        (left_name, right_name)
+    })
+}
 
 pub fn extract_text(text: &str, clock: &Clock) -> Extraction {
     let mut out = Extraction {

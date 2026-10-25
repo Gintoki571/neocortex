@@ -87,6 +87,17 @@ pub fn negation_intent(query: &str) -> bool {
     has_negation_cue(query)
 }
 
+/// True when the question asks for a cause ("why did X happen", "what caused
+/// X", "reason for X"). E4b uses this to surface causal evidence first.
+pub fn causal_intent(query: &str) -> bool {
+    let q = text::fold(query);
+    q.starts_with("why")
+        || q.contains("what caused")
+        || q.contains("what led to")
+        || q.contains("reason for")
+        || q.contains("how come")
+}
+
 /// Every surface form a word may take in a stored fact.
 fn token_forms(token: &str) -> HashSet<String> {
     let mut out = HashSet::new();
@@ -669,6 +680,91 @@ fn residual_after(query: &[f32], fact: &[f32]) -> Vec<f32> {
     let norm = r.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
     r.iter_mut().for_each(|x| *x /= norm);
     r
+}
+
+/// E4b: evidence memories of causal facts, ranked against the question. The
+/// causal group is small, so a scan of its live relations is cheaper than a
+/// second FTS/vector pass and keeps every why-question on the same path.
+pub(crate) fn causal_memories(
+    db: &Db,
+    query_vec: &[f32],
+    query: &str,
+    vis: Visibility,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let group: Option<i64> = db
+        .sql()
+        .query_row(
+            "SELECT COALESCE(NULLIF(group_id,0),id) FROM predicates WHERE canonical='cause'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(group) = group else {
+        return Ok(Vec::new());
+    };
+    let terms: HashSet<String> = text::tokens(query)
+        .into_iter()
+        .filter(|word| word.chars().count() > 1 && !text::is_stopword(word))
+        .map(|word| text::norm_predicate(&word))
+        .collect();
+    let mut st = db.sql().prepare(
+        "SELECT r.id,r.fact,r.polarity,r.valid_from,r.valid_to,r.expired_at,
+                (SELECT embedding FROM relations_vec v WHERE v.rowid=r.id)
+         FROM relations r JOIN predicates p ON p.id=r.predicate_id
+         WHERE COALESCE(NULLIF(p.group_id,0),p.id)=?1 AND r.polarity=1",
+    )?;
+    let mut ranked: Vec<(i64, f64)> = Vec::new();
+    for row in st.query_map([group], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+            r.get::<_, Option<Vec<u8>>>(6)?,
+        ))
+    })? {
+        let (id, fact, _polarity, from, to, expired, blob) = row?;
+        if !vis.shows(from, to, expired) {
+            continue;
+        }
+        let cosine = blob
+            .and_then(|b| crate::db::blob_to_vec(&b))
+            .map(|v| f64::from(crate::rank::cosine(query_vec, &v)))
+            .unwrap_or(0.0);
+        let fact_terms: HashSet<String> = text::tokens(&fact)
+            .into_iter()
+            .filter(|word| word.chars().count() > 1 && !text::is_stopword(word))
+            .map(|word| text::norm_predicate(&word))
+            .collect();
+        let overlap = if terms.is_empty() {
+            0.0
+        } else {
+            terms.intersection(&fact_terms).count() as f64 / terms.len() as f64
+        };
+        ranked.push((id, 0.75 * cosine.max(0.0) + 0.25 * overlap));
+    }
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut out = Vec::new();
+    let mut st = db
+        .sql()
+        .prepare_cached("SELECT memory_id FROM relation_evidence WHERE relation_id=?1")?;
+    for (relation, _) in ranked.into_iter().take(limit) {
+        for memory in st
+            .query_map([relation], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        {
+            if !out.contains(&memory) {
+                out.push(memory);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Evidence memories for ranked paths: the destination first, then the links.

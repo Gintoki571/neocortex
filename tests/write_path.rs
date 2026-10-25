@@ -2043,8 +2043,19 @@ fn a_baseline_v3_database_with_three_column_predicates_opens() {
             &engine,
             "SELECT count(*) FROM predicates WHERE display!='' AND group_id!=0"
         ),
-        16,
+        21,
         "the full ontology is re-seeded on the extended table"
+    );
+    // The causal family is part of the current seed set (E4b).
+    assert_eq!(
+        count(
+            &engine,
+            "SELECT count(*) FROM predicates WHERE canonical IN
+               ('cause','led to','result in','caus by','because of')
+               AND COALESCE(NULLIF(group_id,0),id)=
+                   (SELECT COALESCE(NULLIF(group_id,0),id) FROM predicates WHERE canonical='cause')"
+        ),
+        5
     );
     // The old relation kept its meaning and its rendered text.
     let (text, live): (String, i64) = engine

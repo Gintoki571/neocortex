@@ -115,7 +115,43 @@ impl Db {
         if v < 4 {
             db.migrate_v3_to_v4()?;
         }
+        // Additive tables (E4a links, E5 access history) do not change the
+        // relational shape the ladder guards, so they are ensured for every
+        // v4 database instead of renumbering the schema. Idempotent by design.
+        db.ensure_additive_tables()?;
         Ok(db)
+    }
+
+    fn ensure_additive_tables(&self) -> Result<()> {
+        self.sql().execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_links (
+               a INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+               b INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+               weight REAL NOT NULL,
+               PRIMARY KEY (a, b),
+               CHECK (a < b)
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_links_b ON memory_links(b);
+             CREATE TABLE IF NOT EXISTS memory_access (
+               memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+               at INTEGER NOT NULL,
+               PRIMARY KEY (memory_id, at)
+             );
+             CREATE INDEX IF NOT EXISTS idx_memory_access_at ON memory_access(at);",
+        )?;
+        // New seeded families (the causal group) must reach existing v4
+        // databases too. Presence of the family anchor is the check: when it
+        // exists the whole current seed set does, so a normal open writes
+        // nothing.
+        let anchored: i64 = self.sql().query_row(
+            "SELECT EXISTS(SELECT 1 FROM predicates WHERE canonical='cause')",
+            [],
+            |r| r.get(0),
+        )?;
+        if anchored == 0 {
+            self.seed_predicates()?;
+        }
+        Ok(())
     }
 
     fn table_exists(&self, name: &str) -> Result<bool> {
@@ -295,6 +331,54 @@ impl Db {
                 symmetric: false,
                 group: "headquartered in",
                 inverse: None,
+            },
+            // E4b: one causal family. "caused by" and "because of" state the
+            // same relation from the effect side, so they are inverses and a
+            // write in either direction lands in the canonical cause direction.
+            Seed {
+                canonical: "cause",
+                display: "causes",
+                aliases: &["causes", "cause", "caused", "causing"],
+                exclusive: false,
+                symmetric: false,
+                group: "cause",
+                inverse: Some("caus by"),
+            },
+            Seed {
+                canonical: "led to",
+                display: "led to",
+                aliases: &["led to", "leads to", "lead to"],
+                exclusive: false,
+                symmetric: false,
+                group: "cause",
+                inverse: None,
+            },
+            Seed {
+                canonical: "result in",
+                display: "resulted in",
+                aliases: &["resulted in", "results in", "result in"],
+                exclusive: false,
+                symmetric: false,
+                group: "cause",
+                inverse: None,
+            },
+            Seed {
+                canonical: "caus by",
+                display: "caused by",
+                aliases: &["caused by", "is caused by"],
+                exclusive: false,
+                symmetric: false,
+                group: "cause",
+                inverse: Some("cause"),
+            },
+            Seed {
+                canonical: "because of",
+                display: "because of",
+                aliases: &["because of", "is because of", "because"],
+                exclusive: false,
+                symmetric: false,
+                group: "cause",
+                inverse: Some("cause"),
             },
         ];
         for seed in SEEDS {

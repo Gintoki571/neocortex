@@ -307,7 +307,7 @@ pub fn render_overview(out: &OverviewOutput, fmt: Fmt<'_>) -> String {
 /// Two lines: counts, then storage and model.
 pub fn render_stats(st: &Stats) -> String {
     format!(
-        "memories {} (live {}) · entities {} · relations {} (live {}) · similar {} · predicates {}\n\
+        "memories {} (live {}) · entities {} · relations {} (live {}) · similar {} · predicates {} · cold {}\n\
          db {} · embedder {} · neocortex {}\n",
         st.memories,
         st.live_memories,
@@ -316,6 +316,7 @@ pub fn render_stats(st: &Stats) -> String {
         st.live_relations,
         st.similar_edges,
         st.predicates,
+        st.cold_memories,
         bytes(st.db_bytes),
         st.embedder,
         st.version
@@ -646,11 +647,13 @@ mod tests {
             similar_edges: 3,
             predicates: 7,
             db_bytes: 128 * 1024,
+            cold_memories: 2,
             embedder: "hash".into(),
             version: "0.1.4".into(),
         };
         let text = render_stats(&out);
         assert!(text.starts_with("memories 42 (live 40)"), "{text}");
+        assert!(text.contains("cold 2"), "{text}");
         assert!(text.contains("db 128.0 KiB"), "{text}");
         assert!(text.contains("neocortex 0.1.4"), "{text}");
         assert_eq!(text.lines().count(), 2);

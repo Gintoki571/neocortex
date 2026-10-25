@@ -243,7 +243,7 @@ pub fn remember(
     inp: RememberInput,
 ) -> Result<RememberOutput> {
     check_embedder(db, emb)?;
-    let mut prepared = prepare(clock, inp)?;
+    let mut prepared = prepare(cfg, clock, inp)?;
     embed_prepared(emb, std::slice::from_mut(&mut prepared))?;
     db.write(|db| write_prepared(db, cfg, clock, emb.name(), prepared))
 }
@@ -270,7 +270,7 @@ pub fn remember_batch(
     for chunk in inputs.chunks(BATCH_SIZE) {
         let mut prepared: Vec<(usize, Prepared)> = Vec::with_capacity(chunk.len());
         for (offset, inp) in chunk.iter().enumerate() {
-            match prepare(clock, inp.clone()) {
+            match prepare(cfg, clock, inp.clone()) {
                 Ok(item) => prepared.push((base + offset, item)),
                 Err(e) => slots[base + offset] = Some(Err(e)),
             }
@@ -325,7 +325,7 @@ pub fn remember_batch(
 }
 
 /// Validate one input and lay out the texts that must be embedded for it.
-fn prepare(clock: Clock, mut inp: RememberInput) -> Result<Prepared> {
+fn prepare(cfg: &Config, clock: Clock, mut inp: RememberInput) -> Result<Prepared> {
     let content = inp.content.trim().to_string();
     if content.is_empty() {
         return Err(crate::err!("content must not be empty"));
@@ -423,6 +423,23 @@ fn prepare(clock: Clock, mut inp: RememberInput) -> Result<Prepared> {
                 distinct_from: Vec::new(),
             })
             .collect();
+    }
+    // E4b: conservative text cue ("A because B") when the agent supplied no
+    // facts. Both clause sides must name exactly one known entity.
+    if cfg.causal_extract && inp.relations.is_empty() {
+        let names: Vec<String> = entities.iter().map(|e| e.name.clone()).collect();
+        if let Some((cause, effect)) = crate::extract_model::causal_cue(&content, &names) {
+            inp.relations.push(RelationIn {
+                source: cause.clone(),
+                predicate: "causes".into(),
+                target: effect.clone(),
+                fact: Some(format!("{cause} causes {effect}")),
+                exclusive: None,
+                negated: None,
+                valid_from: None,
+                valid_to: None,
+            });
+        }
     }
     let cards: Vec<String> = entities
         .iter()
@@ -693,6 +710,12 @@ fn write_prepared(
             kg::project_entity_from_db(db, eid)?;
             add_mention(db, id, eid, now)?;
         }
+    }
+    // E4a: memories that share an entity and sit close in world time are
+    // neighbours ("what else happened around the move"). The fan-out cap is
+    // enforced on both endpoints, so no memory can become a hub.
+    if duplicate_of.is_none() {
+        write_temporal_links(db, id, valid_from, cfg)?;
     }
     let mut rel_results = Vec::new();
     let mut invalidated = Vec::new();
@@ -1095,6 +1118,101 @@ fn write_similar(db: &Db, entity: i64, other: i64, score: f32) -> Result<()> {
         params![a, b, score],
     )?;
     kg::project_similar(db, a, b, score)
+}
+
+/// Largest temporal-link weight gap the brief allows: a pair further apart
+/// than a day still gets the floor weight only if it is inside the window.
+const TLINK_DAY: f64 = 86_400.0;
+const TLINK_FLOOR: f64 = 0.3;
+
+/// E4a: link a new memory to the closest live memories that share one of its
+/// entities. Weight is `max(0.3, 1 - gap/24h)` (Hindsight); the candidate
+/// query is driven by `idx_mentions_entity` and `idx_memories_valid`.
+fn write_temporal_links(db: &Db, memory: i64, valid_from: i64, cfg: &Config) -> Result<()> {
+    let cap = cfg.tlink_cap;
+    let window = (cfg.tlink_window_hours.max(0.0) * 3_600.0).round() as i64;
+    if cap == 0 || window <= 0 {
+        return Ok(());
+    }
+    let entity_ids: Vec<i64> = {
+        let mut st = db
+            .sql()
+            .prepare("SELECT entity_id FROM mentions WHERE memory_id=?1")?;
+        let mut ids = Vec::new();
+        for row in st.query_map([memory], |r| r.get(0))? {
+            ids.push(row?);
+        }
+        ids
+    };
+    if entity_ids.is_empty() {
+        return Ok(());
+    }
+    let marks = std::iter::repeat_n("?", entity_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT m.id,m.valid_from FROM memories m
+         JOIN mentions me ON me.memory_id=m.id
+         WHERE me.entity_id IN ({marks})
+           AND m.id!=?{a} AND m.expired_at IS NULL
+           AND m.valid_from BETWEEN ?{lo} AND ?{hi}
+         GROUP BY m.id
+         ORDER BY MIN(ABS(m.valid_from-?{at})), m.id
+         LIMIT ?{limit}",
+        a = entity_ids.len() + 1,
+        lo = entity_ids.len() + 2,
+        hi = entity_ids.len() + 3,
+        at = entity_ids.len() + 4,
+        limit = entity_ids.len() + 5,
+    );
+    let mut st = db.sql().prepare(&sql)?;
+    let mut p: Vec<Box<dyn rusqlite::ToSql>> = entity_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    for value in [
+        memory,
+        valid_from - window,
+        valid_from + window,
+        valid_from,
+        cap as i64,
+    ] {
+        p.push(Box::new(value));
+    }
+    let candidates: Vec<(i64, i64)> = st
+        .query_map(
+            rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    for (other, other_from) in candidates {
+        let gap = (valid_from - other_from).abs() as f64;
+        let weight = (1.0 - gap / TLINK_DAY).max(TLINK_FLOOR);
+        let (a, b) = if memory < other {
+            (memory, other)
+        } else {
+            (other, memory)
+        };
+        db.sql().execute(
+            "INSERT INTO memory_links(a,b,weight) VALUES (?1,?2,?3)
+             ON CONFLICT(a,b) DO UPDATE SET weight=MAX(memory_links.weight,excluded.weight)",
+            params![a, b, weight],
+        )?;
+        trim_temporal_links(db, memory, cap)?;
+        trim_temporal_links(db, other, cap)?;
+    }
+    Ok(())
+}
+
+/// Keep the `cap` strongest links incident to one memory.
+fn trim_temporal_links(db: &Db, memory: i64, cap: usize) -> Result<()> {
+    db.sql().execute(
+        "DELETE FROM memory_links WHERE rowid IN (
+           SELECT rowid FROM memory_links WHERE a=?1 OR b=?1
+           ORDER BY weight DESC, a, b LIMIT -1 OFFSET ?2)",
+        params![memory, cap as i64],
+    )?;
+    Ok(())
 }
 
 /// A memory whose every evidenced relation has ended describes a past state:
