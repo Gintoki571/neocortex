@@ -20,11 +20,29 @@ fn run(db: &Db, q: &str, params: &[(&str, serde_json::Value)]) -> Result<()> {
     Ok(())
 }
 
-pub fn project_memory(db: &Db, id: i64, kind: &str) -> Result<()> {
+/// First words of a memory's text: the readable `name` a Cypher query shows
+/// (`MATCH (m:Memory) RETURN m.name`). Full text stays relational and in FTS.
+fn memory_name(content: &str) -> String {
+    let mut name: String = content
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if name.chars().count() > 80 {
+        name = name.chars().take(79).collect::<String>() + "…";
+    }
+    name
+}
+
+pub fn project_memory(db: &Db, id: i64, kind: &str, content: &str) -> Result<()> {
     run(
         db,
-        "MERGE (n:Memory {id:$id}) SET n.kind=$kind",
-        &[("id", format!("m:{id}").into()), ("kind", kind.into())],
+        "MERGE (n:Memory {id:$id}) SET n.kind=$kind, n.name=$name",
+        &[
+            ("id", format!("m:{id}").into()),
+            ("kind", kind.into()),
+            ("name", memory_name(content).into()),
+        ],
     )
 }
 
@@ -155,12 +173,12 @@ pub fn reproject_entity(db: &Db, entity: i64) -> Result<()> {
 pub fn rebuild_all(db: &Db) -> Result<()> {
     db.graph().cypher("MATCH (n) DETACH DELETE n")?;
     {
-        let mut st = db.sql().prepare("SELECT id,kind FROM memories")?;
-        let rows: Vec<(i64, String)> = st
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        let mut st = db.sql().prepare("SELECT id,kind,content FROM memories")?;
+        let rows: Vec<(i64, String, String)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        for (id, kind) in rows {
-            project_memory(db, id, &kind)?;
+        for (id, kind, content) in rows {
+            project_memory(db, id, &kind, &content)?;
         }
     }
     {

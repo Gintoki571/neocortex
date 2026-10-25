@@ -631,7 +631,7 @@ fn write_prepared(
                     "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,?2,1)",
                     params![id, vec_blob(&vectors[0])],
                 )?;
-                kg::project_memory(db, id, &kind)?;
+                kg::project_memory(db, id, &kind, &content)?;
                 id
             }
             Err(e) if crate::db::is_unique_violation(&e) => {

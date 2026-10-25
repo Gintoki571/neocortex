@@ -94,6 +94,13 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 `recall` flags: `--k --budget --kinds --tags --scope --source --session --since
 --until --as-of --history --entities --keywords`.
 
+`cypher` runs read-only openCypher over the graph projection:
+`MATCH ... [WHERE ...] RETURN ... [ORDER BY ...] [SKIP n] [LIMIT n]`. It refuses
+`CREATE`/`MERGE`/`SET`/`DELETE`/`DETACH`/`REMOVE`/`DROP`/`CALL`. Memory nodes
+carry `id`, `kind` and `name` (the first words of the text); entity nodes carry
+`id`, `name` and `type`; edges are `MENTIONS` (`type(r)` = `MENTIONS`),
+`SIMILAR` (with `score`) and `REL` (with `rid` and `predicate`).
+
 Exit codes: `0` ok, `1` runtime error, `2` usage error.
 
 ### Export, import and benchmarks

@@ -1299,6 +1299,51 @@ fn cypher_rejects_writes_and_allows_reads() {
 }
 
 #[test]
+fn cypher_memory_nodes_and_mention_edges_are_readable() {
+    let engine = engine();
+    remember(
+        &engine,
+        "Mom moved from Delhi to Pune on 2026-09-14.",
+        vec![named("Mom")],
+        vec![],
+    );
+    let rows = engine
+        .cypher("MATCH (a)-[r]->(b) RETURN a.name AS memory, type(r) AS edge, b.name AS entity")
+        .unwrap();
+    let rows = rows.as_array().unwrap();
+    let mentions: Vec<_> = rows.iter().filter(|r| r["edge"] == "MENTIONS").collect();
+    assert_eq!(mentions.len(), 1, "{rows:?}");
+    assert_eq!(mentions[0]["entity"], "Mom");
+    assert_eq!(
+        mentions[0]["memory"], "Mom moved from Delhi to Pune on 2026-09-14.",
+        "Memory nodes carry the first words of their text"
+    );
+    // The projection also exposes long memories as a readable prefix.
+    remember(
+        &engine,
+        "One two three four five six seven eight nine ten eleven twelve",
+        vec![],
+        vec![],
+    );
+    let names: Vec<String> = engine
+        .cypher("MATCH (n:Memory) RETURN n.name AS name")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(names.contains(&"One two three four five six seven eight".to_string()));
+    // SKIP/LIMIT are part of the read-only Cypher subset.
+    let all = engine.cypher("MATCH (n) RETURN n.id AS id").unwrap();
+    let page = engine
+        .cypher("MATCH (n) RETURN n.id AS id ORDER BY n.id SKIP 1 LIMIT 1")
+        .unwrap();
+    assert!(all.as_array().unwrap().len() > 1);
+    assert_eq!(page.as_array().unwrap().len(), 1, "{page:?}");
+}
+
+#[test]
 fn embedder_identity_rejects_a_different_name() {
     struct Other;
     impl Embedder for Other {
