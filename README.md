@@ -277,15 +277,17 @@ history.
 
 ## Quality
 
-On 84 queries, recall is **0.953** and MRR is **0.896**; on the independent
+On 84 queries, recall is **0.953** and MRR is **0.895**; on the independent
 holdout set (88 queries) **0.913 / 0.798** (measured 2026-10-25; the ablation
-numbers live in `neocortex eval <fixtures> --ablation`). Recall p50 with
+numbers live in `neocortex eval <fixtures> --ablation`). Multi-hop acc@10 is
+**0.825** on `eval/multihop-holdout.json` and **0.830** on the blind
+`eval/multihop-holdout2.json` (2026-10-26). Recall p50 with
 UltraBERT on a 12-core laptop CPU is about **160 ms**; the 10k-memory
 hash-embedder benchmark reports **~100 ms p50 / ~220-360 ms p95** including
 embedding.
 Retrieval uses four base channels, then RRF (`k=5`), modifiers, MMR and graph
-context; access history is recorded but only changes ranking when
-`w_retention` is non-zero.
+context; access history nudges ranking through the retention blend
+(`w_retention`, default 0.05).
 
 ## Environment
 
