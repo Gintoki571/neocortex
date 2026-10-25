@@ -24,6 +24,12 @@ pub struct EvalReport {
     pub acc: Option<f64>,
     #[serde(skip_serializing_if = "is_zero")]
     pub answer_queries: usize,
+    /// Queries whose recall returned at least one `next` hint, and the
+    /// estimated tokens those hints add per query (chars / 4).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hint_queries: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hint_tokens: usize,
     pub category: serde_json::Value,
     pub latency_mean_ms: f64,
     pub latency_p50_ms: f64,
@@ -288,6 +294,8 @@ fn evaluate(
     let mut mrr_sum = 0.0;
     let mut answer_queries = 0;
     let mut acc_hits = 0;
+    let mut hint_queries = 0;
+    let mut hint_tokens = 0;
     let mut failures = Vec::new();
     let mut by_category: HashMap<String, CategoryScore> = HashMap::new();
     for query in queries {
@@ -313,6 +321,16 @@ fn evaluate(
             ..Default::default()
         })?;
         latencies.push(started.elapsed().as_secs_f64() * 1000.0);
+        if !out.next.is_empty() {
+            hint_queries += 1;
+            hint_tokens += out
+                .next
+                .iter()
+                .map(|h| {
+                    (h.entity.len() + h.name.len() + h.want.len() + h.why.len() + 24).div_ceil(4)
+                })
+                .sum::<usize>();
+        }
         let found: Vec<i64> = out.memories.iter().take(k).map(|m| m.id).collect();
         let expected: Vec<i64> = query
             .expect
@@ -425,6 +443,8 @@ fn evaluate(
             Some(acc_hits as f64 / answer_queries as f64)
         },
         answer_queries,
+        hint_queries,
+        hint_tokens,
         category: serde_json::Value::Object(category),
         latency_mean_ms: if n == 0 {
             0.0
@@ -554,6 +574,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "causal_extract",
     "w_retention",
     "access_keep",
+    "hint_tau",
 ];
 
 fn boolean(key: &str, value: &str) -> Result<bool> {
@@ -600,6 +621,7 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "w_causal" => cfg.w_causal = number(key, value)?,
         "causal_extract" => cfg.causal_extract = boolean(key, value)?,
         "w_retention" => cfg.w_retention = number(key, value)?,
+        "hint_tau" => cfg.hint_tau = number(key, value)? as f32,
         "access_keep" => cfg.access_keep = number(key, value)? as usize,
         other => {
             return Err(crate::err!(
@@ -620,6 +642,14 @@ pub fn render_report(report: &EvalReport, show_failures: bool) -> String {
         out.push_str(&format!(
             "acc@{ACC_K}: {acc:.3} ({} answer queries)\n",
             report.answer_queries
+        ));
+    }
+    if report.hint_queries > 0 {
+        out.push_str(&format!(
+            "hints: {}/{} queries, ~{:.1} tokens/query\n",
+            report.hint_queries,
+            report.queries,
+            report.hint_tokens as f64 / report.queries.max(1) as f64
         ));
     }
     out.push_str(&format!(

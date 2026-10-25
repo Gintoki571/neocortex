@@ -24,16 +24,21 @@ const ACC_K: usize = 10;
 fn main() -> neocortex::Result<()> {
     let mut args = std::env::args().skip(1);
     let fixture = PathBuf::from(args.next().unwrap_or_else(|| {
-        eprintln!("usage: agent_sim <world.json> <db> [--limit N] [--depth N]");
+        eprintln!("usage: agent_sim <world.json> <db> [--limit N] [--depth N] [--hints]");
         std::process::exit(2)
     }));
     let db = PathBuf::from(args.next().unwrap_or_else(|| {
-        eprintln!("usage: agent_sim <world.json> <db> [--limit N] [--depth N]");
+        eprintln!("usage: agent_sim <world.json> <db> [--limit N] [--depth N] [--hints]");
         std::process::exit(2)
     }));
     let mut limit = usize::MAX;
     let mut depth = 3;
+    let mut hints = false;
     while let Some(flag) = args.next() {
+        if flag == "--hints" {
+            hints = true;
+            continue;
+        }
         let value = args.next().expect("flag needs a value");
         match flag.as_str() {
             "--limit" => {
@@ -70,6 +75,9 @@ fn main() -> neocortex::Result<()> {
     let mut answered = 0usize;
     let mut solved = [0usize; 4];
     let mut calls = 0usize;
+    let mut hint_queries = 0usize;
+    let mut hint_follows = 0usize;
+    let mut hint_solved = 0usize;
     let mut recall_ms: Vec<f64> = Vec::new();
     let mut follow_ms: Vec<f64> = Vec::new();
     let mut by_category: HashMap<String, (usize, usize)> = HashMap::new();
@@ -108,6 +116,51 @@ fn main() -> neocortex::Result<()> {
             0
         };
 
+        if step == 0 && hints {
+            if !first.next.is_empty() {
+                hint_queries += 1;
+            }
+            let mut leaf = None;
+            for hint in first.next.iter().take(2) {
+                hint_follows += 1;
+                let started = Instant::now();
+                let out = paths::follow(
+                    &engine,
+                    &FollowInput {
+                        from: hint.entity.clone(),
+                        predicate: Some(hint.want.clone()),
+                        depth: Some(depth),
+                        k: Some(40),
+                        ..Default::default()
+                    },
+                )?;
+                follow_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+                used += 1;
+                if holds(&follow_context(&out, depth), &answers) {
+                    step = 2;
+                    hint_solved += 1;
+                    break;
+                }
+                leaf = leaf_entity(&out).or(leaf);
+            }
+            if step == 0 {
+                if let Some(leaf) = leaf {
+                    let started = Instant::now();
+                    let again = engine.recall(&RecallInput {
+                        query: format!("{leaf} {q}"),
+                        k: Some(ACC_K),
+                        as_of: query["as_of"].as_str().map(str::to_string),
+                        include_history: query["include_history"].as_bool().unwrap_or(false),
+                        ..Default::default()
+                    })?;
+                    recall_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+                    used += 1;
+                    if holds(&context(&again), &answers) {
+                        step = 3;
+                    }
+                }
+            }
+        }
         if step == 0 {
             if let Some(from) = question_entity(&engine, q)? {
                 let started = Instant::now();
@@ -164,13 +217,28 @@ fn main() -> neocortex::Result<()> {
         rate(solved[1] + solved[2], total),
         rate(answered, total)
     );
-    println!(
-        "  solved by: recall {} follow {} recall-leaf {} missed {}",
-        solved[1],
-        solved[2],
-        solved[3],
-        total - answered
-    );
+    if hints {
+        println!(
+            "  solved by: recall {} hint-follow {} follow {} recall-leaf {} missed {}",
+            solved[1],
+            hint_solved,
+            solved[2] - hint_solved,
+            solved[3],
+            total - answered
+        );
+        println!(
+            "  hints: {} followed on {} hint-bearing misses",
+            hint_follows, hint_queries
+        );
+    } else {
+        println!(
+            "  solved by: recall {} follow {} recall-leaf {} missed {}",
+            solved[1],
+            solved[2],
+            solved[3],
+            total - answered
+        );
+    }
     println!(
         "  calls/query {:.2}, recall p50 {:.0} ms, follow p50 {} ms",
         calls as f64 / total.max(1) as f64,

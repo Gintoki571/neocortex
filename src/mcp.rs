@@ -673,7 +673,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "recall",
-            "description": "Retrieve what is known about a topic: memories, current and ended facts, and entity cards, packed into a token budget. Call it at the start of a task, before decisions that may depend on past context, when the user refers to something from before, and when you are stuck. Filter with kinds/tags/scope/time when you know the shape of the answer; leave filters off to search broadly. Use as_of for \"what was true then\", and include_history for how something changed.",
+            "description": "Retrieve what is known about a topic: memories, current and ended facts, and entity cards, packed into a token budget. Call it at the start of a task, before decisions that may depend on past context, when the user refers to something from before, and when you are stuck. Filter with kinds/tags/scope/time when you know the shape of the answer; leave filters off to search broadly. Use as_of for \"what was true then\", and include_history for how something changed. When the answer needs another hop, the reply may carry `next` (at most two): each names an entity, a name, the relation `want` and a `why`. Do not guess: call follow with that entity and want, then answer from what it returns.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -834,6 +834,29 @@ mod tests {
             assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
             assert!(tool["description"].as_str().unwrap().len() > 20, "{tool}");
         }
+    }
+
+    #[test]
+    fn recall_describes_the_next_hint() {
+        let tools = tool_defs();
+        let recall = tools.iter().find(|t| t["name"] == "recall").unwrap();
+        let description = recall["description"].as_str().unwrap();
+        assert!(description.contains("`next`"), "{description}");
+        assert!(description.contains("follow"), "{description}");
+    }
+
+    #[test]
+    fn next_hint_json_is_the_follow_call() {
+        let hint = engine::NextHop {
+            entity: "e7".into(),
+            name: "Oslo".into(),
+            want: "where live".into(),
+            why: "chain ends at a city".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&hint).unwrap(),
+            json!({"entity": "e7", "name": "Oslo", "want": "where live", "why": "chain ends at a city"})
+        );
     }
 
     #[test]
