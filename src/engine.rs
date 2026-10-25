@@ -80,6 +80,8 @@ pub struct Config {
     pub history_boost: f64,
     /// Cosine threshold for text-only update candidates.
     pub update_candidate: f32,
+    /// Trained hop scorer for the semantic beam: "off" (cosine residual) or "on".
+    pub hop_scorer: String,
 }
 
 impl Default for Config {
@@ -109,6 +111,7 @@ impl Default for Config {
             fact_entity_boost: 1.0,
             fact_memory_seed: 0.0,
             update_candidate: 0.75,
+            hop_scorer: "off".to_string(),
         }
     }
 }

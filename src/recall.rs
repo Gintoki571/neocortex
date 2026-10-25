@@ -683,11 +683,13 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         let semantic = if engine.cfg.w_sempath > 0.0 {
             paths::search_semantic(
                 &engine.db,
+                &query_text,
                 &query_vec,
                 &sem_starts,
                 &path_starts,
                 &nearest_memories,
                 vis,
+                engine.cfg.hop_scorer == "on",
             )?
         } else {
             Vec::new()
