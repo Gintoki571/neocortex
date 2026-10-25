@@ -872,9 +872,9 @@ fn write_prepared(
             // The exclusive value is the endpoint that is not the subject; an
             // inverted predicate (e.g. "reports to", stored as its inverse
             // "manages") keeps it on the src side. REL-19: a near-duplicate
-            // new value ("Bergn") never ends the correct one; blocked or
-            // cosine-unsure near targets are reported as conflict candidates
-            // instead.
+            // new value ("Bergn") never ends the correct one; near targets
+            // that hit a blocker or sit over the typo-edit allowance are
+            // reported as conflict candidates instead.
             let value_new = if swap { src } else { dst };
             let value_norm = text::norm_name(if swap { src_name } else { dst_name });
             let value_vector = if swap {

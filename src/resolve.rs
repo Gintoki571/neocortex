@@ -405,15 +405,17 @@ fn candidates(db: &Db, norm: &str, embedding: &[f32]) -> Result<Candidates> {
 /// Verdict of a near-name comparison between a mention norm and a stored
 /// entity (Graphify layered dedup, ER-07).
 pub(crate) enum Verdict {
-    /// JW >= name_merge, no blocker, entity cosine agrees.
+    /// JW >= name_merge, typo-sized edit, no blocker, entity cosine agrees.
     Merge,
-    /// name_near <= JW < name_merge with no blocker: near, but not a merge.
+    /// name_near <= JW < name_merge with no blocker, or a pass-everything
+    /// pair whose differing tokens sit over the typo-edit allowance: near,
+    /// but not a merge.
     Near,
-    /// A hard blocker fired (digits, short label, differing long tokens - see
-    /// `text::name_blocker` for the list).
+    /// A hard blocker fired (digits, subset, short label, extension token -
+    /// see `text::name_blocker` for the list).
     Blocked,
-    /// JW >= name_merge, no blocker, but the entity cosine disagreed (or no
-    /// vector to judge with).
+    /// JW >= name_merge, name layer passed, but the entity cosine disagreed
+    /// (or no vector to judge with) - the cosine is a veto, never a cause.
     Unsure,
     /// JW < name_near.
     Below,
@@ -441,10 +443,13 @@ pub(crate) struct NearJudge<'a> {
 }
 
 /// Compare a mention against one stored entity: Jaro-Winkler on the
-/// transliteration keys, the hard blockers, and (for a semantic embedder) the
-/// F2 entity_conflict cosine against the candidate card, falling back to the
-/// memory-context cosine of the candidate's own memories. A hash embedder
-/// cannot judge identity, so the name layer alone decides "Merge".
+/// transliteration keys, the hard blockers, the typo-sized-edit gate (ER-07,
+/// 2026-10-25 fix: topic-agreeing cosines are not identity - "Bergen Airport
+/// South" is not "Bergen Airport" even when every vector agrees), and only
+/// then (for a semantic embedder) the F2 entity_conflict cosine as a veto
+/// against the candidate card, falling back to the memory-context cosine of
+/// the candidate's own memories. A hash embedder cannot judge identity, so
+/// the name layer alone decides "Merge".
 pub(crate) fn near_name(
     db: &Db,
     a_norm: &str,
@@ -460,6 +465,9 @@ pub(crate) fn near_name(
         return Verdict::Blocked;
     }
     if jw < f64::from(judge.cfg.name_merge) {
+        return Verdict::Near;
+    }
+    if !text::name_typo_ok(a_norm, b_norm) {
         return Verdict::Near;
     }
     if !judge.semantic {
@@ -632,9 +640,9 @@ pub fn resolve_entity(
     }
 
     // ER-07 layered dedup inside the candidate pool: a near-name pair merges
-    // only when JW passes, no blocker fires and the entity cosine agrees.
-    // Blocked or cosine-unsure pairs surface as ambiguous candidates instead
-    // of a silent `new` (never silent).
+    // only when JW passes, no blocker fires, the change is typo-sized and the
+    // entity cosine agrees. Near/Blocked/Unsure pairs surface as ambiguous
+    // candidates instead of a silent `new` (never silent).
     let mut merged: Option<(i64, f64)> = None;
     let mut flagged: Vec<i64> = Vec::new();
     let judge = NearJudge {
@@ -649,7 +657,9 @@ pub fn resolve_entity(
             Verdict::Merge => {
                 merged.get_or_insert((*id, 1.0));
             }
-            Verdict::Blocked | Verdict::Unsure if flagged.len() < 5 && !flagged.contains(id) => {
+            Verdict::Near | Verdict::Blocked | Verdict::Unsure
+                if flagged.len() < 5 && !flagged.contains(id) =>
+            {
                 flagged.push(*id);
             }
             _ => {}

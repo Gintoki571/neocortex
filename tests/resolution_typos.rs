@@ -202,6 +202,46 @@ fn er07_person_tokens_block_the_automatic_merge() {
     assert!(res.candidates.iter().any(|c| c.id == mota_id));
 }
 
+// ER-07 layered dedup, near band: `name_near <= JW < name_merge` pairs and
+// over-allowance merges surface as ambiguous candidates (reported, never
+// silent), and subset siblings are blocked the same way.
+#[test]
+fn er07_near_band_and_subset_report_ambiguous_candidates() {
+    let e = engine();
+    // JW(Nowak, Nowata) = 0.893 - inside the near band, not blocked.
+    let first = remember_named(&e, "Nowak opened the case.", vec![person("Nowak")], vec![]);
+    let nowak_id = resolution(&first, "Nowak").id;
+    let second = remember_named(
+        &e,
+        "Nowata opened the case too.",
+        vec![person("Nowata")],
+        vec![],
+    );
+    let res = resolution(&second, "Nowata");
+    assert_ne!(res.id, nowak_id, "near-band pairs never auto-merge");
+    assert_eq!(res.status, "ambiguous", "near pair is reported, not silent");
+    assert!(res.candidates.iter().any(|c| c.id == nowak_id), "{res:?}");
+
+    // Subset sibling: blocked before the typo gate, same reporting shape.
+    let third = remember_named(
+        &e,
+        "Novak Group runs the case.",
+        vec![org("Novak Group")],
+        vec![],
+    );
+    let group_id = resolution(&third, "Novak Group").id;
+    let fourth = remember_named(
+        &e,
+        "Novak Group North runs the case too.",
+        vec![org("Novak Group North")],
+        vec![],
+    );
+    let res = resolution(&fourth, "Novak Group North");
+    assert_ne!(res.id, group_id, "subset siblings never auto-merge");
+    assert_eq!(res.status, "ambiguous", "blocked sibling is reported");
+    assert!(res.candidates.iter().any(|c| c.id == group_id), "{res:?}");
+}
+
 #[test]
 fn er07_cosine_disagreement_keeps_the_pair_separate() {
     let e = map_engine(vec![
@@ -228,6 +268,96 @@ fn er07_cosine_disagreement_keeps_the_pair_separate() {
     assert_ne!(res.id, bergen_id, "cosine-disagreeing pair stays separate");
     assert_eq!(res.status, "ambiguous");
     assert!(res.candidates.iter().any(|c| c.id == bergen_id));
+}
+
+// Model-gated reviewer repro (fix round): with the real UltraBERT embedder
+// the entity-cosine gate AGREES for near-name siblings (same topic, not the
+// same thing), so auto-merge must hold on the name layer alone. Covers the
+// reviewer table: subset siblings and over-allowance edits are never merges;
+// a typo-sized edit still is. Skip pattern of the other model-gated tests in
+// tests/ (no model dir -> not run).
+fn real_model_engine() -> Option<Engine> {
+    let dir = match std::env::var_os("NEOCORTEX_MODEL_DIR") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let home = std::env::var_os("HOME")?;
+            std::path::Path::new(&home).join(".neocortex/models/UltraBERT-Embed-150M")
+        }
+    };
+    if !dir.is_dir() {
+        return None;
+    }
+    let emb = neocortex::embed::load(Some(&dir)).unwrap();
+    Some(
+        Engine::open_in_memory(Arc::from(emb) as Arc<dyn Embedder>)
+            .unwrap()
+            .with_clock(Clock {
+                now: NOW,
+                tz_offset_secs: 0,
+            }),
+    )
+}
+
+#[test]
+fn er07_real_model_near_names_keep_their_names() {
+    let Some(e) = real_model_engine() else {
+        eprintln!("skipping: UltraBERT model directory absent");
+        return;
+    };
+    fn note(name: String) -> String {
+        format!("{name} handled the booking.")
+    }
+
+    // Rows 1-4: near-name siblings must NOT auto-merge on topic agreement.
+    for (first, second, kind) in [
+        ("Bergen Airport", "Bergen Airport South", "place"),
+        ("Novak Group", "Novak Group North", "org"),
+        ("Jan Novak", "Jan Nováček", "person"),
+        ("Anna Tomczak", "Anna Tomczuka", "person"),
+    ] {
+        let kind = Some(kind.into());
+        let entity = EntityIn {
+            name: first.into(),
+            kind: kind.clone(),
+            ..Default::default()
+        };
+        let out = remember_named(&e, &note(first.into()), vec![entity], vec![]);
+        let first_id = out.entities[0].id;
+        let entity = EntityIn {
+            name: second.into(),
+            kind: kind.clone(),
+            ..Default::default()
+        };
+        let out = remember_named(&e, &note(second.into()), vec![entity], vec![]);
+        let res = resolution(&out, second);
+        assert!(
+            res.id != first_id,
+            "{first:?}/{second:?} must not auto-merge: {res:?}"
+        );
+        let status = res.status.as_str();
+        assert!(
+            status == "new" || status == "ambiguous",
+            "{first:?}/{second:?} must be new or ambiguous, got {status:?}"
+        );
+    }
+
+    // Row 5: a typo-sized edit still merges.
+    let out = remember_named(
+        &e,
+        "Jonathan Smith called about the servers.",
+        vec![person("Jonathan Smith")],
+        vec![],
+    );
+    let smith_id = out.entities[0].id;
+    let out = remember_named(
+        &e,
+        "Jonathon Smith called about the servers again.",
+        vec![person("Jonathon Smith")],
+        vec![],
+    );
+    let res = resolution(&out, "Jonathon Smith");
+    assert_eq!(res.id, smith_id, "one edit must still merge: {res:?}");
+    assert_eq!(res.status, "near");
 }
 
 // ------------------------------------------------------------------- Q-08

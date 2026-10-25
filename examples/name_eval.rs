@@ -3,13 +3,18 @@
 //! hard negatives) and report precision/recall per threshold.
 //!
 //! The decision under measurement is the name layer only: JW on the
-//! transliteration key >= threshold AND no hard blocker. The entity-cosine
-//! layer reuses the measured `entity_conflict = 0.73` threshold (see
-//! Cargo's Config doc), so it is not swept here.
+//! transliteration key >= threshold AND no hard blocker AND a typo-sized
+//! Damerau-Levenshtein edit on the differing token keys (<= 1 up to 8 chars,
+//! <= 2 beyond - `text::name_typo_ok`; pairs over the allowance that still
+//! clear `name_near` are Near: reported, never merged). The entity-cosine
+//! layer reuses the measured `entity_conflict = 0.73` threshold (see Cargo's
+//! Config doc), so it is not swept here.
 //!
 //! Run: cargo run --release --example name_eval -- [pairs.json]
 
-use neocortex::text::{jaro_winkler, name_blocker, norm_name, translit_norm};
+use neocortex::text::{
+    damerau_levenshtein, jaro_winkler, name_blocker, name_typo_ok, norm_name, translit_norm,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -35,14 +40,17 @@ fn main() {
     let pairs: Pairs = serde_json::from_str(&raw).expect("parse pairs file");
     println!("{}", pairs.note.as_deref().unwrap_or_default());
 
-    // Normalise once; report the raw JW and blocker per pair.
+    // Normalise once; report the raw JW, blocker cause, whole-key edit count
+    // and typo-gate verdict per pair.
     struct Scored {
         a: String,
         b: String,
         label: String,
         kind: String,
         key_jw: f64,
-        blocked: bool,
+        blocked: Option<&'static str>,
+        key_edits: usize,
+        mergeable: bool,
     }
     let scored: Vec<Scored> = pairs
         .pairs
@@ -56,12 +64,14 @@ fn main() {
                 label: p.label.clone(),
                 kind: p.kind.clone(),
                 key_jw: jaro_winkler(&ka, &kb),
-                blocked: name_blocker(&na, &nb).is_some(),
+                blocked: name_blocker(&na, &nb),
+                key_edits: damerau_levenshtein(&ka, &kb),
+                mergeable: name_typo_ok(&na, &nb),
             }
         })
         .collect();
 
-    // Per-threshold sweep.
+    // Per-threshold sweep: merges = JW >= t AND not blocked AND typo-sized.
     println!("\nthreshold  precision  recall  f1     misses");
     for t in [
         70, 75, 80, 82, 84, 85, 86, 88, 90, 91, 92, 93, 94, 95, 96, 97, 98,
@@ -71,7 +81,7 @@ fn main() {
         let mut miss = Vec::new();
         for p in &scored {
             let want = p.label == "same";
-            let got = p.key_jw >= t && !p.blocked;
+            let got = p.key_jw >= t && p.blocked.is_none() && p.mergeable;
             match (want, got) {
                 (true, true) => tp += 1,
                 (false, true) => {
@@ -80,13 +90,14 @@ fn main() {
                 }
                 (true, false) => {
                     fn_ += 1;
-                    miss.push(format!(
-                        "FN {} / {} (jw {:.3}{})",
-                        p.a,
-                        p.b,
-                        p.key_jw,
-                        if p.blocked { ", blocked" } else { "" }
-                    ));
+                    let cause = if p.blocked.is_some() {
+                        " blocked"
+                    } else if !p.mergeable {
+                        " over-edit"
+                    } else {
+                        ""
+                    };
+                    miss.push(format!("FN {} / {} (jw {:.3}{cause})", p.a, p.b, p.key_jw,));
                 }
                 (false, false) => {}
             }
@@ -112,23 +123,28 @@ fn main() {
         );
     }
 
-    // Per-pair table at the default threshold for the report.
+    // Per-pair table at the default threshold for the report: merge | near
+    // (>= name_near, over the edit allowance) | no.
     let t = 0.92;
-    println!("\nper-pair (kind, key JW, blocker, decision at {t}):");
+    println!("\nper-pair (kind, key JW, blocker, key edits, decision at {t}):");
     for p in &scored {
+        let decision = if p.key_jw >= t && p.blocked.is_none() && p.mergeable {
+            "merge"
+        } else if p.key_jw >= 0.85 && p.blocked.is_none() {
+            "near"
+        } else {
+            "no"
+        };
         println!(
-            "  {:<24.24} {:<22.22} {:<18.18} {:>6}  {:.3}  {:<5}  {}",
+            "  {:<24.24} {:<22.22} {:<18.18} {:>6}  {:.3}  {:<7} {:>2}  {}",
             p.a,
             p.b,
             p.kind,
             p.label,
             p.key_jw,
-            if p.blocked { "block" } else { "-" },
-            if p.key_jw >= t && !p.blocked {
-                "merge"
-            } else {
-                "no"
-            },
+            p.blocked.unwrap_or("-"),
+            p.key_edits,
+            decision,
         );
     }
 }

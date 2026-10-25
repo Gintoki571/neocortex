@@ -217,10 +217,14 @@ history.
 - Same name, different type: two entity rows (casing folds), one per type.
 - Typos, diacritic spellings and other scripts: names are compared on a
   transliteration key that is never stored ("Мюллер", "Müller", "Mueller" key
-  to the same string). A near name that passes the hard blockers and the
-  entity-cosine check joins the existing card with `near` status ("Bergn" for
-  "Bergen"); a lookalike that hits a blocker stays a separate card and is
-  reported as `ambiguous` with the candidate, never silently merged
+  to the same string). A near name that passes the hard blockers, is a
+  typo-sized edit on the differing tokens (1 Damerau-Levenshtein edit up to 8
+  chars, 2 beyond), and agrees with the entity cosine joins the existing card
+  with `near` status ("Bergn" for "Bergen"). A lookalike that hits a blocker
+  or is more than a typo away stays a separate card and is reported as
+  `ambiguous` with the candidate, never silently merged: sibling names
+  ("Bergen Airport"/"Bergen Airport South", "Novak Group North", "Jan
+  Nováček"), label pairs ("Apt 3B"/"Apt 3C"), and other hard negatives
   ("Alex"/"Alexis", "Room 101"/"Room 102", "Teresa Mota"/"Teresa Moura").
 - Same name + conflicting description: the match keeps `ambiguous` status with
   a ranked candidate; neocortex never pastes one description over the other.
@@ -239,8 +243,8 @@ history.
 
 ## Quality
 
-On 84 queries, recall is **0.953** and MRR is **0.894**; on the independent
-holdout set (88 queries) **0.924 / 0.794** (measured 2026-10-23; the ablation
+On 84 queries, recall is **0.953** and MRR is **0.895**; on the independent
+holdout set (88 queries) **0.913 / 0.796** (measured 2026-10-25; the ablation
 numbers live in `neocortex eval <fixtures> --ablation`). Recall p50 with
 UltraBERT on a 12-core laptop CPU is about **160 ms**; the 10k-memory
 hash-embedder benchmark reports **~100 ms p50 / ~220-360 ms p95** including

@@ -48,16 +48,23 @@ pub struct Config {
     /// pairs (same min 0.7404, different max 0.7275).
     pub entity_conflict: f32,
     /// Jaro-Winkler on the transliteration key at/above which a near-name
-    /// pair auto-merges when the hard blockers pass and the entity cosine
-    /// agrees (ER-07 layered dedup). Measured on the 50 labelled pairs in
-    /// tests/data/name_pairs.json (examples/name_eval): recall 1.000 (28/28
-    /// same pairs merge), precision 0.800 (7 hard negatives pass the name
-    /// layer; the entity-cosine gate and type check are the designed second
-    /// gate, e.g. "Novak Group"/"Novak Group North").
+    /// pair auto-merges when the hard blockers pass, the differing token
+    /// keys are within the typo-edit allowance (1 Damerau-Levenshtein edit
+    /// up to 8 chars, 2 beyond - `text::name_typo_ok`; the cosine is a veto
+    /// only, never a cause - ER-07 layered dedup, 2026-10-25 fix). Measured
+    /// on the 51 labelled pairs in tests/data/name_pairs.json
+    /// (examples/name_eval): recall 0.964 (27/28 same pairs merge,
+    /// "Aleksandr Ivanov"/"Alexander Ivanov" is 4 key edits apart and lands
+    /// Near), precision 0.964 (27/28 merges are same pairs; the one false
+    /// merge is "Wisniewski"/"Wisniowski", 1 edit on 10-char keys -
+    /// name-layer isomorphic to Dostoevsky/Dostoevskij, so only the cosine or
+    /// type check can split those two shapes). The brief's precision-0 target
+    /// on hard negatives is NOT met by the name layer.
     pub name_merge: f32,
     /// JW floor under which a blocked or cosine-unsure pair is silently
     /// ignored; at/above it the pair is reported instead (ambiguous
-    /// candidate, REL-19 conflict) and never auto-merged.
+    /// candidate, REL-19 conflict) and never auto-merged. Over-allowance
+    /// edit pairs land here even above `name_merge`.
     pub name_near: f32,
     pub w_bm25: f64,
     pub w_vector: f64,
