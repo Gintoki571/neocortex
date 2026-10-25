@@ -5,6 +5,7 @@
 use crate::db::Db;
 use crate::embed::Embedder;
 use crate::error::Result;
+use crate::rerank::{LazyReranker, Reranker};
 use crate::temporal::Clock;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,12 @@ pub struct Config {
     pub update_candidate: f32,
     /// Trained hop scorer for the semantic beam: "off" (cosine residual) or "on".
     pub hop_scorer: String,
+    /// Rerank the top N fused memory candidates with the cross-encoder
+    /// (0 = off). Without a model directory `recall` ignores it.
+    pub rerank_top: usize,
+    /// Share of the cross-encoder's sigmoid in the blended candidate score
+    /// (0 = fused order, 1 = cross-encoder order).
+    pub w_rerank: f64,
 }
 
 impl Default for Config {
@@ -157,6 +164,8 @@ impl Default for Config {
             fact_memory_seed: 0.0,
             update_candidate: 0.75,
             hop_scorer: "off".to_string(),
+            rerank_top: 0,
+            w_rerank: 0.5,
         }
     }
 }
@@ -164,6 +173,8 @@ impl Default for Config {
 pub struct Engine {
     pub db: Db,
     pub emb: Arc<dyn Embedder>,
+    /// Optional cross-encoder; loads lazily and only when `cfg.rerank_top > 0`.
+    pub reranker: Arc<dyn Reranker>,
     pub cfg: Config,
     /// Fixed "now" for tests/eval; None = system clock.
     pub fixed_clock: Option<Clock>,
@@ -175,6 +186,7 @@ impl Engine {
         Ok(Engine {
             db: Db::open(path)?,
             emb,
+            reranker: Arc::new(LazyReranker::new()),
             cfg: Config::default(),
             fixed_clock: None,
             snapshot_cache: Mutex::new(None),
@@ -185,10 +197,16 @@ impl Engine {
         Ok(Engine {
             db: Db::open_in_memory()?,
             emb,
+            reranker: Arc::new(LazyReranker::new()),
             cfg: Config::default(),
             fixed_clock: None,
             snapshot_cache: Mutex::new(None),
         })
+    }
+
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Engine {
+        self.reranker = reranker;
+        self
     }
 
     pub fn with_clock(mut self, clock: Clock) -> Engine {

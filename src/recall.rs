@@ -5,7 +5,7 @@ use crate::engine::{
     Community, CommunityRef, EntityCard, EntityOutput, FactHit, MemoryHit, OverviewOutput,
     RecallInput, RecallOutput,
 };
-use crate::{extract, graph, kg, paths, rank, temporal, text, Result};
+use crate::{extract, graph, kg, paths, rank, rerank, temporal, text, Result};
 use rusqlite::{params, params_from_iter, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -986,6 +986,20 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             window_empty: false,
             over_budget: false,
         });
+    }
+    // Cross-encoder: score (query, memory) jointly for the head of the fused
+    // list and blend with the fused score. It reads text only, not validity,
+    // so history / as-of questions (where the ended memory is the answer) keep
+    // the fused order. A missing or broken model leaves the order untouched.
+    if engine.cfg.rerank_top > 0 && !history && candidates.len() > 1 {
+        let head = engine.cfg.rerank_top.min(candidates.len());
+        let texts: Vec<&str> = candidates[..head]
+            .iter()
+            .map(|c| rows[&c.0].1.as_str())
+            .collect();
+        if let Ok(logits) = engine.reranker.score(&query_text, &texts) {
+            candidates = rerank::blend(candidates, &logits, engine.cfg.w_rerank);
+        }
     }
     let mmr_ids: Vec<i64> = candidates.iter().map(|x| x.0).take(3 * k).collect();
     let vecs = fetch_vectors(&engine.db, &mmr_ids)?;

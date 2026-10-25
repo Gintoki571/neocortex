@@ -1368,6 +1368,7 @@ fn embedder_identity_rejects_a_different_name() {
     let other = Engine {
         db: engine.db,
         emb: Arc::new(Other),
+        reranker: Arc::new(neocortex::rerank::LazyReranker::new()),
         cfg: Default::default(),
         fixed_clock: Some(clock()),
         snapshot_cache: std::sync::Mutex::new(None),

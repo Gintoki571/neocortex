@@ -554,6 +554,8 @@ pub const CONFIG_KEYS: &[&str] = &[
     "causal_extract",
     "w_retention",
     "access_keep",
+    "rerank_top",
+    "w_rerank",
 ];
 
 fn boolean(key: &str, value: &str) -> Result<bool> {
@@ -601,6 +603,8 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "causal_extract" => cfg.causal_extract = boolean(key, value)?,
         "w_retention" => cfg.w_retention = number(key, value)?,
         "access_keep" => cfg.access_keep = number(key, value)? as usize,
+        "rerank_top" => cfg.rerank_top = number(key, value)? as usize,
+        "w_rerank" => cfg.w_rerank = number(key, value)?,
         other => {
             return Err(crate::err!(
                 "unknown config key '{other}'; valid: {}",

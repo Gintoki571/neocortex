@@ -183,14 +183,15 @@ Input: `query`, `k` (default 8), `budget` tokens (default 1200, approx chars/4),
    - recency: × (0.9 + 0.1 · 2^(−age_days/90)) on valid_from;
    - importance: × (0.9 + 0.2 · importance);
    - retention (E5, `w_retention`, default 0.05: neutral on fixtures, +0.007 MRR on holdout, flat on world-300 and multihop-holdout2): × (1 + w_retention · retention), where `retention = min(1, importance·e^(−0.01·days_since_created) + 0.3·Σ 1/days_since_access)` over the stored access times (same-instant accesses contribute nothing).
-5. Diversity: MMR (λ = 0.75) over the top 3k candidates using stored embeddings, which removes near-duplicate hits.
-6. Context assembly (graph RAG output):
+5. Cross-encoder rerank (optional, `src/rerank.rs`): the top `rerank_top` fused candidates (0 = off) are scored jointly with the query by cross-encoder/ms-marco-MiniLM-L-6-v2 (BERT, 6 layers, 384 hidden, Apache-2.0, candle CPU, lazy-loaded from `NEOCORTEX_RERANK_MODEL` or `~/.neocortex/models/ms-marco-MiniLM-L-6-v2`). Each candidate's head-normalised fused score is blended with sigmoid(logit) at `w_rerank`; the head keeps its score range and stays above the tail. It is skipped for history, as-of and `include_history` queries (the model reads text, not validity, and would demote the ended memory that is the answer), and when the model directory is absent or fails to load recall is byte-identical to running without it.
+6. Diversity: MMR (λ = 0.75) over the top 3k candidates using stored embeddings, which removes near-duplicate hits.
+7. Context assembly (graph RAG output):
    - the top memories;
    - up to 8 facts: relations among the top-PPR entities, valid at as_of (or with validity shown), ranked by PPR(src)+PPR(dst) and fact relevance; a group loaded with ≥ 2 valid values shows the count over its display predicate rather than implying completeness;
    - up to 3 entity cards (name, type, aliases, description);
    - per-side view: a card or profile renders its facts with the card's entity as subject — "Iris reports to Kofi" (stored as "Kofi manages Iris") reads "Iris —reports to→ Kofi" on Iris's card and "Kofi —manages→ Iris" on Kofi's; symmetric facts read the same both ways.
    - Everything is packed into the budget: whole items only; the top memory always fits (`over_budget` is set when it alone exceeds the budget); omissions are reported.
-7. Side effect: bump `access_count`/`last_access` of returned memories and append their access instant to `memory_access` (capped by `access_keep`; 0 keeps no history), in one `Db::write` transaction. Ranking uses them only when `w_retention` is non-zero; `stats` reports `cold` (retention < 0.15) as a hint and never evicts.
+8. Side effect: bump `access_count`/`last_access` of returned memories and append their access instant to `memory_access` (capped by `access_keep`; 0 keeps no history), in one `Db::write` transaction. Ranking uses them only when `w_retention` is non-zero; `stats` reports `cold` (retention < 0.15) as a hint and never evicts.
 
 Default output (text, compact; `json: true` gives the same structure as JSON):
 ```
