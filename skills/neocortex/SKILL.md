@@ -82,9 +82,21 @@ Store something when it will still matter next week:
 - Pass `negated: true` for retractions such as "no longer likes" or "X does not
   support Y"; negative relations render as `—NOT→` and end the matching
   positive interval of the same fact (reasserting the positive later is normal
-  history). When `remember` returns `conflicts` or `related`, decide whether
+  history). A retraction sentence with no relation ("Ivan left Acme; he no
+  longer works there") still ends the one live fact of that kind it names at
+  the memory's `valid_from`, reported in `invalidated`; if several facts match
+  it returns `conflicts` and ends nothing, so say which one you mean. The name
+  must be the whole object of the cue: "left the Acme office" and "left Acme a
+  voicemail" end nothing, and a hedged or reported sentence ("almost quit",
+  "thinks Bob left") returns a conflict candidate instead. When
+  `remember` returns `conflicts` or `related`, decide whether
   to invalidate or supersede the candidate; neocortex never guesses and never
   deletes history.
+- Plans and routines are read from the text: "we will move next spring" gets a
+  future start (or the tag `planned` when no date resolves) and is never
+  current, so a planned move does not answer "where does X live"; "standup
+  every Monday" keeps the rule and gets the tag `recurring`. Ask for plans
+  explicitly ("upcoming", "planned", "what is scheduled") to see them.
 - **Correct, don't contradict**: use `supersedes: ["m12"]` for a newer memory
   that replaces an older one, or `invalidate m<id>` when a fact stopped being
   true (it also ends the facts that memory alone states).
@@ -106,9 +118,14 @@ Store something when it will still matter next week:
 
 - `[m42]` memory, `[r9]` relation, `[e3]` entity. Pass ids back with or without
   the prefix.
-- A date range with `[ended]` or "ended" is **history**: true then, not now.
+- `[planned]` / `[recurring]` mark a future plan or a rule; neither is a current
+  fact. A date range with `[ended]` or "ended" is **history**: true then, not now.
   `retracted` means the source was forgotten, not that it stopped being true.
   Current facts have `since <date>` or no end.
+- Ordering questions ("what happened first") return items sorted by start date;
+  duration questions ("how long did Alice work at Acme") add the computed span,
+  e.g. "3 years 2 months" or "ongoing since 2023-04-01". Ask for history when
+  the answer is about the past.
 - `(bm25#2 vec#1 graph#1)` says which channels matched; more agreeing channels
   means a stronger hit. `tlink` (temporal neighbours) and `causal` (why-answer
   evidence) appear only when those optional channels are enabled.

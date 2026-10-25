@@ -649,7 +649,7 @@ fn tool_defs() -> Vec<Value> {
     vec![
         json!({
             "name": "remember",
-            "description": "Store one durable memory. Use atomic facts, events, decisions, preferences, mistakes, procedures and outcomes. Pass every stated fact as a relation {source, predicate, target}: text alone never becomes a graph fact, so unstructured facts are invisible to multi-hop and conflict handling. For relations, exclusive=true ends competing values, false keeps this write without conflict reporting, and omission returns candidates unless the predicate is seeded single-valued. Pass negated=true for a retraction. Act on conflicts/related with invalidate or supersedes; history is never deleted. Never store secrets, credentials or transient chatter.",
+            "description": "Store one durable memory. Use atomic facts, events, decisions, preferences, mistakes, procedures and outcomes. Pass every stated fact as a relation {source, predicate, target}: text alone never becomes a graph fact, so unstructured facts are invisible to multi-hop and conflict handling. For relations, exclusive=true ends competing values, false keeps this write without conflict reporting, and omission returns candidates unless the predicate is seeded single-valued. Pass negated=true for a retraction; a retraction sentence with no relations (\"Ivan left Acme; he no longer works there\") ends the one live relation it names at valid_from and reports it in invalidated, or returns conflicts and ends nothing when several match. Only the whole object of the cue counts: \"left the Acme office\" or \"left Acme a voicemail\" ends nothing, and a hedged or reported sentence (\"almost quit\", \"thinks Bob left\") returns a conflict candidate instead. A future plan (\"we will move next spring\") gets the resolved future valid_from, or the tag planned when no date resolves; a recurring sentence (\"standup every Monday\") keeps its rule text and gets the tag recurring. Act on conflicts/related with invalidate or supersedes; history is never deleted. Never store secrets, credentials or transient chatter.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -660,7 +660,7 @@ fn tool_defs() -> Vec<Value> {
                     "scope": {"type": "string", "description": "Namespace such as \"personal\", \"work\", a repo or a project name."},
                     "source": {"type": "string", "description": "Who or what produced this memory (agent name, user, document)."},
                     "session": {"type": "string", "description": "Conversation or run id, for tracing."},
-                    "valid_from": {"type": "string", "description": "When it happened or became true: ISO date/datetime, unix seconds, or a relative phrase like \"yesterday\". Defaults to now."},
+                    "valid_from": {"type": "string", "description": "When it happened or became true: ISO date/datetime, unix seconds, or a relative phrase like \"yesterday\" or \"next spring\". Defaults to now; a future value marks the memory as a plan."},
                     "valid_to": {"type": "string", "description": "When it stopped being true; omit while it still holds."},
                     "entities": {"type": "array", "items": entity_schema(), "description": "Entities to link. Name them the same way every time so they resolve to one node."},
                     "relations": {"type": "array", "items": relation_schema(), "description": "Structured facts to add to the knowledge graph."},
@@ -673,7 +673,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "recall",
-            "description": "Retrieve what is known about a topic: memories, current and ended facts, and entity cards, packed into a token budget. Call it at the start of a task, before decisions that may depend on past context, when the user refers to something from before, and when you are stuck. Filter with kinds/tags/scope/time when you know the shape of the answer; leave filters off to search broadly. Use as_of for \"what was true then\", and include_history for how something changed.",
+            "description": "Retrieve what is known about a topic: memories, current and ended facts, and entity cards, packed into a token budget. Call it at the start of a task, before decisions that may depend on past context, when the user refers to something from before, and when you are stuck. Filter with kinds/tags/scope/time when you know the shape of the answer; leave filters off to search broadly. Use as_of for \"what was true then\", and include_history for how something changed. Future-dated and planned memories are excluded unless the question asks for plans or names a future window. Ordering questions (\"what happened first\") and duration questions (\"how long did Alice work at Acme\") return facts sorted by valid_from and a computed duration per fact (\"3 years 2 months\", \"ongoing since 2023-04-01\").",
             "inputSchema": {
                 "type": "object",
                 "properties": {

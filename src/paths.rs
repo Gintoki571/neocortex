@@ -985,6 +985,7 @@ pub(crate) fn facts(db: &Db, hits: &[PathHit], cutoff: i64, limit: usize) -> Res
                 polarity,
                 current_values: None,
                 replaced_by: None,
+                duration: None,
             });
             if out.len() >= limit {
                 return Ok(out);

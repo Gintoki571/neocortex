@@ -409,6 +409,10 @@ pub struct MemoryHit {
     pub score: f64,
     /// e.g. ["bm25#2", "vec#1", "graph#1", "time"]
     pub reasons: Vec<String>,
+    /// Set when the query asks for a duration: "3 years 2 months" or
+    /// "ongoing since 2023-04-01".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -432,6 +436,10 @@ pub struct FactHit {
     /// The newer relation that ended this one, as (id, fact).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaced_by: Option<(i64, String)>,
+    /// Set when the query asks for a duration: "3 years 2 months" or
+    /// "ongoing since 2023-04-01".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

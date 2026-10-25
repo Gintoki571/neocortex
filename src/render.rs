@@ -30,6 +30,15 @@ fn memory_line(m: &MemoryHit, fmt: Fmt<'_>) -> String {
             None => line.push_str(" [ended]"),
         }
     }
+    if m.tags.iter().any(|tag| tag == "planned") {
+        line.push_str(" [planned]");
+    }
+    if m.tags.iter().any(|tag| tag == "recurring") {
+        line.push_str(" [recurring]");
+    }
+    if let Some(duration) = &m.duration {
+        line.push_str(&format!(" ({duration})"));
+    }
     line.push_str(" · ");
     line.push_str(&m.content);
     if !m.reasons.is_empty() {
@@ -55,7 +64,7 @@ fn timeline_memory_line(m: &MemoryHit, fmt: Fmt<'_>) -> String {
 
 /// `[r9] Mom —live in→ Pune (since 2026-09-14)`
 fn fact_line(f: &FactHit, fmt: Fmt<'_>) -> String {
-    let span = match (f.valid_to, f.ended) {
+    let base = match (f.valid_to, f.ended) {
         (Some(to), true) => match &f.replaced_by {
             Some((id, fact)) => format!(
                 "{} → {}, replaced by r{id}: {fact}",
@@ -68,6 +77,13 @@ fn fact_line(f: &FactHit, fmt: Fmt<'_>) -> String {
         (None, true) if f.retracted => format!("{}, retracted", fmt(f.valid_from)),
         (None, true) => format!("{}, ended", fmt(f.valid_from)),
         (None, false) => format!("since {}", fmt(f.valid_from)),
+    };
+    // A duration question renders the computed span instead of a bare date:
+    // "3 years 2 months", or "ongoing since 2023-04-01" for a live fact.
+    let span = match &f.duration {
+        Some(d) if f.valid_to.is_none() && !f.ended => d.clone(),
+        Some(d) => format!("{base}, {d}"),
+        None => base,
     };
     let arrow = if f.polarity == 0 { "—NOT " } else { "—" };
     let suffix = f
@@ -373,6 +389,7 @@ mod tests {
             tags: Vec::new(),
             score: 1.0,
             reasons: Vec::new(),
+            duration: None,
         }
     }
 
@@ -400,6 +417,7 @@ mod tests {
             polarity: 1,
             current_values: None,
             replaced_by: None,
+            duration: None,
         }
     }
 
