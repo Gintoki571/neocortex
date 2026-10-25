@@ -1,0 +1,17 @@
+# Cross-cutting techniques
+
+* [Community summaries for global questions](community-summaries.md) - Pre-summarise graph communities so corpus-wide questions can be answered from summaries. (neocortex: adapt · LLM: indexing)
+* [Ego-graph merge with soft pruning](ego-graph-subgraph-pruning.md) - Merge ego-graphs of top key nodes and prune redundant nodes softly before returning context. (neocortex: adapt · LLM: none)
+* [Entity synonym expansion](entity-synonym-expansion.md) - Add links between phrases whose embeddings are close, so one entity is found under its variants. (neocortex: adapt · LLM: none)
+* [Entity-chunk bidirectional index](entity-chunk-bidirectional-index.md) - Index entities to the chunks they occur in and chunks to their entities, so graph hops and text lookups both stay cheap. (neocortex: adapt · LLM: none)
+* [Flow-based relational path pruning](flow-path-pruning.md) - Keep the relation paths that carry the most resource between retrieved nodes, pruning redundant paths. (neocortex: adapt · LLM: none)
+* [Graph-to-text serialization](graph-to-text-serialization.md) - Serialize a graph neighbourhood or problem into text or token sequences an LLM can read, with templates that fix the order of nodes and hops. (neocortex: adapt · LLM: retrieval)
+* [Hybrid lexical plus dense retrieval](hybrid-lexical-dense-retrieval.md) - Combine BM25 and dense vector scores (for example RRF) so exact names and paraphrases both match. (neocortex: adapt · LLM: none)
+* [Keyword-chunk bipartite index](keyword-chunk-bipartite-index.md) - A bipartite graph of keywords and chunks as a cheap alternative to a full KG. (neocortex: adapt · LLM: none)
+* [KG path beam search with LLM pruning](kg-path-beam-search.md) - Beam search over KG relation paths, with an LLM choosing which candidates survive at each hop; depth D and width N bound the search. (neocortex: adapt · LLM: retrieval)
+* [KG-grounded draft correction](kg-grounded-draft-correction.md) - Check an LLM draft's claims against KG facts, then retrofit or re-plan only the unsupported parts. (neocortex: adapt · LLM: both)
+* [KG-guided chunk expansion](kg-guided-chunk-expansion.md) - Expand a set of seed chunks through the entity graph to pull in related chunks that the vector search missed. (neocortex: adapt · LLM: none)
+* [LLM-free entity extraction](llm-free-entity-extraction.md) - Get entities from text with NER or statistics instead of an LLM, so indexing costs no tokens. (neocortex: adapt · LLM: none)
+* [Personalized PageRank seeding](ppr-seeding.md) - Seed a PageRank walk from query-matched nodes so scores spread to associated memories. (neocortex: adapt · LLM: none)
+* [Steiner subgraph retrieval](steiner-subgraph-retrieval.md) - Select a small connected subgraph that holds the most query-relevant nodes, by prize-collecting Steiner tree. (neocortex: adapt · LLM: none)
+* [Graph instruction tuning](graph-instruction-tuning.md) - Fine-tune an LLM on graph task instructions so it answers graph questions directly. (neocortex: skip · LLM: indexing)

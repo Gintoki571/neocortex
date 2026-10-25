@@ -1,0 +1,18 @@
+# Open-source projects
+
+* [GraphRAG-Bench (repository)](graphrag-bench-site.md) - Code repository and dataset host for the GraphRAG-Bench benchmark; the benchmark's method and data are in its benchmark entry. (neocortex: adopt · LLM: both)
+* [Cognee](cognee.md) - Open-source memory engine that builds knowledge graphs and embeddings from data for agents, with a no-LLM local mode based on GLiNER. (neocortex: adapt · LLM: none)
+* [DIGIMON (repository)](digimon-repo.md) - Code repository of the DIGIMON unified graph-RAG framework and its comparison harness; the study is in the benchmark entry. (neocortex: adapt · LLM: both)
+* [Fast GraphRAG](fast-graphrag.md) - Promptable GraphRAG framework that domain-tunes entity types and explores the graph with PageRank for interpretable retrieval. (neocortex: adapt · LLM: both)
+* [Graphiti](graphiti.md) - Framework for building temporal context graphs for agents, with bi-temporal facts that are invalidated rather than deleted, and hybrid retrieval. (neocortex: adapt · LLM: both)
+* [GraphRAG-SDK (FalkorDB)](graphrag-sdk.md) - Toolkit for GraphRAG on FalkorDB, with ontology-constrained extraction, multi-path retrieval and a retrieval trail for grounding checks. (neocortex: adapt · LLM: both)
+* [LightRAG](lightrag.md) - Graph-based RAG with entity and relation indexing and dual-level (low-level and high-level) retrieval, from the HKUDS group. (neocortex: adapt · LLM: both)
+* [nano-graphrag](nano-graphrag.md) - Small, hackable GraphRAG implementation with networkx graph storage, nano-vectordb and local, global and naive query modes. (neocortex: adapt · LLM: both)
+* [Agentic-RAG (LogicRAG)](agentic-rag.md) - README lists an agentic RAG system; the repo now redirects to chensyCN/LogicRAG, Source code of LogicRAG at AAAI'26. (neocortex: watch · LLM: both)
+* [Code-Graph-RAG](code-graph-rag.md) - Graph RAG over multi-language codebases: Tree-sitter parse to a knowledge graph, queried in natural language and edited via MCP. (neocortex: watch · LLM: retrieval)
+* [HuixiangDou2](huixiangdou2.md) - GraphRAG approach (ROGRAG) with a two-stage dual-level and logic-form retrieval. (neocortex: watch · LLM: both)
+* [Microsoft GraphRAG](microsoft-graphrag.md) - Data pipeline that extracts structured data from unstructured text with LLMs for GraphRAG queries. (neocortex: watch · LLM: both)
+* [Semantica](semantica.md) - Open-source semantic layer and GraphRAG framework between raw corpora and LLMs. (neocortex: watch · LLM: none)
+* [VeritasGraph](veritasgraph.md) - Local GraphRAG pipeline combining tree-search document structure with KG reasoning and source attribution. (neocortex: watch · LLM: both)
+* [ApeRAG](aperag.md) - Production RAG platform combining Graph RAG, vector search and full-text search with AI agents and MCP support. (neocortex: skip · LLM: both)
+* [WFGY Problem Map](wfgy.md) - A set of documents that defines 16 recurring RAG failure modes, with a large text-based ecosystem around it. (neocortex: skip · LLM: both)
