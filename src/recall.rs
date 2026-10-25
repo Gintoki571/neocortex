@@ -815,7 +815,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     rows.extend(fetch_rows(&engine.db, &missing)?);
     causal_ids.retain(|id| {
         rows.get(id)
-            .is_some_and(|row| eligible(row, as_of, history, input, since, until))
+            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
     });
     causal_ids.truncate(depth);
 
@@ -835,7 +835,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     rows.extend(fetch_rows(&engine.db, &missing)?);
     tlink_ids.retain(|id| {
         rows.get(id)
-            .is_some_and(|row| eligible(row, as_of, history, input, since, until))
+            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
     });
     tlink_ids.truncate(depth);
 
