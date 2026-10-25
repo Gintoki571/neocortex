@@ -956,6 +956,12 @@ fn communities_persist_two_clusters() {
             }
             kg::project_similar(db, 1, 2, 1.0)?;
             kg::project_similar(db, 3, 4, 1.0)?;
+            for (a, b) in [(1, 2), (3, 4)] {
+                db.sql().execute(
+                    "INSERT OR REPLACE INTO similar(a,b,score) VALUES (?1,?2,1.0)",
+                    rusqlite::params![a, b],
+                )?;
+            }
             Ok(())
         })
         .unwrap();

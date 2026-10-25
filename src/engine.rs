@@ -387,6 +387,14 @@ pub struct FactHit {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct CommunityRef {
+    pub id: i64,
+    /// Top-degree member names, e.g. "Alice, Bob, Carol +9".
+    pub label: String,
+    pub size: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct EntityCard {
     pub id: i64,
     pub name: String,
@@ -394,6 +402,9 @@ pub struct EntityCard {
     pub kind: String,
     pub aliases: Vec<String>,
     pub description: String,
+    /// Set by `entity`; omitted on recall/overview cards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub community: Option<CommunityRef>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -453,9 +464,16 @@ pub struct ChangeOutput {
 #[derive(Clone, Debug, Serialize)]
 pub struct Community {
     pub id: i64,
+    /// Top-degree member names, e.g. "Alice, Bob, Carol +9".
+    pub label: String,
     pub size: usize,
     /// Most central / most relevant entities first.
     pub entities: Vec<EntityCard>,
+    /// The community's most common live predicates.
+    pub predicates: Vec<String>,
+    /// Oldest memory start and youngest end covered by the community.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<(i64, i64)>,
     pub facts: Vec<FactHit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub representative: Option<MemoryHit>,

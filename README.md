@@ -71,12 +71,12 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 |---|---|
 | `remember <content...>` | store a memory; flags below |
 | `recall <query...>` | retrieve memories, facts and entities |
-| `entity <name\|eID>` | profile, current/past facts and timeline of one entity |
+| `entity <name\|eID>` | profile (with its community), current/past facts and timeline of one entity |
 | `invalidate <mID\|rID>` | end a memory or relation at a time, keeping it as history |
 | `forget <mID>` | retire a memory; its sole-evidence relations are retracted (`--hard` deletes it with vectors and mentions) |
 | `merge <keep> <merge>` | merge one entity into another (`--force` crosses types) |
 | `alias <entity> <alias>` | add another name to an entity |
-| `overview [query...]` | clusters of the entity graph |
+| `overview [query...]` | communities with labels, key predicates and date spans |
 | `stats` | counts, database size, embedder |
 | `reindex` | rebuild the graph projection from the relational tables |
 | `validate` | report integrity problems (exit 1 when any) |
@@ -93,6 +93,14 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 `remember -` reads a whole `RememberInput` JSON object from stdin.
 `recall` flags: `--k --budget --kinds --tags --scope --source --session --since
 --until --as-of --history --entities --keywords`.
+
+Every CLI invocation loads the embedder before it answers: the tokenizer parse
+plus the safetensors copies cost about half a second of CPU, so a run of
+one-off commands pays it each time. An agent that stays in the store for a
+session should start `neocortex mcp` once and keep that process resident; a
+unix-socket `serve` mode was considered and is not provided, because the MCP
+stdio server already is the resident path and a second protocol surface would
+not pay for itself.
 
 `cypher` runs read-only openCypher over the graph projection:
 `MATCH ... [WHERE ...] RETURN ... [ORDER BY ...] [SKIP n] [LIMIT n]`. It refuses
@@ -191,6 +199,14 @@ supports protocol versions `2025-06-18`, `2025-03-26` and `2024-11-05`.
 `overview`, `stats`. Every tool accepts `format: "text"` (default, compact) or
 `"json"`. Tool errors come back as `isError: true` content with a message that
 says what to fix.
+
+`overview` runs deterministic Leiden community detection over the live graph
+(the same seed always gives the same partition; `cN` ids are matched to the
+previous run by member overlap). Each community is summarised without an LLM:
+a label of its highest-degree entities, its size, the most common live
+predicates, the date span of its memories, three central facts and a
+representative memory. `entity` cards carry the same community as
+`community: {id, label, size}`.
 
 The agent-facing guide — when to remember, how to write a good memory, when to
 recall — is in [`skills/neocortex/SKILL.md`](skills/neocortex/SKILL.md).
