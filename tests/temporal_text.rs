@@ -274,6 +274,185 @@ fn tm10_no_matching_relation_is_a_quiet_no_op() {
     assert_eq!(relation_end(&e, rid), None);
 }
 
+/// The world the review table runs against: Ivan at Acme, Maria married to
+/// Tom, Ivan in Bergen.
+struct World {
+    work: i64,
+    married: i64,
+    residence: i64,
+}
+
+fn retraction_world() -> (Engine, World) {
+    let e = engine();
+    let work = e
+        .remember(RememberInput {
+            content: "Ivan works at Acme.".into(),
+            valid_from: Some("2020-01-01".into()),
+            entities: vec![person("Ivan"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap()
+        .relations[0]
+        .id;
+    let married = e
+        .remember(RememberInput {
+            content: "Maria is married to Tom.".into(),
+            valid_from: Some("2018-01-01".into()),
+            entities: vec![person("Maria"), person("Tom")],
+            relations: vec![rel("Maria", "married to", "Tom", true)],
+            ..Default::default()
+        })
+        .unwrap()
+        .relations[0]
+        .id;
+    let residence = e
+        .remember(RememberInput {
+            content: "Ivan lives in Bergen.".into(),
+            valid_from: Some("2019-01-01".into()),
+            entities: vec![person("Ivan"), place("Bergen")],
+            relations: vec![rel("Ivan", "lives in", "Bergen", true)],
+            ..Default::default()
+        })
+        .unwrap()
+        .relations[0]
+        .id;
+    (
+        e,
+        World {
+            work,
+            married,
+            residence,
+        },
+    )
+}
+
+fn plain(e: &Engine, content: &str) -> neocortex::engine::RememberOutput {
+    e.remember(RememberInput {
+        content: content.into(),
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+/// A wrongly ended fact disappears from current recall, so every "not ended"
+/// row also checks the relation is still open.
+fn assert_kept(e: &Engine, out: &neocortex::engine::RememberOutput, rid: i64) {
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "relation r{rid} was ended: {out:?}"
+    );
+    assert_eq!(
+        relation_end(e, rid),
+        None,
+        "relation r{rid} got an end date"
+    );
+}
+
+fn assert_ended(out: &neocortex::engine::RememberOutput, rid: i64) {
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "relation r{rid} was not ended: {out:?}"
+    );
+}
+
+#[test]
+fn tm10b_a_determiner_in_the_gap_is_not_a_retraction() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Ivan left the Acme office at 5pm to pick up his kids.");
+    assert_kept(&e, &out, w.work);
+}
+
+#[test]
+fn tm10b_a_ditransitive_left_is_not_a_retraction() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Ivan left Acme a voicemail about the invoice.");
+    assert_kept(&e, &out, w.work);
+}
+
+#[test]
+fn tm10b_a_possessive_object_is_not_a_retraction() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Ivan left Acme's parking lot after the meeting.");
+    assert_kept(&e, &out, w.work);
+}
+
+#[test]
+fn tm10b_a_hedged_near_miss_is_a_conflict_candidate() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Ivan almost quit Acme last year but stayed.");
+    assert_kept(&e, &out, w.work);
+    assert!(
+        out.conflicts.iter().any(|c| c.relation_id == w.work),
+        "hedged retraction was not reported as a candidate: {out:?}"
+    );
+}
+
+#[test]
+fn tm10b_a_negated_left_is_not_a_retraction() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Ivan did not leave Acme despite the offer from Globex.");
+    assert_kept(&e, &out, w.work);
+}
+
+#[test]
+fn tm10b_a_reported_belief_is_not_a_retraction() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Ivan thinks Bob left Acme.");
+    assert_kept(&e, &out, w.work);
+}
+
+#[test]
+fn tm10b_left_a_person_at_the_station_is_not_a_retraction() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Maria left Tom at the station and went home.");
+    assert_kept(&e, &out, w.married);
+}
+
+#[test]
+fn tm10b_left_a_place_for_a_purpose_is_not_a_retraction() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Ivan left Bergen for a two-day conference in Oslo.");
+    assert_kept(&e, &out, w.residence);
+}
+
+#[test]
+fn tm10b_left_acme_with_a_time_expression_ends() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Ivan left Acme last month and joined Globex.");
+    assert_ended(&out, w.work);
+}
+
+#[test]
+fn tm10b_no_longer_works_at_ends() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Ivan no longer works at Acme.");
+    assert_ended(&out, w.work);
+}
+
+#[test]
+fn tm10b_moved_out_of_ends() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Ivan moved out of Bergen in June.");
+    assert_ended(&out, w.residence);
+}
+
+#[test]
+fn tm10b_divorced_ends_the_marriage() {
+    let (e, w) = retraction_world();
+    let out = plain(&e, "Maria divorced Tom in 2024.");
+    assert_ended(&out, w.married);
+}
+
+#[test]
+fn tm10b_split_and_separated_end_the_marriage() {
+    for content in ["Maria split up with Tom.", "Maria separated from Tom."] {
+        let (e, w) = retraction_world();
+        let out = plain(&e, content);
+        assert_ended(&out, w.married);
+    }
+}
+
 // ---------------------------------------------------------------- TM-11
 
 #[test]

@@ -213,7 +213,10 @@ stored with polarity and end matching positive validity without deleting
 history. A retraction sentence with no relations ("Ivan left Acme; he no
 longer works there") ends the one live relation of that kind it names at the
 memory's `valid_from` and reports it in `invalidated`; when several relations
-match it reports `conflicts` and ends nothing.
+match it reports `conflicts` and ends nothing. The name must be the whole
+object of the cue: "left the Acme office", "left Acme's parking lot" and "left
+Acme a voicemail" end nothing, and a hedge ("almost quit", "thinks Bob left")
+only reports a conflict candidate.
 
 Plans and routines are recognised from the text: "we will move next spring"
 gets a future `valid_from` (or the tag `planned` when no date resolves) and is

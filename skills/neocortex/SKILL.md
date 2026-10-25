@@ -72,7 +72,10 @@ Store something when it will still matter next week:
   history). A retraction sentence with no relation ("Ivan left Acme; he no
   longer works there") still ends the one live fact of that kind it names at
   the memory's `valid_from`, reported in `invalidated`; if several facts match
-  it returns `conflicts` and ends nothing, so say which one you mean. When
+  it returns `conflicts` and ends nothing, so say which one you mean. The name
+  must be the whole object of the cue: "left the Acme office" and "left Acme a
+  voicemail" end nothing, and a hedged or reported sentence ("almost quit",
+  "thinks Bob left") returns a conflict candidate instead. When
   `remember` returns `conflicts` or `related`, decide whether
   to invalidate or supersede the candidate; neocortex never guesses and never
   deletes history.

@@ -57,6 +57,8 @@ const RETRACTIONS: &[(&[&str], &str)] = &[
     (&["left"], "work at"),
     (&["moved", "out", "of"], "live in"),
     (&["broke", "up", "with"], "married to"),
+    (&["split", "up", "with"], "married to"),
+    (&["separated", "from"], "married to"),
     (&["divorced"], "married to"),
     (&["sold"], "own"),
     (&["stopped", "using"], "use"),
@@ -72,6 +74,201 @@ const RETRACTIONS: &[(&[&str], &str)] = &[
 const RETRACTION_BREAKS: &[&str] = &[
     "and", "but", "because", "while", "although", "though", "who", "which", "that",
 ];
+
+/// A determiner between the cue and a name makes the name part of a longer
+/// noun phrase ("the Acme office"), so it is not the object of the cue.
+const OBJECT_DETERMINERS: &[&str] = &[
+    "the", "a", "an", "some", "any", "his", "her", "their", "its", "my", "our", "your", "this",
+    "that", "these", "those",
+];
+
+/// Followers that end the object with a clause boundary.
+const CLAUSE_FOLLOWERS: &[&str] = &["and", "but", "then"];
+
+/// Calendar and clock words a time expression may start with or contain.
+const TIME_WORDS: &[&str] = &[
+    "yesterday",
+    "today",
+    "tomorrow",
+    "tonight",
+    "ago",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "sept",
+    "oct",
+    "nov",
+    "dec",
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "year",
+    "years",
+    "hour",
+    "hours",
+    "minute",
+    "minutes",
+    "spring",
+    "summer",
+    "autumn",
+    "fall",
+    "winter",
+    "noon",
+    "midnight",
+    "night",
+    "morning",
+    "evening",
+    "afternoon",
+];
+
+/// Hedges and modality in the clause before the cue: the sentence reports a
+/// belief, a plan or a near miss, so the fact is not ended. The relation is
+/// offered as a conflict candidate instead.
+const HEDGES: &[&str] = &[
+    "almost",
+    "nearly",
+    "might",
+    "may",
+    "could",
+    "would",
+    "should",
+    "plans",
+    "plan",
+    "planned",
+    "wants",
+    "want",
+    "considering",
+    "thinking",
+    "thought",
+    "if",
+    "unless",
+    "rumoured",
+    "rumored",
+    "reportedly",
+    "thinks",
+    "think",
+    "believes",
+    "believe",
+    "said",
+    "says",
+    "say",
+    "hopes",
+    "hope",
+];
+
+/// How the object of a cue ends. Only the first three make the name the whole
+/// object; `Noun` means the name continues into a noun phrase or is a
+/// ditransitive object ("the Acme office", "Acme's parking lot", "left Acme a
+/// voicemail"), and the sentence retracts nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObjectTail {
+    /// End of sentence, punctuation, or a clause boundary ("and", "but").
+    Boundary,
+    /// A time expression ("last month", "in June", "yesterday", "at 5pm").
+    Time,
+    /// An employment move ("to join Globex", "for Globex", "for good").
+    Employment,
+    /// The name continues into a noun phrase.
+    Noun,
+}
+
+/// Classify what follows the object. Rule 1 of the retraction contract: the
+/// object span must be the whole object of the cue.
+fn object_tail(
+    lower: &str,
+    object_end: usize,
+    words: &[(usize, usize, &str)],
+    next: usize,
+    group: &str,
+    spans: &[(usize, usize, String)],
+) -> ObjectTail {
+    let rest = &lower[object_end..];
+    // A possessive continues the noun phrase ("Acme's parking lot").
+    if rest.starts_with("'s") || rest.starts_with('\u{2019}') {
+        return ObjectTail::Noun;
+    }
+    let Some(&(start, _, word)) = words.get(next) else {
+        return ObjectTail::Boundary;
+    };
+    if start < object_end
+        || rest[..start - object_end]
+            .chars()
+            .any(|c| !c.is_whitespace())
+    {
+        // Punctuation right after the name closes the object.
+        return ObjectTail::Boundary;
+    }
+    if CLAUSE_FOLLOWERS.contains(&word) {
+        return ObjectTail::Boundary;
+    }
+    if time_tail(words, next) {
+        return ObjectTail::Time;
+    }
+    match (word, words.get(next + 1).map(|w| w.2)) {
+        ("for", Some("good")) | ("to", Some("join")) => ObjectTail::Employment,
+        ("for", Some(_))
+            if group == "work at" && spans.iter().any(|(s, _, _)| *s == words[next + 1].0) =>
+        {
+            ObjectTail::Employment
+        }
+        _ => ObjectTail::Noun,
+    }
+}
+
+/// True when the word at `i` starts a time expression. `at` needs a clock
+/// time, so "at the station" stays a noun phrase.
+fn time_tail(words: &[(usize, usize, &str)], i: usize) -> bool {
+    let word = words[i].2;
+    let next = words.get(i + 1).map(|w| w.2);
+    match word {
+        "yesterday" | "today" | "tomorrow" | "tonight" | "ago" => true,
+        "last" | "this" | "next" => next.is_some_and(|n| TIME_WORDS.contains(&n)),
+        "in" | "on" => {
+            next.is_some_and(|n| TIME_WORDS.contains(&n) || n.chars().all(|c| c.is_ascii_digit()))
+        }
+        "at" => next.is_some_and(|n| {
+            n.chars().any(|c| c.is_ascii_digit())
+                || matches!(
+                    n,
+                    "noon" | "midnight" | "night" | "morning" | "evening" | "afternoon"
+                )
+        }),
+        _ => false,
+    }
+}
+
+/// True when the clause from word `from` up to the cue hedges, plans or
+/// reports the event.
+fn hedged(words: &[(usize, usize, &str)], from: usize, cue: usize) -> bool {
+    words[from..cue].iter().any(|w| HEDGES.contains(&w.2))
+}
 
 fn words_of(text: &str) -> Vec<String> {
     text.split_whitespace()
@@ -190,6 +387,9 @@ struct TextRetraction {
     subject: String,
     object: String,
     group: &'static str,
+    /// The sentence hedges or reports the event: offer the relation as a
+    /// conflict candidate, never end it.
+    candidate: bool,
 }
 
 /// Spans where a name occurs as whole words in the content, as
@@ -301,18 +501,56 @@ fn text_retractions(content: &str, spans: &[(usize, usize, String)]) -> Vec<Text
             let phrase_start = words[p].0;
             let phrase_end = words[p + plen - 1].1;
             let max_end = words.get(p + plen + 2).map(|w| w.1).unwrap_or(usize::MAX);
-            let mut object = spans
+            let mut object_span = spans
                 .iter()
                 .find(|(s, _, _)| *s >= phrase_end && *s <= max_end)
-                .map(|(_, _, name)| name.clone());
-            if object.is_none() && words.iter().skip(p + plen).take(4).any(|w| w.2 == "there") {
-                object = spans
+                .cloned();
+            if object_span.is_none() && words.iter().skip(p + plen).take(4).any(|w| w.2 == "there")
+            {
+                object_span = spans
                     .iter()
                     .rev()
                     .find(|(_, e, _)| *e <= phrase_start)
-                    .map(|(_, _, name)| name.clone());
+                    .cloned();
             }
-            let Some(object) = object else { continue };
+            let Some((object_start, object_end, object)) = object_span else {
+                continue;
+            };
+            let mut candidate = false;
+            if object_start >= phrase_end {
+                // A span may start before the name it normalises to ("the
+                // Acme" from the alias n-grams), so the gap and the tail are
+                // measured from different edges.
+                let gap_end = words.partition_point(|w| w.0 < object_start);
+                let next_word = words.partition_point(|w| w.0 < object_end);
+                // Rule 1: a determiner between the cue and the name means the
+                // name is inside a longer noun phrase, not the object.
+                if words[p + plen..gap_end]
+                    .iter()
+                    .any(|w| OBJECT_DETERMINERS.contains(&w.2))
+                {
+                    continue;
+                }
+                // Rules 1+2: the object must be the whole object. A bare
+                // "left" also means "departed from" or "left behind", so it
+                // ends nothing unless a clause boundary, a time expression or
+                // an employment tail follows (rule 4).
+                if object_tail(&lower, object_end, &words, next_word, group, spans)
+                    == ObjectTail::Noun
+                {
+                    continue;
+                }
+                // Rule 3: a hedge or report before the cue ("almost quit",
+                // "thinks Bob left") is a candidate, not an end.
+                let clause = lower[..phrase_start]
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| matches!(c, '.' | ';' | '!' | '?' | '\n'))
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                let from = words.partition_point(|w| w.0 < clause);
+                candidate = hedged(&words, from, p);
+            }
             let min_start = words.get(p.saturating_sub(10)).map(|w| w.0).unwrap_or(0);
             let Some(subject) = spans
                 .iter()
@@ -328,6 +566,7 @@ fn text_retractions(content: &str, spans: &[(usize, usize, String)]) -> Vec<Text
                     subject,
                     object,
                     group,
+                    candidate,
                 },
             ));
         }
@@ -347,11 +586,14 @@ fn text_retractions(content: &str, spans: &[(usize, usize, String)]) -> Vec<Text
             continue;
         }
         subject_of_object.insert(retraction.object.clone(), retraction.subject.clone());
-        if !out.iter().any(|r| {
+        if let Some(seen) = out.iter_mut().find(|r| {
             r.subject == retraction.subject
                 && r.object == retraction.object
                 && r.group == retraction.group
         }) {
+            // A plain statement of the same retraction outranks a hedged one.
+            seen.candidate &= retraction.candidate;
+        } else {
             out.push(retraction);
         }
     }
@@ -417,7 +659,7 @@ fn end_text_retractions(
             )?
             .collect::<rusqlite::Result<_>>()?;
         match rows.as_slice() {
-            [(rid, _, old_from)] => {
+            [(rid, _, old_from)] if !retraction.candidate => {
                 if *old_from >= at {
                     // Same instant: the retraction is a correction, so the
                     // older row is system-retired rather than zero-length.
