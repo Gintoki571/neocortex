@@ -84,7 +84,7 @@ failure mode (bad decompositions) for no accuracy left to win on this data.
 The no-network, candle-only constraint also rules out pulling a model at run
 time.
 
-### 2.3 Tiny trained "System-1" scorer (SubgraphRAG shape) — not run, deferred
+### 2.3 Tiny trained "System-1" scorer (SubgraphRAG shape) — run 2026-10-26, not adopted (section 8)
 
 SubgraphRAG/GNN-RAG-style scorers rank candidate triples with a small trained
 model. Training data can be generated from a *different* `gen_world` seed (never
@@ -328,4 +328,21 @@ Rejected: reserving an output slot for the best prose-ending chain's memory (its
 
 Trade-offs, measured: holdout recall 0.924 -> 0.913 is one query ("the boat she takes out on the river": the expect_absent touring-kayak memory now outranks the single scull, reached through Ingrid's prose memories); multihop-holdout two-hop 0.850 -> 0.825 is one query ("partner of Ravi Menon": "resides in Antwerp | Seun born in Antwerp" outscores "married to | born in Naples" because "partner" barely matches "married to"). Both are the paraphrase weakness a trained triple scorer would address. Variants that fixed the boat query (memory hops only after a relation hop; anchor-only seeds) cost more elsewhere (fixtures recall 0.941; holdout MRR 0.778).
 
-Remaining misses are three-hop chains whose middle hop is a paraphrase ("partner"/"married to", "trained"/"studied at") or whose answer sits in a long prose memory. Single-shot retrieval is at 0.82 on this set; the >90% bar needs either the agent loop (`follow` on the bridge entity, measured 600/600 on world-1000 in 3.3) or a learned hop scorer.
+Remaining misses are three-hop chains whose middle hop is a paraphrase ("partner"/"married to", "trained"/"studied at") or whose answer sits in a long prose memory. Single-shot retrieval is at 0.82 on this set; the >90% bar needs either the agent loop (`follow` on the bridge entity, measured 600/600 on world-1000 in 3.3) or a learned hop scorer (section 8: tried, not adopted).
+
+## 8. Learned hop scorer (2026-10-26, lane nc-hop): not adopted
+
+Method: L2 logistic regression over the seven features of `search_semantic`'s candidate hops (`scripts/train_hop_scorer.py`, numpy). Data: `NEOCORTEX_DUMP_HOPS` dumps of eval/fixtures.json (2,619 candidates) and of gen_world seeds 42 and 11 at 100 people (42,767 and 38,639 candidates); 981 queries, 2,500 positive hops. Label: an evidence memory of the hop is an expected memory of the query. Split by query, 20% validation: AUC 0.933 (train 0.947) against 0.798 for the residual cosine on the same candidates. Weights live in `src/paths.rs` (`HOP_WEIGHTS`, `HOP_BIAS`). The validation log-loss was flat across the L2 grid (0 to 1), so the penalty did not matter at this data size.
+
+Same binary, `eval --set hop_scorer=off|on`:
+
+| Set | off | on |
+| fixtures recall / MRR | 0.953 / 0.896 | 0.955 / 0.898 |
+| holdout recall / MRR | 0.913 / 0.791 | 0.924 / 0.787 |
+| multihop-holdout acc@10 (two-hop / three-hop) | 0.825 (0.825 / 0.720) | 0.787 (0.800 / 0.640) |
+| multihop-holdout2 acc@10 (two-hop) | 0.820 (0.875) | 0.810 (0.850) |
+| world-300 acc@10 | 0.992 | 0.992 |
+
+World-300 recall p50, two interleaved pairs under machine load ~40: off 253 and 219 ms, on 166 and 168 ms. The load is too high for a clean 10% comparison; no slowdown is visible.
+
+Verdict: the default stays `off`. The scorer adds one holdout query (recall +0.011) but loses MRR there and loses acc@10 on both multihop sets, the opposite of the goal. The gate failed on multihop-holdout2 (0.810 < 0.82). Multihop-holdout was checked once and multihop-holdout2 once; no weights were re-tuned after seeing either. Unverified guess for the failure: the weights are large (cos(question) about 20) and the training worlds are template-generated, so their paraphrase pattern differs from the hand-written sets. Revisit only with chains generated from a new paraphrase distribution and a fresh blind set.

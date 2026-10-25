@@ -580,6 +580,7 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "w_graph" => cfg.w_graph = number(key, value)?,
         "w_temporal" => cfg.w_temporal = number(key, value)?,
         "w_sempath" => cfg.w_sempath = number(key, value)?,
+        "hop_scorer" => cfg.hop_scorer = value.to_string(),
         "rrf_k" => cfg.rrf_k = number(key, value)?,
         "alpha" => cfg.alpha = number(key, value)?,
         "entity_seed" => cfg.entity_seed = number(key, value)? as f32,

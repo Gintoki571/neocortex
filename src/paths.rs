@@ -430,22 +430,82 @@ const PROSE_HOP: f64 = 0.8;
 /// Target of a hop through a memory that names no other entity.
 const NO_ENTITY: i64 = -1;
 
+/// Learned hop scorer weights (L2 logistic regression, raw feature scale) over
+/// [cos(question,fact), cos(residual,fact), hop_index, prose, pred_overlap,
+///  log(1+degree), far_mentioned]. Trained by `scripts/train_hop_scorer.py` on
+/// `NEOCORTEX_DUMP_HOPS` dumps of eval/fixtures.json and gen_world seeds 42 and
+/// 11 (100 people each), 2026-10-26. Used only when `hop_scorer=on`.
+const HOP_WEIGHTS: [f64; 7] = [
+    19.9840337,
+    -2.7410487,
+    -0.41490904,
+    -0.151894685,
+    10.0273381,
+    -0.0860151107,
+    -0.672498487,
+];
+const HOP_BIAS: f64 = -10.0124513;
+
+fn learned_hop_score(features: &[f64]) -> f64 {
+    let mut z = HOP_BIAS;
+    for (w, f) in HOP_WEIGHTS.iter().zip(features) {
+        z += w * f;
+    }
+    1.0 / (1.0 + (-z).exp())
+}
+
+/// Hop score in the semantic beam: the learned scorer when on, else the cosine.
+fn hop_value(use_scorer: bool, cosine: f64, features: &[f64]) -> f64 {
+    if use_scorer {
+        learned_hop_score(features)
+    } else {
+        cosine
+    }
+}
+
+fn entity_degree(db: &Db, id: i64, cache: &mut HashMap<i64, f64>) -> f64 {
+    if id == NO_ENTITY {
+        return 0.0;
+    }
+    if let Some(v) = cache.get(&id) {
+        return *v;
+    }
+    let count: i64 = db
+        .sql()
+        .query_row(
+            "SELECT count(*) FROM mentions WHERE entity_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let v = (count as f64 + 1.0).ln();
+    cache.insert(id, v);
+    v
+}
+
 /// Semantic twin of [`search`] for questions that paraphrase the stored
 /// predicates ("who guides Noor's career" vs `mentors`): hops may only use
 /// relations among the question's nearest facts. Each hop is scored against
 /// the residual question (the question vector minus what earlier hops already
 /// explained) and a path scores the sum, so a chain beats a single fact that
 /// matches only part of the question. Only paths of >= 2 hops are emitted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn search_semantic(
     db: &Db,
+    query: &str,
     query_vec: &[f32],
     seeds: &[i64],
     anchors: &[i64],
     nearest_memories: &[i64],
     vis: Visibility,
+    use_scorer: bool,
 ) -> Result<Vec<PathHit>> {
     if seeds.is_empty() {
         return Ok(Vec::new());
+    }
+    let mut query_forms: HashSet<String> = HashSet::new();
+    for t in text::tokens(query) {
+        query_forms.extend(token_forms(&t));
     }
     // Facts the question recognises; their vectors are read lazily, only for
     // the edges the beam reaches (a vec0 vector read costs ~0.3 ms).
@@ -517,6 +577,12 @@ pub(crate) fn search_semantic(
         .prepare_cached("SELECT embedding FROM memories_vec WHERE rowid=?1")?;
     let mut memory_vectors: HashMap<i64, Vec<f32>> = HashMap::new();
     let mut cache: HashMap<i64, Vec<(Step, i64, Vec<f32>)>> = HashMap::new();
+    let mut degree_cache: HashMap<i64, f64> = HashMap::new();
+    // Training dump (`NEOCORTEX_DUMP_HOPS=<file>`): features of every candidate.
+    let dump = std::env::var("NEOCORTEX_DUMP_HOPS")
+        .ok()
+        .filter(|p| !p.is_empty());
+    let want_features = use_scorer || dump.is_some();
     let mut edges = |entity: i64| -> Result<Vec<(Step, i64, Vec<f32>)>> {
         if let Some(hit) = cache.get(&entity) {
             return Ok(hit.clone());
@@ -606,6 +672,8 @@ pub(crate) fn search_semantic(
     };
     // (entity, visited entities, cosine sum, steps, residual question vector)
     type SemState = (i64, Vec<i64>, f64, Vec<Step>, Vec<f32>);
+    // (step, far entity, far vector, hop score, scorer features)
+    type ScoredHop = (Step, i64, Vec<f32>, f64, Vec<f64>);
     let mut frontier: Vec<SemState> = seeds
         .iter()
         .map(|id| (*id, vec![*id], 0.0, Vec::new(), query_vec.to_vec()))
@@ -614,33 +682,103 @@ pub(crate) fn search_semantic(
     for _ in 0..MAX_DEPTH {
         let mut next = Vec::new();
         for (entity, visited, sum, steps, residual) in &frontier {
-            let mut scored: Vec<(Step, i64, Vec<f32>, f64)> = edges(*entity)?
+            // First compute features + base cosine for every candidate.
+            let mut scored: Vec<ScoredHop> = edges(*entity)?
                 .into_iter()
                 // A chain may start at a question anchor but never pass
                 // through one: that walk lists sibling facts about the anchor.
                 .filter(|(_, other, _)| !visited.contains(other) && !anchors.contains(other))
                 .map(|(step, other, vector)| {
                     // Prose is weaker evidence of a link than a stated relation.
-                    let weight = if step.memory.is_some() {
-                        PROSE_HOP
+                    let prose = step.memory.is_some();
+                    let weight = if prose { PROSE_HOP } else { 1.0 };
+                    let cos_residual = f64::from(crate::rank::cosine(residual, &vector));
+                    let cosine = weight * cos_residual;
+                    // Features cost a degree lookup per entity: built only when used.
+                    let features = if want_features {
+                        let cos_question = f64::from(crate::rank::cosine(query_vec, &vector));
+                        // Predicate-to-question token overlap (stemmed forms).
+                        let pred_overlap = if step.predicate.is_empty() {
+                            0.0
+                        } else {
+                            let pf = text_forms(&step.predicate);
+                            let inter = pf.intersection(&query_forms).count() as f64;
+                            (inter / (query_forms.len().max(1) as f64)).min(1.0)
+                        };
+                        let hop_index = (steps.len() + 1) as f64;
+                        let degree = if other == NO_ENTITY {
+                            0.0
+                        } else {
+                            entity_degree(db, other, &mut degree_cache)
+                        };
+                        let far_mentioned = if anchors.contains(&other) || seeds.contains(&other) {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        vec![
+                            cos_question,
+                            cos_residual,
+                            hop_index,
+                            if prose { 1.0 } else { 0.0 },
+                            pred_overlap,
+                            degree,
+                            far_mentioned,
+                        ]
                     } else {
-                        1.0
+                        Vec::new()
                     };
-                    let cosine = weight * f64::from(crate::rank::cosine(residual, &vector));
-                    (step, other, vector, cosine)
+                    let hop_score = hop_value(use_scorer, cosine, &features);
+                    (step, other, vector, hop_score, features)
                 })
                 .collect();
             scored.sort_by(|a, b| {
                 b.3.total_cmp(&a.3)
                     .then(a.0.relation_id.cmp(&b.0.relation_id))
             });
+            // Optional dump of every candidate considered (training data).
+            if let Some(path) = &dump {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    use std::io::Write;
+                    for (step, _other, _vector, _score, features) in &scored {
+                        let memory_ids: Vec<i64> = if let Some(mid) = step.memory {
+                            vec![mid]
+                        } else {
+                            db.sql()
+                                .prepare_cached(
+                                    "SELECT memory_id FROM relation_evidence WHERE relation_id=?1",
+                                )
+                                .ok()
+                                .and_then(|mut st| {
+                                    st.query_map([step.relation_id], |r| r.get::<_, i64>(0))
+                                        .ok()
+                                        .map(|rows| rows.filter_map(|x| x.ok()).collect())
+                                })
+                                .unwrap_or_default()
+                        };
+                        let rec = serde_json::json!({
+                            "query": query,
+                            "depth": steps.len() + 1,
+                            "features": features,
+                            "memory_ids": memory_ids,
+                            "relation_id": step.relation_id,
+                            "prose": step.memory.is_some(),
+                        });
+                        let _ = writeln!(f, "{}", rec);
+                    }
+                }
+            }
             scored.truncate(SEM_EDGES);
-            for (step, other, vector, cosine) in scored {
+            for (step, other, vector, hop_score, _features) in scored {
                 let mut steps = steps.clone();
                 steps.push(step);
                 let mut visited = visited.clone();
                 visited.push(other);
-                let sum = sum + cosine;
+                let sum = sum + hop_score;
                 // The next hop must explain what this fact did not.
                 let residual = residual_after(residual, &vector);
                 // One-hop facts are already the vector channel's job.
@@ -1218,6 +1356,20 @@ pub fn aggregate(engine: &Engine, input: &AggregateInput) -> Result<AggregateOut
         memories,
         truncated: total > limit,
     })
+}
+
+#[cfg(test)]
+mod hop_scorer_tests {
+    use super::{hop_value, HOP_BIAS, HOP_WEIGHTS};
+
+    #[test]
+    fn scorer_on_applies_the_weights_and_off_keeps_the_cosine() {
+        let f = [0.9, 0.4, 1.0, 0.0, 0.2, 1.5, 0.0];
+        assert_eq!(hop_value(false, 0.37, &f), 0.37);
+        let z = HOP_BIAS + HOP_WEIGHTS.iter().zip(&f).map(|(w, x)| w * x).sum::<f64>();
+        let want = 1.0 / (1.0 + (-z).exp());
+        assert!((hop_value(true, 0.37, &f) - want).abs() < 1e-12);
+    }
 }
 
 #[cfg(test)]
