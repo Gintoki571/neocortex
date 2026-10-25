@@ -14,4 +14,4 @@
 * [LLM-free entity extraction](llm-free-entity-extraction.md) - Get entities from text with NER or statistics instead of an LLM, so indexing costs no tokens. (neocortex: adapt · LLM: none)
 * [Personalized PageRank seeding](ppr-seeding.md) - Seed a PageRank walk from query-matched nodes so scores spread to associated memories. (neocortex: adapt · LLM: none)
 * [Steiner subgraph retrieval](steiner-subgraph-retrieval.md) - Select a small connected subgraph that holds the most query-relevant nodes, by prize-collecting Steiner tree. (neocortex: adapt · LLM: none)
-* [Graph instruction tuning](graph-instruction-tuning.md) - Fine-tune an LLM on graph task instructions so it answers graph questions directly. (neocortex: skip · LLM: indexing)
+* [Graph instruction tuning](graph-instruction-tuning.md) - Fine-tune an LLM on graph task instructions, with a graph encoder and a trained projector, so it answers graph questions directly. (neocortex: skip · LLM: indexing)

@@ -1,9 +1,9 @@
 ---
 type: "Paper"
 title: "An Explanation of In-context Learning as Implicit Bayesian Inference"
-description: "Theory that in-context learning emerges from implicit Bayesian inference when pretraining documents have long-range coherence."
+description: "Theory that in-context learning emerges when pretraining documents are mixtures of HMM concepts, so the LM infers a latent concept from the prompt; checked on the synthetic GINC dataset (ICLR 2022)."
 resource: "https://arxiv.org/abs/2111.02080"
-tags: ["in-context-learning", "theory"]
+tags: ["in-context-learning", "theory", "bayesian-inference", "hmm", "synthetic-data"]
 year: 2021
 venue: "ICLR 2022"
 llm_required: none
@@ -13,19 +13,27 @@ status: draft
 sources:
   - id: paper
     resource: "https://arxiv.org/abs/2111.02080"
-    title: "arXiv 2111.02080"
+    title: "arXiv abstract page"
+  - id: html
+    resource: "https://arxiv.org/html/2111.02080"
+    title: "arXiv HTML full text (Sections 2-4; theorems and GINC experiments)"
 ---
 # Summary
-- The paper studies when in-context learning can emerge from pretraining documents with long-range coherence.[^paper]
-- The LM is said to infer a latent document-level concept that is shared between prompt and test.[^paper]
+- Pretraining documents are modelled as a mixture of HMMs: a latent concept theta sets the token-transition matrix, so a long document has one coherent concept.[^html]
+- In-context learning is the model inferring the shared latent concept from the prompt's examples, despite a distribution mismatch between prompts and pretraining documents.[^paper][^html]
+- The paper gives formal results (Theorems 1-3) for distinguishable concepts, the non-distinguishable case and varying-length test examples.[^html]
 
 # Method
-- Theoretical analysis of in-context learning as implicit Bayesian inference (abstract level).[^paper]
+- Five assumptions (delimiter hidden states, bounded delimiter transitions, distribution shift from the prompt start, well-specification, regularity) support the theorems.[^html]
+- Synthetic GINC dataset: a uniform mixture of HMMs over 5 concepts, 1,000 pretraining documents (about 10 million tokens); GPT-2-style Transformers and LSTMs are trained on it with vocabulary sizes 50, 100 and 150, averaged over 5 pretraining runs.[^html]
 
 # Results
-- Not read beyond the abstract.[^paper]
+- In-context accuracy rises with the number of examples n and the example length k for both Transformers and LSTMs (Figure 3).[^html]
+- Ablation: pretraining on a single concept makes in-context learning fail (flat curves, Figure 4 left); larger Transformers (4, 12, 16 layers) increase in-context accuracy (Figure 6).[^html]
 
 # Relevance to neocortex
-- Background theory only. Skip for neocortex's engineering decisions.
+- Background only. The result is that a prompt's examples are used to pick a latent concept; neocortex does not learn from prompts, so nothing here changes its engine or its recall design.
+- The theory is about pretraining mixtures, not retrieval, so it gives no numbers neocortex can use. Skip.
 
-[^paper]: arXiv 2111.02080
+[^paper]: arXiv abstract page
+[^html]: arXiv HTML full text (Sections 2-4)

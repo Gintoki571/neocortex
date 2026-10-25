@@ -1,9 +1,9 @@
 ---
 type: "Paper"
 title: "LLaGA: Large Language and Graph Assistant"
-description: "Adapts graph neighborhoods into an LLM-compatible input format so a general LLM can work on graph data."
+description: "LLaGA: a Vicuna-7B assistant that turns each node's fixed-size sampled neighbourhood into a template-ordered token sequence (ND and HO templates) and aligns it with a projector, for node classification and link prediction (ICML 2024)."
 resource: "https://arxiv.org/abs/2402.08170"
-tags: ["fine-tuning", "subgraph-level", "graph-to-text"]
+tags: ["graph-to-llm", "node-classification", "link-prediction", "computational-tree", "vicuna"]
 year: 2024
 venue: "ICML 2024"
 llm_required: indexing
@@ -13,19 +13,29 @@ status: draft
 sources:
   - id: paper
     resource: "https://arxiv.org/abs/2402.08170"
-    title: "arXiv 2402.08170"
+    title: "arXiv abstract page"
+  - id: html
+    resource: "https://arxiv.org/html/2402.08170"
+    title: "arXiv HTML full text (Sections 2-3, Tables 1-2, 5-6)"
 ---
 # Summary
-- LLaGA keeps the general-purpose LLM and adapts graph-structured data into a format the LLM can take as input.[^paper]
-- It targets the difficulty of translating graph structure into language.[^paper]
+- Graph-to-LLM translation: each node becomes a fixed-shape sampled computational tree, linearised into node-embedding tokens, so a frozen-architecture LLM reads graph structure without changing its parameters.[^html]
+- Two node-level templates: Neighborhood Detail (ND) describes the node and its neighbourhood, and Hop-Ordered (HO) lists neighbours hop by hop.[^html]
+- Alignment tuning trains a projector, then the LLM is instruction-tuned for node classification, link prediction and node description.[^html]
 
 # Method
-- Subgraph-level graph-to-sequence adaptation feeding an LLM (abstract level; template details not read).[^paper]
+- Sampled computational tree with a fixed neighbour sample size per hop (n1, n2, ...); the default text encoder is SimTeG and the LLM is Vicuna-7B-v1.5-16K.[^html]
+- Datasets: ogbn-arxiv, ogbn-products, PubMed and Cora (citation and e-commerce graphs).[^html]
+- Baselines: GNNs in three groups (single-focus, task-expert and classification-expert) including GCN, GraphSAGE, GAT, SGC, SAGN and NodeFormer.[^html]
 
 # Results
-- Not read beyond the abstract.[^paper]
+- Table 1, single-focus setting, LLaGA-HO-7B node classification accuracy (Arxiv / Products / PubMed / Cora): 76.66 / 84.67 / 95.03 / 89.22; GraphSAGE 76.29 / 82.87 / 94.87 / 88.89.[^html]
+- Table 1, single-focus link prediction accuracy (Arxiv / Products / PubMed / Cora): LLaGA-HO-7B 94.15 / 95.56 / 89.18 / 86.82; LLaGA-ND-7B 88.86 / 91.24 / 97.36 / 83.79 (ND, the best on PubMed); GraphSAGE 91.64 / 94.96 / 90.64 / 79.15.[^html]
+- The paper's zero-shot and template ablations (Tables 5-6) are not summarised here.
 
 # Relevance to neocortex
-- Needs LLM tuning and inference. The serialization idea is relevant to how the agent could send neighborhoods to neocortex. Link: [graph-to-text serialization](/techniques/graph-to-text-serialization.md).
+- The sampled-tree template is a fixed-budget neighbourhood serialisation, which is the same budget idea as neocortex's ego-graph pruning. The LLM part is not usable inside the engine.
+- Skip the model. Keep the idea of a hop-ordered, budgeted neighbourhood text as a candidate format for what neocortex returns to the calling agent.
+- Node classification and link prediction are not neocortex's tasks, so the numbers are a weak signal only.
 
-[^paper]: arXiv 2402.08170
+[^html]: arXiv HTML full text (Sections 2-3, Tables 1-2, 5-6)

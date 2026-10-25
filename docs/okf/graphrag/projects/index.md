@@ -2,7 +2,7 @@
 
 * [GraphRAG-Bench (repository)](graphrag-bench-site.md) - Code repository and dataset host for the GraphRAG-Bench benchmark; the benchmark's method and data are in its benchmark entry. (neocortex: adopt · LLM: both)
 * [Cognee](cognee.md) - Open-source memory engine that builds knowledge graphs and embeddings from data for agents, with a no-LLM local mode based on GLiNER. (neocortex: adapt · LLM: none)
-* [DIGIMON (repository)](digimon-repo.md) - Code repository of the DIGIMON unified graph-RAG framework and its comparison harness; the study is in the benchmark entry. (neocortex: adapt · LLM: both)
+* [DIGIMON (repository)](digimon-repo.md) - Code repository of the DIGIMON unified graph-RAG framework (arXiv 2503.04338) with runnable configs for nine GraphRAG methods; no licence is published. (neocortex: adapt · LLM: both)
 * [Fast GraphRAG](fast-graphrag.md) - Promptable GraphRAG framework that domain-tunes entity types and explores the graph with PageRank for interpretable retrieval. (neocortex: adapt · LLM: both)
 * [Graphiti](graphiti.md) - Framework for building temporal context graphs for agents, with bi-temporal facts that are invalidated rather than deleted, and hybrid retrieval. (neocortex: adapt · LLM: both)
 * [GraphRAG-SDK (FalkorDB)](graphrag-sdk.md) - Toolkit for GraphRAG on FalkorDB, with ontology-constrained extraction, multi-path retrieval and a retrieval trail for grounding checks. (neocortex: adapt · LLM: both)
