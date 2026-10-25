@@ -210,7 +210,19 @@ Relation writes use tri-state `exclusive`: `true` ends competing values,
 predicate policy or returns candidates. `false` can clear a sticky exclusive
 flag, but never on the seeded predicate ontology. Negative assertions are
 stored with polarity and end matching positive validity without deleting
-history.
+history. A retraction sentence with no relations ("Ivan left Acme; he no
+longer works there") ends the one live relation of that kind it names at the
+memory's `valid_from` and reports it in `invalidated`; when several relations
+match it reports `conflicts` and ends nothing.
+
+Plans and routines are recognised from the text: "we will move next spring"
+gets a future `valid_from` (or the tag `planned` when no date resolves) and is
+not treated as current, so "where does X live" is not answered with a move that
+has not happened; "standup every Monday" keeps its rule text and gets the tag
+`recurring`. Ordering questions ("what happened first") sort memories and facts
+by `valid_from`, and duration questions ("how long did Alice work at Acme")
+also render the interval with a computed duration ("3 years 2 months",
+"ongoing since 2023-04-01").
 
 ## How names and phrases resolve
 

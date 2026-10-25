@@ -196,6 +196,252 @@ pub fn find_window(text: &str, clock: &Clock) -> Option<Window> {
     best.map(|(_, _, window)| window)
 }
 
+/// True when the text states a future plan or arrangement: "will", "going
+/// to", "plan to", "next <unit|weekday>", "in <N> <unit>". A bare future date
+/// is not a cue: a decision about a future date was still made now.
+pub fn plan_intent(text: &str, _clock: &Clock) -> bool {
+    let lower = text.to_lowercase();
+    let toks: Vec<&str> = words(&lower).iter().map(|&(s, e)| &lower[s..e]).collect();
+    if toks
+        .iter()
+        .any(|t| matches!(*t, "will" | "shall" | "gonna" | "won't"))
+    {
+        return true;
+    }
+    for phrase in [
+        "going to",
+        "plan to",
+        "plans to",
+        "planned to",
+        "planning to",
+        "intend to",
+        "intends to",
+        "intended to",
+        "scheduled to",
+    ] {
+        if has_phrase(&lower, phrase) {
+            return true;
+        }
+    }
+    for i in 0..toks.len() {
+        if toks[i] == "next"
+            && i + 1 < toks.len()
+            && (unit(toks[i + 1]).is_some() || weekday_index(toks[i + 1]).is_some())
+        {
+            return true;
+        }
+        if toks[i] == "in"
+            && i + 2 < toks.len()
+            && num(toks[i + 1]).is_some()
+            && unit(toks[i + 2]).is_some()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when the text states a repeating rule ("every Monday", "weekly",
+/// "each month", "on Mondays"). The rule text itself is kept in the content.
+pub fn recurrence(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let toks: Vec<&str> = words(&lower).iter().map(|&(s, e)| &lower[s..e]).collect();
+    for t in &toks {
+        if matches!(
+            *t,
+            "weekly" | "daily" | "monthly" | "annually" | "annual" | "biweekly" | "fortnightly"
+        ) {
+            return true;
+        }
+        if weekday_plural(t) {
+            return true;
+        }
+    }
+    for i in 0..toks.len() {
+        if !matches!(toks[i], "every" | "each") {
+            continue;
+        }
+        for &w in toks.iter().skip(i + 1).take(3) {
+            if weekday_index(w).is_some() || weekday_plural(w) || unit(w).is_some() {
+                return true;
+            }
+            // "every six months", "every other week": keep looking past a
+            // number or "other", but stop at the first unrelated word.
+            if w == "other" || num(w).is_some() || matches!(w, "a" | "an" | "one") {
+                continue;
+            }
+            break;
+        }
+    }
+    false
+}
+
+/// The first date in the text that lies after `clock.now` (the start of a
+/// plan), if one resolves.
+pub fn future_window(text: &str, clock: &Clock) -> Option<Window> {
+    find_window(text, clock).filter(|w| w.start > clock.now)
+}
+
+/// True when the question is about intentions or the future ("plans",
+/// "upcoming", "schedule"): planned memories may be shown for these.
+pub fn wants_plans(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "plan",
+        "plans",
+        "planned",
+        "planning",
+        "upcoming",
+        "future",
+        "schedule",
+        "scheduled",
+        "roadmap",
+        "goal",
+        "goals",
+    ]
+    .iter()
+    .any(|word| has_phrase(&lower, word))
+}
+
+/// True when the question asks about order in time ("first", "before",
+/// "after", "earlier", "later", "which came first").
+pub fn ordering_intent(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    for phrase in [
+        "which came first",
+        "which happened first",
+        "what happened first",
+        "in order",
+        "order of",
+        "chronological",
+        "timeline",
+        "sequence",
+        "most recent",
+        "oldest memory",
+        "oldest event",
+        "oldest fact",
+        "oldest record",
+        "newest memory",
+        "newest event",
+        "newest fact",
+        "newest record",
+    ] {
+        if has_phrase(&lower, phrase) {
+            return true;
+        }
+    }
+    let toks: Vec<&str> = words(&lower).iter().map(|&(s, e)| &lower[s..e]).collect();
+    for (i, tok) in toks.iter().enumerate() {
+        let prev = i.checked_sub(1).map(|j| toks[j]);
+        let next = toks.get(i + 1).copied();
+        match *tok {
+            // "look after the dog", "named after her aunt", "the day after":
+            // the word carries no sequence meaning.
+            "after" => {
+                let phrasal = matches!(
+                    prev,
+                    Some(
+                        "look"
+                            | "looks"
+                            | "looked"
+                            | "looking"
+                            | "name"
+                            | "named"
+                            | "ask"
+                            | "asks"
+                            | "asked"
+                            | "go"
+                            | "goes"
+                            | "going"
+                            | "went"
+                            | "day"
+                            | "days"
+                            | "soon"
+                            | "right"
+                            | "ever"
+                            | "short"
+                            | "long"
+                    )
+                );
+                if !phrasal && next != Some("all") {
+                    return true;
+                }
+            }
+            "before" | "earlier" | "later" => return true,
+            // "the first thing I do", "first place": an idiom, not a sequence.
+            "first" if !matches!(next, Some("thing" | "things" | "place")) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// True when the question asks how long something lasted ("how long",
+/// "since when", "for how many", "duration").
+pub fn duration_intent(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "how long",
+        "since when",
+        "for how many",
+        "how many years",
+        "how many months",
+        "how many days",
+        "how much time",
+        "duration",
+    ]
+    .iter()
+    .any(|phrase| has_phrase(&lower, phrase))
+}
+
+/// Calendar duration between two instants, in years and months ("3 years
+/// 2 months"), or days when it is under a month.
+pub fn duration(from: i64, to: i64, clock: &Clock) -> String {
+    if to <= from {
+        return "less than a day".to_string();
+    }
+    let off = clock.tz_offset_secs;
+    let d1 = local_days(from, off);
+    let d2 = local_days(to, off);
+    let (y1, m1, day1) = civil_from_days(d1);
+    let (y2, m2, day2) = civil_from_days(d2);
+    let mut months = (y2 - y1) * 12 + i64::from(m2) - i64::from(m1);
+    if day2 < day1 {
+        months -= 1;
+    }
+    if months >= 12 {
+        let years = months / 12;
+        let rest = months % 12;
+        return if rest == 0 {
+            plural(years, "year")
+        } else {
+            format!("{} {}", plural(years, "year"), plural(rest, "month"))
+        };
+    }
+    if months > 0 {
+        return plural(months, "month");
+    }
+    let days = d2 - d1;
+    if days <= 0 {
+        "less than a day".to_string()
+    } else {
+        plural(days, "day")
+    }
+}
+
+fn plural(n: i64, unit: &str) -> String {
+    if n == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{n} {unit}s")
+    }
+}
+
+fn weekday_plural(tok: &str) -> bool {
+    tok.strip_suffix('s')
+        .is_some_and(|base| base.len() >= 4 && weekday_index(base).is_some())
+}
+
 /// True when the query asks about the past state of things ("used to",
 /// "previously", "before", "formerly", "history", "changed", "did ... use").
 pub fn history_intent(text: &str) -> bool {
@@ -600,6 +846,26 @@ fn unit(tok: &str) -> Option<Unit> {
 // --- resolution -------------------------------------------------------------
 
 fn resolve_range(expr: &str, clock: &Clock) -> Option<(i64, i64)> {
+    let expr = expr.trim();
+    // "in 3 days" is a future point, unlike a bare "3 days" (a duration).
+    if let Some(rest) = expr.strip_prefix("in ") {
+        if let [k, what] = rest.split_whitespace().collect::<Vec<_>>().as_slice() {
+            if let (Some(k), Some(u)) = (num(k), unit(what)) {
+                let off = clock.tz_offset_secs;
+                let today = local_days(clock.now, off);
+                let (y, m, _) = civil_from_days(today);
+                return Some(match u {
+                    Unit::Day => day_window(today + k, off),
+                    Unit::Week => day_window(today + 7 * k, off),
+                    Unit::Month => {
+                        let (ny, nm) = add_months(y, m, k);
+                        month_window(ny, nm, off)
+                    }
+                    Unit::Year => year_window(y + k, off),
+                });
+            }
+        }
+    }
     let expr = strip_lead(expr);
     if let Some(rest) = expr.strip_prefix("since ") {
         let (start, _) = resolve(rest, clock)?;
@@ -1214,6 +1480,120 @@ mod tests {
         assert_eq!(tz_offset(Some("")), local_offset());
         assert_eq!(tz_offset(Some("Europe/Berlin")), local_offset());
         assert_eq!(tz_offset(None), local_offset());
+    }
+
+    #[test]
+    fn plan_and_recurrence_cues() {
+        for text in [
+            "We will move to Lisbon.",
+            "She is going to resign.",
+            "They plan to visit Osaka.",
+            "The team moves next month.",
+            "We ship in 3 days.",
+        ] {
+            assert!(plan_intent(text, &utc()), "plan_intent({text:?})");
+        }
+        for text in [
+            "Phoenix ships on 2027-06-15.",
+            "Alice moved to Lisbon.",
+            "The deadline moved to 2027-03-01.",
+        ] {
+            assert!(!plan_intent(text, &utc()), "plan_intent({text:?})");
+        }
+        for text in [
+            "Team standup every Monday.",
+            "The sync is weekly.",
+            "Reports go out each month.",
+            "Yoga on Tuesdays.",
+            "We meet every other week.",
+        ] {
+            assert!(recurrence(text), "recurrence({text:?})");
+        }
+        for text in [
+            "Alice moved to Lisbon in 2024.",
+            "The report is ready.",
+            "We met on Monday.",
+        ] {
+            assert!(!recurrence(text), "recurrence({text:?})");
+        }
+    }
+
+    #[test]
+    fn in_n_units_is_a_future_window() {
+        let cases = [
+            ("in 3 days", 1_792_800_000, 1_792_886_400),
+            ("in two weeks", 1_793_750_400, 1_793_836_800),
+        ];
+        for (input, start, end) in cases {
+            let got = parse_window(input, &utc());
+            assert_eq!(
+                got.as_ref().map(|w| (w.start, w.end)),
+                Some((start, end)),
+                "parse_window({input:?})"
+            );
+        }
+        // A bare duration is not a date.
+        assert_eq!(parse_window("3 days", &utc()), None);
+    }
+
+    #[test]
+    fn future_window_only_returns_dates_after_now() {
+        assert_eq!(
+            future_window("We move in June 2027.", &utc()).map(|w| w.start),
+            Some(1_811_808_000)
+        );
+        assert!(future_window("We moved in June 2020.", &utc()).is_none());
+        assert!(future_window("next spring", &utc()).is_none());
+    }
+
+    #[test]
+    fn durations_are_calendar_years_and_months() {
+        let d = |a, b| duration(a, b, &utc());
+        assert_eq!(d(day(2020, 1, 1), day(2023, 3, 1)), "3 years 2 months");
+        assert_eq!(d(day(2020, 1, 1), day(2021, 1, 1)), "1 year");
+        assert_eq!(d(day(2020, 1, 15), day(2020, 3, 14)), "1 month");
+        assert_eq!(d(day(2020, 1, 1), day(2020, 1, 11)), "10 days");
+        assert_eq!(d(day(2020, 1, 1), day(2020, 1, 1)), "less than a day");
+    }
+
+    #[test]
+    fn ordering_and_duration_intent_phrases() {
+        for text in [
+            "what happened first, the move or the job?",
+            "which came first",
+            "what did she do before that",
+            "what came after the move",
+            "which one was earlier",
+            "tell me the chronological order",
+        ] {
+            assert!(ordering_intent(text), "ordering_intent({text:?})");
+        }
+        for text in ["where does Alice live", "what is my favourite colour"] {
+            assert!(!ordering_intent(text), "ordering_intent({text:?})");
+        }
+        // Idioms and phrasal verbs are not sequence questions.
+        for text in [
+            "what breed is the dog that Noor looks after?",
+            "who is Sofia's oldest friend?",
+            "what does she sip first thing?",
+        ] {
+            assert!(!ordering_intent(text), "ordering_intent({text:?})");
+        }
+        for text in [
+            "how long did Alice work at Acme?",
+            "since when has she lived there?",
+            "for how many years",
+            "what is the duration",
+        ] {
+            assert!(duration_intent(text), "duration_intent({text:?})");
+        }
+        assert!(!duration_intent("where does Alice live"));
+        assert!(wants_plans("what are our plans for Lisbon"));
+        assert!(!wants_plans("where do we live"));
+    }
+
+    fn day(y: i64, m: u32, d: u32) -> i64 {
+        days_from_civil(y, m, d) * DAY
     }
 
     #[test]

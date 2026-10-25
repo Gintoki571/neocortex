@@ -37,6 +37,9 @@ pub fn heuristic_entities(text: &str) -> Vec<Candidate> {
         if is_all_caps_status_word(&c.name) {
             return false;
         }
+        if is_date_like_name(&c.name) {
+            return false;
+        }
         let norm = norm_name(&c.name);
         if norm.is_empty() || seen.contains(&norm) {
             return false;
@@ -717,7 +720,7 @@ fn excluded_word(word: &str) -> bool {
 }
 
 fn is_weekday_or_month(word: &str) -> bool {
-    const CALENDAR: [&str; 19] = [
+    const CALENDAR: [&str; 41] = [
         "monday",
         "tuesday",
         "wednesday",
@@ -737,8 +740,252 @@ fn is_weekday_or_month(word: &str) -> bool {
         "october",
         "november",
         "december",
+        // Abbreviations, as written without the full stop.
+        "jan",
+        "feb",
+        "mar",
+        "apr",
+        "jun",
+        "jul",
+        "aug",
+        "sep",
+        "sept",
+        "oct",
+        "nov",
+        "dec",
+        "mon",
+        "tue",
+        "tues",
+        "wed",
+        "thu",
+        "thur",
+        "thurs",
+        "fri",
+        "sat",
+        "sun",
     ];
-    CALENDAR.contains(&word)
+    if CALENDAR.contains(&word) {
+        return true;
+    }
+    // "Mondays", "Tuesdays": a plural weekday is still a calendar word.
+    word.strip_suffix('s')
+        .is_some_and(|base| base.len() >= 4 && CALENDAR.contains(&base))
+}
+
+/// True when a candidate is a date, month, weekday, year, quarter, duration
+/// or relative-time expression rather than a name. Every token must be
+/// date-ish, so "Windows 2000" and "Postgres 16" survive while "Dec 2025",
+/// "March 5, 2025", "3 days" and "yesterday" do not.
+fn is_date_like_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if is_iso_date(&lower) || is_clock_time(&lower) {
+        return true;
+    }
+    let toks: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if toks.is_empty() {
+        return false;
+    }
+    // A trailing month + year is a date even when a verb leads the span
+    // ("Ships Dec 2025"); "Windows 2000" keeps its product name.
+    if toks.len() >= 2 {
+        let last = toks[toks.len() - 1];
+        let prev = toks[toks.len() - 2];
+        if is_year_token(last) && is_calendar_token(prev) {
+            return true;
+        }
+    }
+    let mut saw_date = false;
+    for tok in &toks {
+        if is_calendar_token(tok)
+            || is_year_token(tok)
+            || is_quarter_token(tok)
+            || is_time_unit(tok)
+            || is_relative_time(tok)
+        {
+            saw_date = true;
+            continue;
+        }
+        if is_number_token(tok) || is_ordinal_token(tok) || is_date_connector(tok) {
+            continue;
+        }
+        return false;
+    }
+    saw_date
+}
+
+fn is_calendar_token(tok: &str) -> bool {
+    is_weekday_or_month(tok)
+}
+
+fn is_year_token(tok: &str) -> bool {
+    tok.len() == 4
+        && tok.bytes().all(|b| b.is_ascii_digit())
+        && tok.parse::<i64>().is_ok_and(|y| (1900..=2100).contains(&y))
+}
+
+fn is_quarter_token(tok: &str) -> bool {
+    let mut chars = tok.chars();
+    matches!(chars.next(), Some('q'))
+        && chars.next().is_some_and(|c| ('1'..='4').contains(&c))
+        && chars.next().is_none()
+}
+
+fn is_time_unit(tok: &str) -> bool {
+    matches!(
+        tok,
+        "day"
+            | "days"
+            | "week"
+            | "weeks"
+            | "month"
+            | "months"
+            | "year"
+            | "years"
+            | "hour"
+            | "hours"
+            | "minute"
+            | "minutes"
+            | "min"
+            | "mins"
+            | "second"
+            | "seconds"
+            | "sec"
+            | "secs"
+            | "fortnight"
+            | "fortnights"
+    )
+}
+
+fn is_relative_time(tok: &str) -> bool {
+    matches!(
+        tok,
+        "yesterday"
+            | "today"
+            | "tomorrow"
+            | "tonight"
+            | "now"
+            | "ago"
+            | "recently"
+            | "lately"
+            | "soon"
+            | "later"
+            | "earlier"
+            | "upcoming"
+            | "currently"
+            | "daily"
+            | "weekly"
+            | "monthly"
+            | "annually"
+            | "yearly"
+    )
+}
+
+fn is_number_token(tok: &str) -> bool {
+    if !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return tok.bytes().any(|b| b.is_ascii_digit());
+    }
+    matches!(
+        tok,
+        "a" | "an"
+            | "one"
+            | "two"
+            | "three"
+            | "four"
+            | "five"
+            | "six"
+            | "seven"
+            | "eight"
+            | "nine"
+            | "ten"
+            | "eleven"
+            | "twelve"
+    )
+}
+
+fn is_ordinal_token(tok: &str) -> bool {
+    let digits = tok.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    if digits.len() < tok.len()
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && matches!(&tok[digits.len()..], "st" | "nd" | "rd" | "th")
+    {
+        return true;
+    }
+    matches!(
+        tok,
+        "first"
+            | "second"
+            | "third"
+            | "fourth"
+            | "fifth"
+            | "sixth"
+            | "seventh"
+            | "eighth"
+            | "ninth"
+            | "tenth"
+    )
+}
+
+fn is_date_connector(tok: &str) -> bool {
+    matches!(
+        tok,
+        "of" | "the"
+            | "in"
+            | "on"
+            | "at"
+            | "and"
+            | "to"
+            | "from"
+            | "between"
+            | "since"
+            | "until"
+            | "before"
+            | "after"
+            | "ago"
+            | "next"
+            | "last"
+            | "this"
+            | "every"
+            | "each"
+            | "per"
+            | "around"
+            | "about"
+            | "by"
+            | "for"
+    )
+}
+
+fn is_iso_date(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(['-', '/']).collect();
+    parts.len() == 3
+        && parts[0].len() == 4
+        && parts[0].bytes().all(|b| b.is_ascii_digit())
+        && (1..=2).contains(&parts[1].len())
+        && parts[1].bytes().all(|b| b.is_ascii_digit())
+        && (1..=2).contains(&parts[2].len())
+        && parts[2].bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_clock_time(s: &str) -> bool {
+    if let Some((h, rest)) = s.split_once(':') {
+        return !h.is_empty()
+            && h.bytes().all(|b| b.is_ascii_digit())
+            && rest
+                .split(':')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    }
+    // "10am", "9pm"
+    let hour = |suffix: &str| {
+        s.len() > suffix.len()
+            && s.ends_with(suffix)
+            && s[..s.len() - suffix.len()]
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+    };
+    hour("am") || hour("pm")
 }
 
 /// All word n-grams (1..=max_n) of `text` as (norm_name(ngram), start, end)
@@ -931,6 +1178,58 @@ mod tests {
         assert!(g
             .iter()
             .any(|(n, s, e)| n == "house" && &text[*s..*e] == "house"));
+    }
+
+    #[test]
+    fn calendar_and_duration_literals_are_not_entities() {
+        // Each entry must never surface as an entity, either alone or inside
+        // a sentence that also carries a real name.
+        for literal in [
+            "2025-03-05",
+            "March 2025",
+            "March 5, 2025",
+            "Dec 2025",
+            "Jan 3",
+            "Monday",
+            "Mondays",
+            "Tuesdays",
+            "Q1 2026",
+            "2025",
+            "in 2019",
+            "3 days ago",
+            "two weeks",
+            "15 minutes",
+            "3 years",
+            "last week",
+            "next month",
+            "yesterday",
+            "10:30",
+            "every Monday",
+            "September 2026",
+        ] {
+            for text in [literal.to_string(), format!("Alice met Bob on {literal}.")] {
+                let names: Vec<String> = heuristic_entities(&text)
+                    .into_iter()
+                    .map(|c| c.name)
+                    .collect();
+                let norm = norm_name(literal);
+                assert!(
+                    names.iter().all(|n| norm_name(n) != norm),
+                    "{literal:?} became an entity in {text:?}: {names:?}"
+                );
+                assert!(
+                    !names.iter().any(|n| is_date_like_name(n)),
+                    "{literal:?} leaked a date-like entity in {text:?}: {names:?}"
+                );
+            }
+        }
+        // Product names and people with numbers survive.
+        let names: Vec<String> = heuristic_entities("Windows 2000 and Postgres 16 run here.")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "Windows 2000"), "{names:?}");
+        assert!(names.iter().any(|n| n == "Postgres 16"), "{names:?}");
     }
 
     #[test]

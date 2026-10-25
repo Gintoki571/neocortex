@@ -118,6 +118,7 @@ fn is_ended(row: &MemoryRow, cutoff: i64) -> bool {
     row.10.is_some_and(|x| x <= cutoff) || row.11.is_some()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eligible(
     row: &MemoryRow,
     as_of: Option<i64>,
@@ -125,6 +126,8 @@ fn eligible(
     input: &RecallInput,
     since: Option<i64>,
     until: Option<i64>,
+    now: i64,
+    planned_ok: bool,
 ) -> bool {
     let (_, _, kind, tags, _, scope, source, session, _, from, to, expired, superseded) = row;
     // Forgotten memories (expired without a successor) are never returned.
@@ -133,6 +136,16 @@ fn eligible(
     }
     if expired.is_some() && !history {
         return false;
+    }
+    // A plan or a future-dated memory has not happened yet: it is not current
+    // truth unless the question asks about plans or takes an as-of snapshot.
+    if as_of.is_none() && !planned_ok {
+        if *from > now {
+            return false;
+        }
+        if tags.split_whitespace().any(|tag| tag == "planned") {
+            return false;
+        }
     }
     if let Some(t) = as_of {
         if *from > t || to.is_some_and(|x| t >= x) {
@@ -349,7 +362,16 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let until = parse_bound(input.until.as_deref(), &clock)?;
     let window = temporal::find_window(&input.query, &clock);
     let history_query = temporal::history_intent(&input.query);
-    let history = input.include_history || history_query || as_of.is_some();
+    // Planned memories stay out of current answers unless the question is
+    // about plans, and an ordering/duration question is a history question:
+    // it needs the ended intervals to compute an answer.
+    let planned_ok = temporal::plan_intent(&input.query, &clock)
+        || temporal::wants_plans(&input.query)
+        || window.as_ref().is_some_and(|w| w.start >= now);
+    let ordering = temporal::ordering_intent(&input.query);
+    let duration_query = temporal::duration_intent(&input.query);
+    let ordered = ordering || duration_query;
+    let history = input.include_history || history_query || as_of.is_some() || ordered;
     let k = input.k.unwrap_or(8).clamp(1, 50);
     let budget = input.budget.unwrap_or(1200).min(20_000);
     let negated = paths::negation_intent(&input.query);
@@ -392,8 +414,9 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let bm25_scored: Vec<(i64, f64)> = bm25_scored
         .into_iter()
         .filter(|(id, _)| {
-            rows.get(id)
-                .is_some_and(|row| eligible(row, as_of, history, input, since, until))
+            rows.get(id).is_some_and(|row| {
+                eligible(row, as_of, history, input, since, until, now, planned_ok)
+            })
         })
         .collect();
     let best_bm25 = bm25_scored
@@ -438,8 +461,9 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let mut vec_ranked: Vec<(i64, f64)> = knn
         .into_iter()
         .filter(|(id, _)| {
-            rows.get(id)
-                .is_some_and(|row| eligible(row, as_of, history, input, since, until))
+            rows.get(id).is_some_and(|row| {
+                eligible(row, as_of, history, input, since, until, now, planned_ok)
+            })
         })
         .map(|(id, cosine)| (id, f64::from(cosine)))
         .collect();
@@ -487,8 +511,9 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         let in_window: Vec<i64> = candidates
             .into_iter()
             .filter(|id| {
-                rows.get(id)
-                    .is_some_and(|row| eligible(row, as_of, history, input, since, until))
+                rows.get(id).is_some_and(|row| {
+                    eligible(row, as_of, history, input, since, until, now, planned_ok)
+                })
             })
             .collect();
         let vectors = fetch_vectors(&engine.db, &in_window)?;
@@ -638,8 +663,9 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let graph_ids: Vec<i64> = graph_ids
         .into_iter()
         .filter(|id| {
-            rows.get(id)
-                .is_some_and(|row| eligible(row, as_of, history, input, since, until))
+            rows.get(id).is_some_and(|row| {
+                eligible(row, as_of, history, input, since, until, now, planned_ok)
+            })
         })
         .take(depth)
         .collect();
@@ -705,8 +731,9 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     rows.extend(fetch_rows(&engine.db, &missing)?);
     for ids in [&mut path_ids, &mut sem_ids] {
         ids.retain(|id| {
-            rows.get(id)
-                .is_some_and(|row| eligible(row, as_of, history, input, since, until))
+            rows.get(id).is_some_and(|row| {
+                eligible(row, as_of, history, input, since, until, now, planned_ok)
+            })
         });
     }
     sem_ids.truncate(depth);
@@ -861,6 +888,10 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                     .map(|x| x.1)
                     .unwrap_or(0.0),
                 reasons,
+                duration: duration_query.then(|| match row.10 {
+                    Some(to) => temporal::duration(row.9, to, &clock),
+                    None => format!("ongoing since {}", temporal::fmt_date(row.9, &clock)),
+                }),
             });
         }
     }
@@ -922,7 +953,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // The last hop of the best paths is often the only place the answer
     // appears ("Liam Vijappa lives in Denver"), and that relation belongs to an
     // entity the neighbourhood search never reached. Render it explicitly.
-    let facts = if negated {
+    let mut facts = if negated {
         facts
             .into_iter()
             .filter(|fact| fact.polarity == 0 || paths::has_negation_cue(&fact.fact))
@@ -940,6 +971,28 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         merged.truncate(8);
         merged
     };
+    // Ordering and duration questions want the intervals themselves, oldest
+    // first, with the elapsed time spelled out. Other queries keep relevance
+    // order.
+    if duration_query {
+        for fact in &mut facts {
+            fact.duration = if fact.retracted {
+                None
+            } else {
+                Some(match fact.valid_to {
+                    Some(to) => temporal::duration(fact.valid_from, to, &clock),
+                    None => format!(
+                        "ongoing since {}",
+                        temporal::fmt_date(fact.valid_from, &clock)
+                    ),
+                })
+            };
+        }
+    }
+    if ordered {
+        memories.sort_by_key(|m| (m.valid_from, m.id));
+        facts.sort_by_key(|f| (f.valid_from, f.id));
+    }
     let entities = top_entities
         .iter()
         .take(3)
@@ -1186,6 +1239,7 @@ fn facts_for_view(
                     None
                 },
                 replaced_by: ended_by.zip(by_fact),
+                duration: None,
             },
         ));
     }
@@ -1269,6 +1323,7 @@ pub fn entity(engine: &Engine, name: &str, limit: usize) -> Result<EntityOutput>
                     .collect(),
                 score: 0.0,
                 reasons: vec![],
+                duration: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1458,6 +1513,7 @@ fn representative(engine: &Engine, ids: &[i64]) -> Result<Option<MemoryHit>> {
                     .collect(),
                 score: 0.0,
                 reasons: Vec::new(),
+                duration: None,
             })
         })
         .optional()?;
