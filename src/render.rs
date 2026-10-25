@@ -233,6 +233,12 @@ pub fn render_entity(out: &EntityOutput, fmt: Fmt<'_>) -> String {
         s.push_str(&out.card.description);
     }
     s.push('\n');
+    if let Some(c) = &out.card.community {
+        s.push_str(&format!(
+            "community c{}: {} ({} entities)\n",
+            c.id, c.label, c.size
+        ));
+    }
     if !out.current_facts.is_empty() {
         s.push_str("current facts:\n");
         for f in &out.current_facts {
@@ -282,14 +288,19 @@ pub fn render_overview(out: &OverviewOutput, fmt: Fmt<'_>) -> String {
     }
     let mut s = String::new();
     for c in &out.communities {
-        let names: Vec<&str> = c.entities.iter().map(|e| e.name.as_str()).collect();
         s.push_str(&format!(
-            "[c{}] {} entities, score {:.2}: {}\n",
-            c.id,
-            c.size,
-            c.score,
-            names.join(", ")
+            "[c{}] {} ({} entities, score {:.2})\n",
+            c.id, c.label, c.size, c.score
         ));
+        let mut about = c.predicates.clone();
+        if let Some((start, end)) = c.span {
+            about.push(format!("{} → {}", fmt(start), fmt(end)));
+        }
+        if !about.is_empty() {
+            s.push_str("  about: ");
+            s.push_str(&about.join(" · "));
+            s.push('\n');
+        }
         for f in &c.facts {
             s.push_str("  ");
             s.push_str(&fact_line(f, fmt));
@@ -337,7 +348,7 @@ fn bytes(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Community, EntityResolution, RelationResult};
+    use crate::engine::{Community, CommunityRef, EntityResolution, RelationResult};
 
     fn fake(t: i64) -> String {
         format!("D{t}")
@@ -399,6 +410,7 @@ mod tests {
             kind: kind.to_string(),
             aliases: aliases.iter().map(|s| s.to_string()).collect(),
             description: String::new(),
+            community: None,
         }
     }
 
@@ -566,6 +578,11 @@ mod tests {
         let out = EntityOutput {
             card: EntityCard {
                 description: "the user's mother".into(),
+                community: Some(CommunityRef {
+                    id: 3,
+                    label: "Mom, Pune".into(),
+                    size: 2,
+                }),
                 ..card(3, "Mom", "person", &["mother"])
             },
             current_facts: vec![fact(9, "Pune", 100, None, false)],
@@ -576,6 +593,7 @@ mod tests {
         assert_eq!(
             render_entity(&out, &fake),
             "[e3] Mom (person; aka mother) — the user's mother\n\
+             community c3: Mom, Pune (2 entities)\n\
              current facts:\n\
              [r9] Mom —live in→ Pune (since D100)\n\
              past facts:\n\
@@ -623,8 +641,11 @@ mod tests {
         let out = OverviewOutput {
             communities: vec![Community {
                 id: 1,
+                label: "Mom, Pune".into(),
                 size: 2,
                 entities: vec![card(3, "Mom", "person", &[]), card(8, "Pune", "place", &[])],
+                predicates: vec!["lives in".into()],
+                span: Some((50, 100)),
                 facts: vec![fact(9, "Pune", 100, None, false)],
                 score: 0.83,
                 representative: None,
@@ -632,7 +653,7 @@ mod tests {
         };
         assert_eq!(
             render_overview(&out, &fake),
-            "[c1] 2 entities, score 0.83: Mom, Pune\n  [r9] Mom —live in→ Pune (since D100)\n"
+            "[c1] Mom, Pune (2 entities, score 0.83)\n  about: lives in · D50 → D100\n  [r9] Mom —live in→ Pune (since D100)\n"
         );
     }
 
@@ -667,6 +688,7 @@ mod tests {
             kind: "".into(),
             aliases: vec![],
             description: "".into(),
+            community: None,
         };
         assert_eq!(entity_card(&bare), "[e1] SQLite");
 
@@ -676,6 +698,7 @@ mod tests {
             kind: "database".into(),
             aliases: vec![],
             description: "".into(),
+            community: None,
         };
         assert_eq!(entity_card(&typed), "[e2] Postgres (database)");
 
@@ -685,6 +708,7 @@ mod tests {
             kind: "".into(),
             aliases: vec!["pgsql".into(), "postgres".into()],
             description: "".into(),
+            community: None,
         };
         assert_eq!(entity_card(&aliased), "[e3] Postgres (aka pgsql, postgres)");
 
@@ -694,6 +718,7 @@ mod tests {
             kind: "person".into(),
             aliases: vec!["mother".into()],
             description: "".into(),
+            community: None,
         };
         assert_eq!(entity_card(&full), "[e4] Mom (person; aka mother)");
     }

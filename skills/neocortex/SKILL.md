@@ -122,12 +122,14 @@ the installed binary is `~/.neocortex/bin/neocortex` (DB `~/.neocortex/neocortex
 | `invalidate` | `neocortex invalidate <mID\|rID> --at <date>` | end a fact |
 | `forget` | `neocortex forget <mID> [--hard]` | retire/delete (facts it alone stated are retracted) |
 | `merge_entities` | `neocortex merge <keep> <merge> [--force]` / `alias <entity> <alias>` | fix names (+ `distinct_from` on the `remember` entities array to split a homonym) |
-| `overview` | `neocortex overview [query]` | clusters of the graph |
+| `overview` | `neocortex overview [query]` | communities with labels, predicates and date spans |
 | `stats` | `neocortex stats` | counts, model status and the cold-tier hint |
 
 Every tool takes `format: "text"` (default) or `"json"`.
 Use `overview` for a compact global view of related entities, facts and a
-representative memory; use `entity` for one entity's facts and timeline.
+representative memory: each community carries a label of its top-degree
+entities, its size, key predicates and date span. Use `entity` for one
+entity's facts and timeline; its card names the community it belongs to.
 
 ## Examples
 

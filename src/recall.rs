@@ -2,8 +2,8 @@ use crate::db::Db;
 use crate::embed::Mode;
 use crate::engine::Engine;
 use crate::engine::{
-    Community, EntityCard, EntityOutput, FactHit, MemoryHit, OverviewOutput, RecallInput,
-    RecallOutput,
+    Community, CommunityRef, EntityCard, EntityOutput, FactHit, MemoryHit, OverviewOutput,
+    RecallInput, RecallOutput,
 };
 use crate::{extract, graph, kg, paths, rank, temporal, text, Result};
 use rusqlite::{params, params_from_iter, OptionalExtension};
@@ -1175,7 +1175,95 @@ fn card(engine: &Engine, id: i64) -> Result<EntityCard> {
         kind,
         aliases,
         description: desc,
+        community: None,
     })
+}
+
+/// "Alice, Bob, Carol +9": up to three names, then how many more there are.
+fn label_of(names: &[String], total: usize) -> String {
+    let shown = names.iter().take(3).cloned().collect::<Vec<_>>();
+    let mut label = shown.join(", ");
+    let rest = total.saturating_sub(shown.len());
+    if rest > 0 {
+        label.push_str(&format!(" +{rest}"));
+    }
+    label
+}
+
+/// The best-connected entities of a community: graph degree is mentions plus
+/// live relations in and out, the same edges `kg::snapshot` projects.
+fn community_names(engine: &Engine, community: i64) -> Result<Vec<String>> {
+    let now = engine.clock().now;
+    let mut st = engine.db.sql().prepare(
+        "SELECT e.name
+         FROM communities c JOIN entities e ON e.id=c.entity_id
+         WHERE c.community=?1
+         ORDER BY (SELECT COUNT(*) FROM mentions m WHERE m.entity_id=e.id)
+                + (SELECT COUNT(*) FROM relations r
+                    WHERE r.expired_at IS NULL AND (r.valid_to IS NULL OR r.valid_to>?2)
+                      AND r.src=e.id)
+                + (SELECT COUNT(*) FROM relations r
+                    WHERE r.expired_at IS NULL AND (r.valid_to IS NULL OR r.valid_to>?2)
+                      AND r.dst=e.id) DESC,
+                  e.id
+         LIMIT 3",
+    )?;
+    let rows = st
+        .query_map(params![community, now], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(rows)
+}
+
+/// The community an entity belongs to, as shown on its card.
+fn community_ref(engine: &Engine, id: i64) -> Result<Option<CommunityRef>> {
+    let comm = cached_communities(engine)?;
+    let Some(&community) = comm.get(&id) else {
+        return Ok(None);
+    };
+    let names = community_names(engine, community)?;
+    let size: i64 = engine.db.sql().query_row(
+        "SELECT COUNT(*) FROM communities WHERE community=?1",
+        [community],
+        |r| r.get(0),
+    )?;
+    Ok(Some(CommunityRef {
+        id: community,
+        label: label_of(&names, size as usize),
+        size: size as usize,
+    }))
+}
+
+/// The community's most common live positive predicates.
+fn community_predicates(engine: &Engine, community: i64) -> Result<Vec<String>> {
+    let now = engine.clock().now;
+    let mut st = engine.db.sql().prepare(
+        "SELECT COALESCE(NULLIF(p.display,''),p.canonical) AS pred, COUNT(*) AS n
+         FROM relations r
+         JOIN communities cs ON cs.entity_id=r.src AND cs.community=?1
+         JOIN communities cd ON cd.entity_id=r.dst AND cd.community=?1
+         JOIN predicates p ON p.id=r.predicate_id
+         WHERE r.expired_at IS NULL AND (r.valid_to IS NULL OR r.valid_to>?2)
+           AND r.polarity=1
+         GROUP BY pred ORDER BY n DESC, pred LIMIT 3",
+    )?;
+    let rows = st
+        .query_map(params![community, now], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(rows)
+}
+
+/// Oldest memory start and youngest end (or start) covered by the community.
+fn community_span(engine: &Engine, community: i64) -> Result<Option<(i64, i64)>> {
+    let (start, end): (Option<i64>, Option<i64>) = engine.db.sql().query_row(
+        "SELECT MIN(m.valid_from), MAX(COALESCE(m.valid_to,m.valid_from))
+         FROM memories m
+         JOIN mentions mn ON mn.memory_id=m.id
+         JOIN communities c ON c.entity_id=mn.entity_id AND c.community=?1
+         WHERE m.expired_at IS NULL",
+        [community],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(start.zip(end))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1384,7 +1472,8 @@ pub fn entity(engine: &Engine, name: &str, limit: usize) -> Result<EntityOutput>
     let limit = limit.min(200);
     let id = resolve_entity(engine, name)?;
     let now = engine.clock().now;
-    let card = card(engine, id)?;
+    let mut card = card(engine, id)?;
+    card.community = community_ref(engine, id)?;
     let all = facts_for_view(
         engine,
         &[id],
@@ -1678,6 +1767,7 @@ pub fn overview(engine: &Engine, query: Option<&str>, k: usize) -> Result<Overvi
         {
             continue;
         }
+        let label = label_of(&community_names(engine, cid)?, ids.len());
         ranked.sort_by(|a, b| {
             b.1.cmp(&a.1)
                 .then_with(|| b.2.cmp(&a.2))
@@ -1696,7 +1786,7 @@ pub fn overview(engine: &Engine, query: Option<&str>, k: usize) -> Result<Overvi
             engine.clock().now,
             (None, None),
             3,
-            None,
+            ppr.as_ref(),
             None,
         )?;
         let score = query
@@ -1704,14 +1794,26 @@ pub fn overview(engine: &Engine, query: Option<&str>, k: usize) -> Result<Overvi
             .unwrap_or_else(|| ranked.iter().map(|x| x.2 as f64).sum());
         out.push(Community {
             id: cid,
+            label,
             size: ordered_ids.len(),
             entities,
+            predicates: Vec::new(),
+            span: None,
             facts,
             representative: representative(engine, &ordered_ids)?,
             score,
         });
     }
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap()
+            .then_with(|| a.id.cmp(&b.id))
+    });
     out.truncate(k.max(1));
+    for c in &mut out {
+        c.predicates = community_predicates(engine, c.id)?;
+        c.span = community_span(engine, c.id)?;
+    }
     Ok(OverviewOutput { communities: out })
 }

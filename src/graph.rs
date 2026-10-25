@@ -253,6 +253,366 @@ pub fn ppr_power(g: &Csr, seeds: &[(u32, f64)], alpha: f64, iters: usize) -> Vec
     x
 }
 
+// ---------------------------------------------------------------- Leiden
+
+const EPS: f64 = 1e-12;
+
+/// Deterministic pseudorandom source: seeded XorShift64, so a graph plus a
+/// seed always yields the same node visit order.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+
+    fn shuffle<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            let j = self.below(i + 1);
+            items.swap(i, j);
+        }
+    }
+}
+
+/// Undirected weighted graph in f64, used at every Leiden level.
+struct Work {
+    n: usize,
+    offsets: Vec<usize>,
+    targets: Vec<u32>,
+    weights: Vec<f64>,
+    /// Weight inside the node itself: edges collapsed by earlier aggregation.
+    selfw: Vec<f64>,
+    /// Full weighted degree, including `selfw`.
+    wdeg: Vec<f64>,
+    total: f64,
+}
+
+impl Work {
+    fn from_csr(csr: &Csr) -> Self {
+        Work {
+            n: csr.len(),
+            offsets: csr.offsets.clone(),
+            targets: csr.targets.clone(),
+            weights: csr.weights.iter().map(|w| f64::from(*w)).collect(),
+            selfw: vec![0.0; csr.len()],
+            wdeg: csr.wdeg.clone(),
+            total: csr.wdeg.iter().sum(),
+        }
+    }
+
+    /// Same merge rules as `Csr::from_edges`, but each undirected pair is
+    /// expected once and kept in f64.
+    fn from_edges(n: usize, edges: &[(u32, u32, f64)]) -> Self {
+        if n == 0 {
+            return Work {
+                n: 0,
+                offsets: vec![0],
+                targets: Vec::new(),
+                weights: Vec::new(),
+                selfw: Vec::new(),
+                wdeg: Vec::new(),
+                total: 0.0,
+            };
+        }
+        let mut directed = Vec::with_capacity(edges.len() * 2);
+        for &(u, v, w) in edges {
+            if u != v && w > 0.0 && (u as usize) < n && (v as usize) < n {
+                directed.push((u, v, w));
+                directed.push((v, u, w));
+            }
+        }
+        directed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut offsets = vec![0usize; n + 1];
+        let mut targets = Vec::with_capacity(directed.len());
+        let mut weights = Vec::with_capacity(directed.len());
+        let mut wdeg = vec![0.0f64; n];
+        let mut it = directed.into_iter().peekable();
+        while let Some((u, v, mut w)) = it.next() {
+            while let Some(&(nu, nv, nw)) = it.peek() {
+                if nu == u && nv == v {
+                    w += nw;
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            targets.push(v);
+            weights.push(w);
+            wdeg[u as usize] += w;
+            offsets[u as usize + 1] += 1;
+        }
+        for i in 0..n {
+            offsets[i + 1] += offsets[i];
+        }
+        let total = wdeg.iter().sum();
+        Work {
+            n,
+            offsets,
+            targets,
+            weights,
+            selfw: vec![0.0; n],
+            wdeg,
+            total,
+        }
+    }
+
+    /// Fast local moving: every node joins the community with the largest
+    /// modularity gain, in a seeded visit order, until a pass changes nothing.
+    fn local_moving(&self, resolution: f64, rng: &mut Rng) -> Vec<u32> {
+        let n = self.n;
+        let mut comm: Vec<u32> = (0..n as u32).collect();
+        let mut tot = self.wdeg.clone();
+        let mut to = vec![0.0f64; n];
+        let mut touched: Vec<u32> = Vec::new();
+        let mut perm: Vec<u32> = (0..n as u32).collect();
+        for _ in 0..64 {
+            rng.shuffle(&mut perm);
+            let mut moved = 0usize;
+            for &node in &perm {
+                let i = node as usize;
+                let deg = self.wdeg[i];
+                let old = comm[i] as usize;
+                tot[old] -= deg;
+                touched.clear();
+                for e in self.offsets[i]..self.offsets[i + 1] {
+                    let c = comm[self.targets[e] as usize] as usize;
+                    if to[c] == 0.0 {
+                        touched.push(c as u32);
+                    }
+                    to[c] += self.weights[e];
+                }
+                let mut best = old;
+                let mut best_gain = to[old] - resolution * deg * tot[old] / self.total;
+                for &c32 in &touched {
+                    let c = c32 as usize;
+                    let gain = to[c] - resolution * deg * tot[c] / self.total;
+                    // Ties go to the lowest community id: deterministic and
+                    // independent of neighbour iteration order.
+                    if gain > best_gain + EPS || ((gain - best_gain).abs() <= EPS && c < best) {
+                        if gain > best_gain {
+                            best_gain = gain;
+                        }
+                        best = c;
+                    }
+                }
+                for &c in &touched {
+                    to[c as usize] = 0.0;
+                }
+                tot[best] += deg;
+                comm[i] = best as u32;
+                if best != old {
+                    moved += 1;
+                }
+            }
+            if moved == 0 {
+                break;
+            }
+        }
+        comm
+    }
+
+    /// Refinement: inside every coarse community, run local moving from
+    /// singletons, then split each result into connected components. Every
+    /// returned community is connected in this graph (the Leiden guarantee).
+    fn refine(&self, part: &[u32], k: usize, resolution: f64, rng: &mut Rng) -> Vec<u32> {
+        let n = self.n;
+        let mut groups: Vec<Vec<u32>> = vec![Vec::new(); k];
+        for (i, &c) in part.iter().enumerate() {
+            groups[c as usize].push(i as u32);
+        }
+        let mut local = vec![u32::MAX; n];
+        let mut edges: Vec<(u32, u32, f64)> = Vec::new();
+        let mut refined = vec![u32::MAX; n];
+        let mut comp = Vec::new();
+        let mut queue = VecDeque::new();
+        let mut next = 0u32;
+        for group in groups {
+            if group.len() == 1 {
+                refined[group[0] as usize] = next;
+                next += 1;
+                continue;
+            }
+            for (li, &node) in group.iter().enumerate() {
+                local[node as usize] = li as u32;
+            }
+            edges.clear();
+            for &node in &group {
+                let i = node as usize;
+                for e in self.offsets[i]..self.offsets[i + 1] {
+                    let j = self.targets[e] as usize;
+                    let lj = local[j];
+                    // Each undirected edge once: from its lower local index.
+                    if lj != u32::MAX && local[i] < lj {
+                        edges.push((local[i], lj, self.weights[e]));
+                    }
+                }
+            }
+            let sub = Work::from_edges(group.len(), &edges);
+            let lp = sub.local_moving(resolution, rng);
+            comp.clear();
+            comp.resize(sub.n, u32::MAX);
+            for start in 0..sub.n {
+                if comp[start] != u32::MAX {
+                    continue;
+                }
+                comp[start] = next;
+                queue.clear();
+                queue.push_back(start as u32);
+                while let Some(x) = queue.pop_front() {
+                    let xi = x as usize;
+                    for e in sub.offsets[xi]..sub.offsets[xi + 1] {
+                        let t = sub.targets[e] as usize;
+                        if comp[t] == u32::MAX && lp[t] == lp[xi] {
+                            comp[t] = next;
+                            queue.push_back(t as u32);
+                        }
+                    }
+                }
+                next += 1;
+            }
+            for (li, &node) in group.iter().enumerate() {
+                refined[node as usize] = comp[li];
+            }
+            for &node in &group {
+                local[node as usize] = u32::MAX;
+            }
+        }
+        refined
+    }
+
+    /// Collapse `part` (dense ids < k) into one node per community.
+    fn aggregate(&self, part: &[u32], k: usize) -> Work {
+        let mut internal = vec![0.0f64; k];
+        let mut acc: std::collections::HashMap<(u32, u32), f64> = std::collections::HashMap::new();
+        for i in 0..self.n {
+            let a = part[i];
+            // Weight already inside node i (from earlier levels) belongs to
+            // the new community's interior. Losing it would shrink `total`
+            // and make later merges look free.
+            internal[a as usize] += self.selfw[i];
+            for e in self.offsets[i]..self.offsets[i + 1] {
+                let b = part[self.targets[e] as usize];
+                let w = self.weights[e];
+                if a == b {
+                    // Both edge directions land here: 2x the undirected weight,
+                    // which is what summed member degrees hold.
+                    internal[a as usize] += w;
+                } else if a < b {
+                    *acc.entry((a, b)).or_insert(0.0) += w;
+                }
+            }
+        }
+        let edges: Vec<(u32, u32, f64)> = acc.into_iter().map(|((a, b), w)| (a, b, w)).collect();
+        let mut g = Work::from_edges(k, &edges);
+        for (c, w) in internal.into_iter().enumerate() {
+            g.wdeg[c] += w;
+            g.selfw[c] = w;
+        }
+        g.total = g.wdeg.iter().sum();
+        g
+    }
+}
+
+/// Renumber community ids densely in order of first appearance.
+fn renumber(comm: &mut [u32]) -> usize {
+    let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut next = 0u32;
+    for c in comm.iter_mut() {
+        let id = *map.entry(*c).or_insert_with(|| {
+            let id = next;
+            next += 1;
+            id
+        });
+        *c = id;
+    }
+    next as usize
+}
+
+/// Deterministic Leiden community detection (Traag, Waltman & van Eck 2019).
+///
+/// Repeatedly: local moving, refinement that splits every community into
+/// connected pieces (the well-connected guarantee Louvain lacks), then
+/// aggregation by the refined partition. The visit order comes from a seeded
+/// XorShift64 and ties go to the lowest community id, so a given graph and
+/// seed always produce the same partition.
+pub fn leiden(csr: &Csr, seed: u64, resolution: f64) -> Vec<u32> {
+    let n = csr.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if csr.wdeg.iter().all(|w| *w <= 0.0) {
+        return (0..n as u32).collect();
+    }
+    let mut rng = Rng::new(seed);
+    let mut graph = Work::from_csr(csr);
+    let mut membership: Vec<u32> = (0..n as u32).collect();
+    for _ in 0..16 {
+        let mut part = graph.local_moving(resolution, &mut rng);
+        let k = renumber(&mut part);
+        if k == graph.n {
+            for m in &mut membership {
+                *m = part[*m as usize];
+            }
+            renumber(&mut membership);
+            return membership;
+        }
+        let refined = graph.refine(&part, k, resolution, &mut rng);
+        let rk = refined.iter().copied().max().map_or(0, |m| m as usize + 1);
+        for m in &mut membership {
+            *m = refined[*m as usize];
+        }
+        if rk == graph.n {
+            break;
+        }
+        graph = graph.aggregate(&refined, rk);
+    }
+    renumber(&mut membership);
+    membership
+}
+
+/// Newman modularity of `comm` on `csr` at the given resolution.
+pub fn modularity(csr: &Csr, comm: &[u32], resolution: f64) -> f64 {
+    let n = csr.len();
+    if n == 0 || comm.len() != n {
+        return 0.0;
+    }
+    let m2: f64 = csr.wdeg.iter().sum();
+    if m2 <= 0.0 {
+        return 0.0;
+    }
+    let k = comm.iter().copied().max().map_or(0, |c| c as usize + 1);
+    let mut tot = vec![0.0f64; k];
+    let mut inside = vec![0.0f64; k];
+    for i in 0..n {
+        tot[comm[i] as usize] += csr.wdeg[i];
+        for e in csr.offsets[i]..csr.offsets[i + 1] {
+            if comm[csr.targets[e] as usize] == comm[i] {
+                inside[comm[i] as usize] += f64::from(csr.weights[e]);
+            }
+        }
+    }
+    (0..k)
+        .map(|c| inside[c] / m2 - resolution * (tot[c] / m2).powi(2))
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +850,85 @@ mod tests {
             duration
         );
         assert!(!res.is_empty());
+    }
+
+    fn two_triangles() -> Csr {
+        let edges = vec![
+            (0, 1, 1.0),
+            (1, 2, 1.0),
+            (0, 2, 1.0),
+            (3, 4, 1.0),
+            (4, 5, 1.0),
+            (3, 5, 1.0),
+            (2, 3, 1.0),
+        ];
+        Csr::from_edges(6, &edges)
+    }
+
+    #[test]
+    fn leiden_splits_two_cliques_deterministically() {
+        let g = two_triangles();
+        let a = leiden(&g, 7, 1.0);
+        let b = leiden(&g, 7, 1.0);
+        assert_eq!(a, b, "same graph and seed must give the same partition");
+        assert_eq!(a[0], a[1]);
+        assert_eq!(a[1], a[2]);
+        assert_eq!(a[3], a[4]);
+        assert_eq!(a[4], a[5]);
+        assert_ne!(a[0], a[3]);
+        let q = modularity(&g, &a, 1.0);
+        assert!((q - 0.357).abs() < 0.01, "Q={q}");
+    }
+
+    #[test]
+    fn leiden_communities_are_connected() {
+        // Three cliques joined by single bridges; Leiden must not leave a
+        // community in disconnected pieces.
+        let mut edges = Vec::new();
+        for base in [0u32, 10, 20] {
+            for i in 0..4 {
+                for j in (i + 1)..4 {
+                    edges.push((base + i, base + j, 1.0));
+                }
+            }
+        }
+        edges.push((3, 10, 1.0));
+        edges.push((13, 20, 1.0));
+        edges.push((2, 22, 0.1)); // weak diagonal chord
+        let g = Csr::from_edges(24, &edges);
+        let comm = leiden(&g, 42, 1.0);
+        assert!(comm.iter().any(|c| *c != comm[0]), "expected >1 community");
+        let mut reached = [false; 24];
+        for start in 0..24 {
+            if reached[start] {
+                continue;
+            }
+            let c = comm[start];
+            let mut stack = vec![start];
+            reached[start] = true;
+            while let Some(x) = stack.pop() {
+                for e in g.offsets[x]..g.offsets[x + 1] {
+                    let t = g.targets[e] as usize;
+                    if !reached[t] && comm[t] == c {
+                        reached[t] = true;
+                        stack.push(t);
+                    }
+                }
+            }
+        }
+        assert!(
+            reached.iter().all(|r| *r),
+            "every node reached from its community"
+        );
+    }
+
+    #[test]
+    fn leiden_isolated_nodes_are_singletons() {
+        let g = Csr::from_edges(4, &[(0, 1, 2.0)]);
+        let comm = leiden(&g, 1, 1.0);
+        assert_eq!(comm[0], comm[1]);
+        assert_ne!(comm[2], comm[0], "isolated node joins nothing");
+        assert_ne!(comm[3], comm[0], "isolated node joins nothing");
+        assert_ne!(comm[2], comm[3], "isolated nodes are separate singletons");
     }
 }

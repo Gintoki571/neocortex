@@ -40,8 +40,11 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content, tags ON memori
 END;
 
 -- rowid = memories.id; live = expired_at IS NULL (kept in sync by the engine)
+-- chunk_size: vec0 allocates a whole chunk on the first insert. The default
+-- 1024 reserves 3 MiB per table (12.6 MiB in a brand-new database); 64 keeps
+-- a fresh database under 1 MiB while KNN still scans in large batches.
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(
-  embedding float[768] distance_metric=cosine, live integer);
+  embedding float[768] distance_metric=cosine, live integer, chunk_size=64);
 
 CREATE TABLE IF NOT EXISTS entities (
   id INTEGER PRIMARY KEY,
@@ -67,7 +70,7 @@ CREATE TABLE IF NOT EXISTS entity_aliases (
 );
 CREATE INDEX IF NOT EXISTS idx_alias_entity ON entity_aliases(entity_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(name, aliases, description, tokenize='porter unicode61');
-CREATE VIRTUAL TABLE IF NOT EXISTS entities_vec USING vec0(embedding float[768] distance_metric=cosine);
+CREATE VIRTUAL TABLE IF NOT EXISTS entities_vec USING vec0(embedding float[768] distance_metric=cosine, chunk_size=64);
 
 CREATE TABLE IF NOT EXISTS mentions (
   memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -92,7 +95,7 @@ CREATE TABLE IF NOT EXISTS predicate_aliases (
   alias_norm TEXT PRIMARY KEY,
   predicate_id INTEGER NOT NULL REFERENCES predicates(id) ON DELETE CASCADE
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS predicates_vec USING vec0(embedding float[768] distance_metric=cosine);
+CREATE VIRTUAL TABLE IF NOT EXISTS predicates_vec USING vec0(embedding float[768] distance_metric=cosine, chunk_size=64);
 
 CREATE TABLE IF NOT EXISTS relations (
   id INTEGER PRIMARY KEY,
@@ -124,7 +127,7 @@ CREATE TABLE IF NOT EXISTS relation_evidence (
 );
 CREATE INDEX IF NOT EXISTS idx_relev_memory ON relation_evidence(memory_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS relations_fts USING fts5(fact, predicate, tokenize='porter unicode61');
-CREATE VIRTUAL TABLE IF NOT EXISTS relations_vec USING vec0(embedding float[768] distance_metric=cosine);
+CREATE VIRTUAL TABLE IF NOT EXISTS relations_vec USING vec0(embedding float[768] distance_metric=cosine, chunk_size=64);
 
 -- soft near-synonym links, a < b
 CREATE TABLE IF NOT EXISTS similar (

@@ -756,7 +756,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "overview",
-            "description": "Global view of the memory graph: the most relevant communities (clusters of related entities) with their central entities and strongest facts. Use it to orient yourself in an unfamiliar knowledge base, or with a query to see the neighbourhood of a topic.",
+            "description": "Global view of the memory graph: the most relevant communities (clusters of related entities). Each comes with a label of its top-degree entities, its size, key predicates, date span, central entities and strongest facts. Use it to orient yourself in an unfamiliar knowledge base, or with a query to see the neighbourhood of a topic.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

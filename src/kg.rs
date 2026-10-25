@@ -2,7 +2,7 @@ use crate::db::Db;
 use crate::error::Result;
 use crate::graph::Csr;
 use rusqlite::params;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct Snapshot {
     pub csr: Csr,
@@ -20,11 +20,29 @@ fn run(db: &Db, q: &str, params: &[(&str, serde_json::Value)]) -> Result<()> {
     Ok(())
 }
 
-pub fn project_memory(db: &Db, id: i64, kind: &str) -> Result<()> {
+/// First words of a memory's text: the readable `name` a Cypher query shows
+/// (`MATCH (m:Memory) RETURN m.name`). Full text stays relational and in FTS.
+fn memory_name(content: &str) -> String {
+    let mut name: String = content
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if name.chars().count() > 80 {
+        name = name.chars().take(79).collect::<String>() + "…";
+    }
+    name
+}
+
+pub fn project_memory(db: &Db, id: i64, kind: &str, content: &str) -> Result<()> {
     run(
         db,
-        "MERGE (n:Memory {id:$id}) SET n.kind=$kind",
-        &[("id", format!("m:{id}").into()), ("kind", kind.into())],
+        "MERGE (n:Memory {id:$id}) SET n.kind=$kind, n.name=$name",
+        &[
+            ("id", format!("m:{id}").into()),
+            ("kind", kind.into()),
+            ("name", memory_name(content).into()),
+        ],
     )
 }
 
@@ -155,12 +173,12 @@ pub fn reproject_entity(db: &Db, entity: i64) -> Result<()> {
 pub fn rebuild_all(db: &Db) -> Result<()> {
     db.graph().cypher("MATCH (n) DETACH DELETE n")?;
     {
-        let mut st = db.sql().prepare("SELECT id,kind FROM memories")?;
-        let rows: Vec<(i64, String)> = st
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        let mut st = db.sql().prepare("SELECT id,kind,content FROM memories")?;
+        let rows: Vec<(i64, String, String)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        for (id, kind) in rows {
-            project_memory(db, id, &kind)?;
+        for (id, kind, content) in rows {
+            project_memory(db, id, &kind, &content)?;
         }
     }
     {
@@ -300,38 +318,71 @@ pub fn snapshot(db: &Db, as_of: Option<i64>, include_ended: bool) -> Result<Snap
     })
 }
 
+/// Fixed seed for community detection: the same graph always yields the same
+/// partition, so ids only change when the graph does.
+const COMMUNITY_SEED: u64 = 7;
+
 pub fn communities(db: &Db) -> Result<HashMap<i64, i64>> {
-    let result = db.graph().cypher("RETURN louvain(1.0)")?;
-    let mut out = HashMap::new();
-    for row in &result {
-        // graphqlite returns algorithm results as one row whose `column_0` is
-        // an array of {node_id, user_id, community} objects.
-        if let Some(graphqlite::Value::Array(items)) = row.get_value("column_0") {
-            for item in items {
-                let graphqlite::Value::Object(fields) = item else {
-                    continue;
-                };
-                let user = match fields.get("user_id") {
-                    Some(graphqlite::Value::String(s)) => s.clone(),
-                    Some(graphqlite::Value::Integer(i)) => i.to_string(),
-                    _ => continue,
-                };
-                let community = match fields.get("community") {
-                    Some(graphqlite::Value::Integer(i)) => *i,
-                    Some(graphqlite::Value::Float(f)) => *f as i64,
-                    _ => continue,
-                };
-                if let Some(id) = user.strip_prefix("e:").and_then(|x| x.parse().ok()) {
-                    out.insert(id, community);
-                }
-            }
-        } else if let Ok(user) = row.get::<String>("user_id") {
-            if let Some(id) = user.strip_prefix("e:").and_then(|x| x.parse().ok()) {
-                if let Ok(c) = row.get::<i64>("community") {
-                    out.insert(id, c);
-                }
-            }
+    let snap = snapshot(db, None, false)?;
+    let partition = crate::graph::leiden(&snap.csr, COMMUNITY_SEED, 1.0);
+    let mut current: HashMap<i64, u32> = HashMap::with_capacity(snap.ent_node.len());
+    for (&entity, &node) in &snap.ent_node {
+        current.insert(entity, partition[node as usize]);
+    }
+
+    // Keep ids stable across runs: match each new community to the previous
+    // community it shares the most entities with (greedy, one-to-one). A
+    // community with no meaningful overlap gets a fresh id above all old ones.
+    let mut previous: HashMap<i64, i64> = HashMap::new();
+    {
+        let mut st = db
+            .sql()
+            .prepare("SELECT entity_id,community FROM communities")?;
+        for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+            let (entity, community) = row?;
+            previous.insert(entity, community);
         }
+    }
+    let mut overlap: HashMap<(i64, u32), usize> = HashMap::new();
+    for (&entity, &community) in &current {
+        if let Some(&old) = previous.get(&entity) {
+            *overlap.entry((old, community)).or_insert(0) += 1;
+        }
+    }
+    let mut pairs: Vec<(usize, i64, u32)> = overlap
+        .into_iter()
+        .map(|((old, new), shared)| (shared, old, new))
+        .collect();
+    pairs.sort_unstable_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    let mut assigned: HashMap<u32, i64> = HashMap::new();
+    let mut used: HashSet<i64> = HashSet::new();
+    for (_, old, new) in pairs {
+        if assigned.contains_key(&new) || used.contains(&old) {
+            continue;
+        }
+        assigned.insert(new, old);
+        used.insert(old);
+    }
+    let first_fresh = previous.values().copied().max().map_or(0, |m| m + 1);
+    let mut fresh: Vec<u32> = current
+        .values()
+        .copied()
+        .filter(|c| !assigned.contains_key(c))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    fresh.sort_unstable();
+    for (next, community) in (first_fresh..).zip(fresh) {
+        assigned.insert(community, next);
+    }
+
+    let mut out: HashMap<i64, i64> = HashMap::with_capacity(current.len());
+    for (entity, community) in &current {
+        out.insert(*entity, assigned[community]);
     }
     let now = crate::temporal::Clock::system().now;
     db.sql().execute("DELETE FROM communities", [])?;
