@@ -382,7 +382,12 @@ fn relation_endpoints_use_their_own_embedding() {
         )
         .unwrap();
     // vectors[1] (the London card) would give 1.0 here.
-    assert!((score - 0.9).abs() < 1e-3, "score {score}");
+    let tol = if engine.db.vec_mode() == neocortex::db::VecMode::Int8 {
+        5e-3
+    } else {
+        1e-3
+    };
+    assert!((score - 0.9).abs() < tol, "score {score}");
     assert_eq!(count(&engine, "SELECT count(*) FROM relations"), 1);
 }
 
