@@ -986,6 +986,7 @@ pub(crate) fn facts(db: &Db, hits: &[PathHit], cutoff: i64, limit: usize) -> Res
                 memory: false,
                 current_values: None,
                 replaced_by: None,
+                duration: None,
             });
             if out.len() >= limit {
                 return Ok(out);
@@ -1077,6 +1078,7 @@ pub(crate) fn prose_terminal_fact(
         memory: true,
         current_values: None,
         replaced_by: None,
+        duration: None,
     }))
 }
 

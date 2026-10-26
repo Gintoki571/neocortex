@@ -1,0 +1,12 @@
+# MemTrace: probing what final accuracy misses (Long et al., 2026)
+Source: https://arxiv.org/abs/2606.17328 (HTML read; Sec 3-4, Tables 3-4). Benchmark preprint.
+
+**Problem.** Pooled QA accuracy hides how a single fact behaves as its age and the question type change.
+
+**Data model (benchmark).** 20 users, 835 typed knowledge points (635 substantive: static, dynamic, preference; 200 distractors: conflict, boundary), 5,677 base probes, 15,422 question rows, 200,453 scored answers over 13 memory configurations in four paradigms (long-context, RAG incl. BM25/dense, structured/graph incl. HippoRAG-v2 and Mem0, agentic). Each fact is probed at **8 chronological checkpoints**; question types Current / Historical / Trajectory; evidence conditions present / missing (boundary: must abstain) / contradicted by a false premise (conflict: must correct).
+
+**Findings.** (1) Same pooled score, different failures: HippoRAG-v2 leads *saturated* current (45.4) and historical (50.9) questions and overall saturated gist (36.5%); a different system (Mem-T) leads *trajectory* (19.8%). Trajectory ("how did it change?") is a different skill from lookup. (2) Abstaining is not resolving: safe refusal does not imply correcting a false premise (Table 4: HippoRAG-v2 conflict gist 80.2 with 11.7 abstain; Mem0 14.6 gist with 82.5 abstain). (3) **Evidence use, not retrieval, is the bottleneck:** on 300 probes replayed with a plain embedding retriever, 21 (7.0%) were reach misses, 220 (73.3%) reached the gold session but were unsolved, 59 solved; with gold evidence handed to the generator, hard probes rise to 80-85% (Sec 4).
+
+**What neocortex could steal.** (1) A *trajectory* answer needs the ordered chain of states of one (subject, predicate): neocortex's `entity` card already has `current_facts/past_facts` newest-first; add a first-class `history(subject, predicate)` render that returns all states with intervals in one block, in order (touches `recall.rs::facts_for_view`, `render.rs`); this is TM-12 and needs no LLM. (2) Measure neocortex with **age-stratified** evals: same fact queried after 10, 100, 1,000 later memories, to catch recency bias in RRF fusion at scale (new eval axis). (3) Test "conflict" probes (false-premise questions: "Since Dana lives in Oslo, ...") separately from abstention.
+
+**Weak / wrong.** LLM judge; synthetic-ish user histories; reports few absolute numbers per system in text.

@@ -202,6 +202,7 @@ Each ablation run must demonstrate either an expected drop in performance for it
 - Current defaults (2026-10-25): fixtures recall 0.953 / MRR 0.896; holdout recall 0.913 / MRR 0.798. Original design defaults on holdout: 0.869 / 0.622.
 - The optional channels are swept like any other knob: `w_tlink` (E4a temporal links), `w_causal` + `causal_extract` (E4b causal evidence), `w_retention` + `access_keep` (E5). All are 0 except `w_retention` (0.05), which was neutral on fixtures and world-300 and +0.007 MRR on holdout.
 - The eval clock is the fixture `now`, so every access written during a run shares one instant and the `1/days_since_access` term of the retention score is zero by construction. Eval can measure the salience/decay part only; the access-history part is covered by `tests/links_access.rs` and the hash-embedder `bench` A/B instead.
+- Reranker keys: `--set rerank_top=30 --set w_rerank=0.5` (needs `NEOCORTEX_RERANK_MODEL`; sweep `rerank_top=0,20,30,50` on one saved ingestion with `--save-db` / `--load-db`). Off by default; `docs/research/rerank.md` has the measurements. `multihop-holdout2.json` is never used to choose between configs beyond six.
 
 ## Running the eval
 

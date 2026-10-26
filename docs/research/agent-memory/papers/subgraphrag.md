@@ -1,0 +1,10 @@
+# SubgraphRAG: simple, flexible, effective KG retrieval (Li et al., ICLR 2025)
+Source: https://arxiv.org/abs/2410.20724 (HTML read; Sec 3-4, Tables 1-3). Lane nc-hop is implementing this; this card is cross-check only.
+
+**Mechanism (exact).** Score every candidate triple tau=(h,r,t) in the topic entities' neighbourhood with an MLP on `[z_q || z_h || z_r || z_t || z_tau]` where z_* are frozen text-encoder embeddings (gte-large-en-v1.5) and **z_tau = Directional Distance Encoding**: one-hot topic-entity indicator `s_e^(0)`, propagate `s_e^(l+1) = MEAN{s_e'^(l) | (e',.,e) in G}` for l rounds forward and in the reverse direction, concatenate all rounds, and use `[s_h || s_t]` (Sec 3). Trained by binary cross-entropy against **weak labels = triples on shortest paths between topic and answer entities**. Retrieval is parallel over triples; top-K by score (K adaptive per LLM).
+
+**Reported results.** WebQSP shortest-path triple recall **0.883** vs cosine-similarity retrieval 0.714; CWQ 0.811 vs 0.488; answer-entity recall 0.944 vs 0.708 (WebQSP); wall-clock 6 s vs 3 s for cosine (Table 1, column "Time (s)"). Ablation (Sec 4.1): MLP alone (no structure) and GraphSAGE are worse than MLP+DDE; DDE supplies the multi-hop signal. Cross-dataset generalisation retained (WebQSP<->CWQ 0.794 / 0.622).
+
+**What neocortex could steal.** Already assigned to nc-hop. Two reminders drawn from the paper: (1) the structural feature is just *k-round mean-propagated distance from seeds in both directions*, i.e. the PPR/BFS profile of each edge endpoint: neocortex can compute this from its in-memory `kg::Snapshot` in microseconds; (2) weak supervision from shortest paths means training pairs can be generated from neocortex's own `gen_world` seeds (not the eval seed), as already noted in `multihop.md` 2.3. Compare the MLP against the residual-cosine beam on multihop-holdout2 three-hop (0.667), the number to move.
+
+**Weak / wrong.** Freebase QA with LLM-labelled relevance for evaluation; retrieval time 2x cosine; gains over cosine shrink when the relation vocabulary overlaps the question words, as in neocortex's own set.

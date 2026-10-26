@@ -18,6 +18,7 @@ pub mod rank;
 pub mod recall;
 pub mod remember;
 pub mod render;
+pub mod rerank;
 pub mod resolve;
 pub mod temporal;
 pub mod text;

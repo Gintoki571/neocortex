@@ -30,6 +30,15 @@ fn memory_line(m: &MemoryHit, fmt: Fmt<'_>) -> String {
             None => line.push_str(" [ended]"),
         }
     }
+    if m.tags.iter().any(|tag| tag == "planned") {
+        line.push_str(" [planned]");
+    }
+    if m.tags.iter().any(|tag| tag == "recurring") {
+        line.push_str(" [recurring]");
+    }
+    if let Some(duration) = &m.duration {
+        line.push_str(&format!(" ({duration})"));
+    }
     line.push_str(" · ");
     line.push_str(&m.content);
     if !m.reasons.is_empty() {
@@ -58,7 +67,7 @@ fn fact_line(f: &FactHit, fmt: Fmt<'_>) -> String {
     if f.memory {
         return format!("[m{}] {} · {}", f.id, f.source, f.fact);
     }
-    let span = match (f.valid_to, f.ended) {
+    let base = match (f.valid_to, f.ended) {
         (Some(to), true) => match &f.replaced_by {
             Some((id, fact)) => format!(
                 "{} → {}, replaced by r{id}: {fact}",
@@ -71,6 +80,13 @@ fn fact_line(f: &FactHit, fmt: Fmt<'_>) -> String {
         (None, true) if f.retracted => format!("{}, retracted", fmt(f.valid_from)),
         (None, true) => format!("{}, ended", fmt(f.valid_from)),
         (None, false) => format!("since {}", fmt(f.valid_from)),
+    };
+    // A duration question renders the computed span instead of a bare date:
+    // "3 years 2 months", or "ongoing since 2023-04-01" for a live fact.
+    let span = match &f.duration {
+        Some(d) if f.valid_to.is_none() && !f.ended => d.clone(),
+        Some(d) => format!("{base}, {d}"),
+        None => base,
     };
     let arrow = if f.polarity == 0 { "—NOT " } else { "—" };
     let suffix = f
@@ -225,6 +241,14 @@ pub fn render_recall(out: &RecallOutput, fmt: Fmt<'_>) -> String {
         let cards: Vec<String> = out.entities.iter().map(entity_card).collect();
         s.push_str(&format!("entities: {}\n", cards.join(" · ")));
     }
+    if !out.next.is_empty() {
+        let hints: Vec<String> = out
+            .next
+            .iter()
+            .map(|h| format!("follow {} {} for {} — {}", h.entity, h.name, h.want, h.why))
+            .collect();
+        s.push_str(&format!("next: {}\n", hints.join(" · ")));
+    }
     s
 }
 
@@ -351,7 +375,7 @@ fn bytes(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Community, CommunityRef, EntityResolution, RelationResult};
+    use crate::engine::{Community, CommunityRef, EntityResolution, NextHop, RelationResult};
 
     fn fake(t: i64) -> String {
         format!("D{t}")
@@ -376,6 +400,7 @@ mod tests {
             tags: Vec::new(),
             score: 1.0,
             reasons: Vec::new(),
+            duration: None,
         }
     }
 
@@ -404,6 +429,7 @@ mod tests {
             memory: false,
             current_values: None,
             replaced_by: None,
+            duration: None,
         }
     }
 
@@ -441,6 +467,7 @@ mod tests {
                 card(3, "Mom", "person", &["mother"]),
                 card(8, "Pune", "place", &[]),
             ],
+            next: Vec::new(),
             window: None,
             candidates: 23,
             tokens_used: 410,
@@ -467,6 +494,7 @@ mod tests {
             memories: Vec::new(),
             facts: Vec::new(),
             entities: Vec::new(),
+            next: Vec::new(),
             window: Some((10, 20, "last week".to_string())),
             candidates: 0,
             tokens_used: 0,
@@ -492,6 +520,41 @@ mod tests {
     }
 
     #[test]
+    fn recall_names_the_next_hop() {
+        let out = RecallOutput {
+            memories: Vec::new(),
+            facts: Vec::new(),
+            entities: Vec::new(),
+            next: vec![
+                NextHop {
+                    entity: "e42".into(),
+                    name: "Mira Lindqvist".into(),
+                    want: "where live".into(),
+                    why: "chain ends at a person".into(),
+                },
+                NextHop {
+                    entity: "e7".into(),
+                    name: "Oslo".into(),
+                    want: "where live".into(),
+                    why: "no chain covers the question".into(),
+                },
+            ],
+            window: None,
+            candidates: 0,
+            tokens_used: 0,
+            tokens_budget: 1200,
+            omitted: 0,
+            window_empty: false,
+            over_budget: false,
+        };
+        assert_eq!(
+            render_recall(&out, &fake),
+            "no memories matched — try fewer filters, a broader query or another spelling.\n\
+next: follow e42 Mira Lindqvist for where live — chain ends at a person · follow e7 Oslo for where live — no chain covers the question\n"
+        );
+    }
+
+    #[test]
     fn recall_marks_superseded_memories() {
         let mut m = hit(7, "fact", "Old truth.", 1, Some(2), true);
         m.superseded_by = Some(9);
@@ -499,6 +562,7 @@ mod tests {
             memories: vec![m],
             facts: Vec::new(),
             entities: Vec::new(),
+            next: Vec::new(),
             window: None,
             candidates: 1,
             tokens_used: 10,
