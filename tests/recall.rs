@@ -494,6 +494,92 @@ fn a_chain_link_stated_only_in_prose_is_followed() {
     );
 }
 
+/// Rui/Marta chain whose last link ("grew up in Braga") is prose only.
+fn prose_terminal_engine() -> (Engine, i64) {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Rui Carvalho is mentored by Marta Lobo.", |i| {
+        i.relations = vec![relation(
+            "Marta Lobo",
+            "mentors",
+            "Rui Carvalho",
+            "Marta Lobo mentors Rui Carvalho",
+        )];
+    });
+    for filler in [
+        "Rui Carvalho runs the Saturday football drills.",
+        "Rui Carvalho prefers espresso over filter coffee.",
+        "Marta Lobo reviewed the grant budget.",
+        "Marta Lobo chairs the hiring panel.",
+    ] {
+        remember(&e, filler, |_| {});
+    }
+    let answer = remember(&e, "Marta Lobo spent her childhood in Braga.", |_| {});
+    (e, answer)
+}
+
+#[test]
+fn a_prose_terminal_chain_renders_its_memory_as_a_fact() {
+    let (mut e, answer) = prose_terminal_engine();
+    let ask = |e: &Engine| {
+        e.recall(&RecallInput {
+            query: "Which town did Rui Carvalho's mentor grow up in?".into(),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    // Opt-in: off by default.
+    assert!(ask(&e).facts.iter().all(|f| !f.memory));
+    e.cfg.prose_margin = 0.0;
+    let out = ask(&e);
+    let fact = out.facts.iter().find(|f| f.memory && f.id == answer);
+    assert!(fact.is_some(), "{:?}", out.facts);
+    assert!(fact.unwrap().fact.contains("Braga"));
+    let text = neocortex::render::render_recall(&out, &|t| t.to_string());
+    assert!(text.contains(&format!("[m{answer}] ")), "{text}");
+    // Infinity switches the line off again.
+    e.cfg.prose_margin = f64::INFINITY;
+    assert!(ask(&e).facts.iter().all(|f| !f.memory));
+}
+
+#[test]
+fn a_history_question_still_reaches_the_second_hop() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Dana Reyes led the Mirante assay team.", |i| {
+        i.valid_from = Some("2025-01-01".into());
+        i.valid_to = Some("2026-01-01".into());
+        i.relations = vec![RelationIn {
+            valid_from: Some("2025-01-01".into()),
+            valid_to: Some("2026-01-01".into()),
+            ..relation(
+                "Dana Reyes",
+                "leads",
+                "Mirante assay team",
+                "Dana Reyes led the Mirante assay team",
+            )
+        }];
+    });
+    for filler in [
+        "Dana Reyes reviewed the plate reader budget.",
+        "The Mirante assay team meets on Tuesdays.",
+        "Dana Reyes runs the Thursday journal club.",
+    ] {
+        remember(&e, filler, |_| {});
+    }
+    let answer = remember(&e, "Dana Reyes has a severe peanut allergy.", |_| {});
+    let out = e
+        .recall(&RecallInput {
+            query: "What is the allergy of whoever used to lead the Mirante assay team?".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let hit = out.memories.iter().find(|m| m.id == answer);
+    assert!(
+        hit.is_some_and(|m| m.reasons.iter().any(|r| r.starts_with("sem#"))),
+        "{:?}",
+        out.memories
+    );
+}
+
 #[test]
 fn unrelated_question_abstains_instead_of_ranking_noise() {
     let e = engine(Arc::new(HashEmbedder));

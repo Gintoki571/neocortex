@@ -987,6 +987,7 @@ pub(crate) fn facts(db: &Db, hits: &[PathHit], cutoff: i64, limit: usize) -> Res
                 ended: expired.is_some() || valid_to.is_some_and(|v| v <= cutoff),
                 retracted: expired.is_some() && valid_to.is_none(),
                 polarity,
+                memory: false,
                 current_values: None,
                 replaced_by: None,
                 duration: None,
@@ -994,6 +995,99 @@ pub(crate) fn facts(db: &Db, hits: &[PathHit], cutoff: i64, limit: usize) -> Res
             if out.len() >= limit {
                 return Ok(out);
             }
+        }
+    }
+    Ok(out)
+}
+
+/// The chains whose relations are rendered: the best of each channel first
+/// (lexical and semantic scores are not comparable), then runners-up, three in
+/// all (the old lexical pair plus the best semantic chain).
+pub(crate) fn top_chains(lexical: &[PathHit], semantic: &[PathHit]) -> Vec<PathHit> {
+    let mut out = Vec::new();
+    for i in 0..2 {
+        out.extend(lexical.get(i).cloned());
+        out.extend(semantic.get(i).cloned());
+    }
+    out.truncate(3);
+    out
+}
+
+/// What a chain ends on: a prose memory or a relation.
+fn terminal(hit: &PathHit) -> Option<(bool, i64)> {
+    hit.steps
+        .last()
+        .map(|s| (s.memory.is_some(), s.memory.unwrap_or(s.relation_id)))
+}
+
+/// Prose steps rendered per query at most.
+const PROSE_FACTS: usize = 2;
+
+/// B4: when the best chain (`hits` sorted best first) uses prose memories and
+/// beats the best chain with another terminal by `margin`, those memories carry
+/// the answer (a relation-less hop is never rendered by `facts`); render them
+/// as fact lines (`memory` = true), destination first.
+pub(crate) fn prose_facts(
+    db: &Db,
+    hits: &[PathHit],
+    margin: f64,
+    cutoff: i64,
+) -> Result<Vec<FactHit>> {
+    let Some(best) = hits.first().filter(|_| margin.is_finite()) else {
+        return Ok(Vec::new());
+    };
+    let rival = hits.iter().find(|h| terminal(h) != terminal(best));
+    if rival.is_some_and(|r| best.score - r.score < margin) {
+        return Ok(Vec::new());
+    }
+    let name = |entity: i64| -> Result<String> {
+        Ok(db
+            .sql()
+            .query_row("SELECT name FROM entities WHERE id=?1", [entity], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .unwrap_or_default())
+    };
+    let mut out = Vec::new();
+    for step in best.steps.iter().rev().filter(|s| s.memory.is_some()) {
+        let id = step.memory.unwrap_or_default();
+        let Some((valid_from, valid_to, expired)) = db
+            .sql()
+            .query_row(
+                "SELECT valid_from,valid_to,expired_at FROM memories WHERE id=?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .filter(|(from, _, _)| *from <= cutoff)
+        else {
+            continue;
+        };
+        out.push(FactHit {
+            id,
+            source: name(step.src)?,
+            predicate: String::new(),
+            target: name(step.dst)?,
+            fact: step.fact.chars().take(200).collect(),
+            valid_from,
+            valid_to,
+            ended: expired.is_some() || valid_to.is_some_and(|v| v <= cutoff),
+            retracted: expired.is_some() && valid_to.is_none(),
+            polarity: 1,
+            memory: true,
+            current_values: None,
+            replaced_by: None,
+            duration: None,
+        });
+        if out.len() >= PROSE_FACTS {
+            break;
         }
     }
     Ok(out)
@@ -1386,5 +1480,44 @@ mod residual_tests {
         let r = residual_after(&[0.6, 0.8, 0.0], &[1.0, 0.0, 0.0]);
         assert!(r[0].abs() < 1e-6, "{r:?}");
         assert!((r[1] - 1.0).abs() < 1e-6, "{r:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chain(score: f64, tag: i64) -> PathHit {
+        PathHit {
+            steps: vec![Step {
+                relation_id: tag,
+                src: 0,
+                dst: 0,
+                predicate: String::new(),
+                fact: String::new(),
+                reverse: false,
+                matched: 0,
+                memory: None,
+            }],
+            coverage: 1,
+            score,
+        }
+    }
+
+    #[test]
+    fn lexical_hits_do_not_crowd_out_the_best_semantic_chain() {
+        let lexical = [chain(9.0, 1), chain(8.0, 2), chain(7.0, 3)];
+        let semantic = [chain(0.6, 10), chain(0.5, 11)];
+        let tags: Vec<i64> = top_chains(&lexical, &semantic)
+            .iter()
+            .map(|h| h.steps[0].relation_id)
+            .collect();
+        assert_eq!(tags, vec![1, 10, 2]);
+        // One channel alone still yields its two best chains.
+        let only: Vec<i64> = top_chains(&lexical, &[])
+            .iter()
+            .map(|h| h.steps[0].relation_id)
+            .collect();
+        assert_eq!(only, vec![1, 2]);
     }
 }

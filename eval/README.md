@@ -183,6 +183,9 @@ recall is still scored on the top-k prefix (`k`, default 8), which greedy MMR ma
 Answer strings are a looser test than ids: a wrong memory that happens to name the same city
 satisfies it. Read acc@10 with recall/MRR, not instead of them.
 
+Two guard columns keep acc@10 honest: `context tokens/query` (rendered recall output, chars / 4) must not grow more than 10% for a change, and `expect_absent leaked` counts queries that still show an `expect_absent` memory in the top k or as a prose fact line (`[m<id>]`), even when it does not outrank the expected one.
+Prose fact lines (`Config.prose_margin`, `--set prose_margin=0`) are opt-in and off by default: measured +1 mh2 query, no gain on a blind set, +1.5% to +4.5% context tokens.
+
 ### 6. Channel Ablation Protocol
 To measure the marginal contribution of each retrieval channel, the benchmark is executed across 5 configurations:
 1. **Full Fusion**: $w_{\text{bm25}} = 1.0, w_{\text{vec}} = 1.0, w_{\text{graph}} = 1.0, w_{\text{temporal}} = 1.0$.
