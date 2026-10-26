@@ -197,6 +197,7 @@ cargo run --release --example gen_world -- --people 300 --seed 7 --out eval/worl
 ./target/release/neocortex eval eval/world-300.json --save-db /tmp/world300.db              # per-category acc@10 / recall / MRR
 cargo run --release --example agent_sim -- eval/world-300.json target/w300.db              # iterative agent accuracy (recall -> follow -> recall-leaf)
 cargo run --release --example agent_sim -- eval/world-300.json target/w300.db --hints      # hint mode never lowers the answered rate; calls/query <= 1.5
+cargo run --release --example agent_sim -- eval/multihop-holdout2.json <db from eval --save-db> --hints  # main b34e01d: 91/100 (0.910) at 1.42 calls/query vs single-recall acc@10 0.820; multihop-holdout 69/80 (0.863)
 cargo run --release --example community_eval -- target/w300.db                             # Leiden modularity >= graphqlite louvain on the same graph
 cargo run --release --example name_eval                                                    # ER-07 threshold sweep on tests/data/name_pairs.json; at 0.92 recall 0.964 / precision 0.964 (known false merge: Wisniewski/Wisniowski)
 ```
