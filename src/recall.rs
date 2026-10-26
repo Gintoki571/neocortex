@@ -1538,7 +1538,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                 })
             });
         let mut merged: Vec<FactHit> = prose.collect();
-        merged.extend(paths::facts(&engine.db, &top_chains, cutoff, 6)?);
+        merged.extend(paths::facts(&engine.db, &top_chains, cutoff, 8)?);
         for fact in facts {
             if !merged.iter().any(|x| x.id == fact.id && !x.memory) {
                 merged.push(fact);

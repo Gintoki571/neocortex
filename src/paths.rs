@@ -999,14 +999,15 @@ pub(crate) fn facts(db: &Db, hits: &[PathHit], cutoff: i64, limit: usize) -> Res
 }
 
 /// The chains whose relations are rendered: the best of each channel first
-/// (lexical and semantic scores are not comparable), then runners-up up to two.
+/// (lexical and semantic scores are not comparable), then runners-up, three in
+/// all (the old lexical pair plus the best semantic chain).
 pub(crate) fn top_chains(lexical: &[PathHit], semantic: &[PathHit]) -> Vec<PathHit> {
     let mut out = Vec::new();
     for i in 0..2 {
         out.extend(lexical.get(i).cloned());
         out.extend(semantic.get(i).cloned());
     }
-    out.truncate(2);
+    out.truncate(3);
     out
 }
 
@@ -1509,7 +1510,7 @@ mod tests {
             .iter()
             .map(|h| h.steps[0].relation_id)
             .collect();
-        assert_eq!(tags, vec![1, 10]);
+        assert_eq!(tags, vec![1, 10, 2]);
         // One channel alone still yields its two best chains.
         let only: Vec<i64> = top_chains(&lexical, &[])
             .iter()
