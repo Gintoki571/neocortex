@@ -2,6 +2,9 @@
 //! cosine parity against the f32 reference fixture. Model-gated like
 //! `embed_parity.rs`: skips when the f32 model dir is absent.
 
+mod common;
+
+use common::TempDir;
 use neocortex::embed::{self, Mode, WEIGHTS_Q4K, WEIGHTS_Q8};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -67,7 +70,7 @@ fn parity(dir: &std::path::Path, dtype: &str) -> (f32, f32) {
 #[test]
 fn q8_round_trip_loads_without_the_f32_file_and_matches_f32() {
     let Some(dir) = model_dir() else { return };
-    let out = std::env::temp_dir().join(format!("neocortex-q8-{}", std::process::id()));
+    let out = TempDir::new("quant");
     let bytes = embed::quantize_dir(&dir, &out, "q8").unwrap();
     assert!(out.join(WEIGHTS_Q8).is_file() && out.join("config.json").is_file());
     // About a quarter of the 604 MB f32 file (embedding table and linears in Q8_0).
@@ -79,7 +82,6 @@ fn q8_round_trip_loads_without_the_f32_file_and_matches_f32() {
         mean >= 0.995 && min >= 0.99,
         "q8 parity min {min} mean {mean}"
     );
-    std::fs::remove_dir_all(&out).ok();
 }
 
 /// q8 vs f32 on 40 memories and 40 queries of each eval set (the fixture above
@@ -89,7 +91,7 @@ fn q8_round_trip_loads_without_the_f32_file_and_matches_f32() {
 #[test]
 fn q8_matches_f32_on_the_eval_corpora() {
     let Some(dir) = model_dir() else { return };
-    let out = std::env::temp_dir().join(format!("neocortex-q8w-{}", std::process::id()));
+    let out = TempDir::new("quant");
     embed::quantize_dir(&dir, &out, "q8").unwrap();
     let (f32m, q8m) = (
         embed::load_dtype(Some(&dir), Some("f32")).unwrap(),
@@ -124,19 +126,17 @@ fn q8_matches_f32_on_the_eval_corpora() {
         cosines.len()
     );
     assert!(mean >= 0.995 && min >= 0.99, "min {min} mean {mean}");
-    std::fs::remove_dir_all(&out).ok();
 }
 
 #[test]
 fn q4k_parity_is_reported_and_stays_usable() {
     let Some(dir) = model_dir() else { return };
-    let out = std::env::temp_dir().join(format!("neocortex-q4k-{}", std::process::id()));
+    let out = TempDir::new("quant");
     embed::quantize_dir(&dir, &out, "q4k").unwrap();
     assert!(out.join(WEIGHTS_Q4K).is_file());
     // Not a default candidate; only guard against a broken kernel.
     let (_, mean) = parity(&out, "q4k");
     assert!(mean >= 0.9, "q4k mean cosine {mean}");
-    std::fs::remove_dir_all(&out).ok();
 }
 
 #[test]
