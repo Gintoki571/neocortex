@@ -512,11 +512,13 @@ pub(crate) fn search_semantic(
     // the edges the beam reaches (a vec0 vector read costs ~0.3 ms).
     let relevant: HashSet<i64> = db
         .sql()
-        .prepare_cached("SELECT rowid FROM relations_vec WHERE embedding MATCH ?1 AND k=?2")?
-        .query_map(
-            params![crate::db::vec_blob(query_vec), SEM_FACTS as i64],
-            |r| r.get::<_, i64>(0),
-        )?
+        .prepare_cached(&format!(
+            "SELECT rowid FROM relations_vec WHERE embedding MATCH {} AND k=?2",
+            db.vec_sql("?1")
+        ))?
+        .query_map(params![db.vec_blob(query_vec), SEM_FACTS as i64], |r| {
+            r.get::<_, i64>(0)
+        })?
         .collect::<rusqlite::Result<_>>()?;
     let mut relation_vector_st = db
         .sql()
@@ -609,7 +611,7 @@ pub(crate) fn search_semantic(
             let Some(vector) = relation_vector_st
                 .query_row([relation_id], |r| r.get::<_, Vec<u8>>(0))
                 .optional()?
-                .and_then(|blob| crate::db::blob_to_vec(&blob))
+                .and_then(|blob| db.blob_to_vec(&blob))
             else {
                 continue;
             };
@@ -637,7 +639,7 @@ pub(crate) fn search_semantic(
                     let Some(v) = vector_st
                         .query_row([memory_id], |r| r.get::<_, Vec<u8>>(0))
                         .optional()?
-                        .and_then(|blob| crate::db::blob_to_vec(&blob))
+                        .and_then(|blob| db.blob_to_vec(&blob))
                     else {
                         continue;
                     };
@@ -874,7 +876,7 @@ pub(crate) fn causal_memories(
             continue;
         }
         let cosine = blob
-            .and_then(|b| crate::db::blob_to_vec(&b))
+            .and_then(|b| db.blob_to_vec(&b))
             .map(|v| f64::from(crate::rank::cosine(query_vec, &v)))
             .unwrap_or(0.0);
         let fact_terms: HashSet<String> = text::tokens(&fact)

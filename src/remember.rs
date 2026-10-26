@@ -1,5 +1,5 @@
 use crate::{
-    db::{vec_blob, Db},
+    db::Db,
     embed::{Embedder, Mode},
     engine::{
         Config, EntityIn, EntityResolution, RelationIn, RelationResult, RememberInput,
@@ -1180,8 +1180,11 @@ fn write_prepared(
             Ok(_) => {
                 let id = db.sql().last_insert_rowid();
                 db.sql().execute(
-                    "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,?2,1)",
-                    params![id, vec_blob(&vectors[0])],
+                    &format!(
+                        "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,{},1)",
+                        db.vec_sql("?2")
+                    ),
+                    params![id, db.vec_blob(&vectors[0])],
                 )?;
                 kg::project_memory(db, id, &kind, &content)?;
                 id
@@ -1258,11 +1261,12 @@ fn write_prepared(
     let mut related = Vec::new();
     if relations.is_empty() && !ids.is_empty() {
         let entity_ids: Vec<i64> = ids.values().copied().collect();
-        let mut st = db.sql().prepare(
+        let mut st = db.sql().prepare(&format!(
             "SELECT rowid,1-distance FROM memories_vec
-             WHERE embedding MATCH ?1 AND k=10 AND live=1 ORDER BY distance",
-        )?;
-        for row in st.query_map([vec_blob(&vectors[0])], |r| {
+             WHERE embedding MATCH {} AND k=10 AND live=1 ORDER BY distance",
+            db.vec_sql("?1")
+        ))?;
+        for row in st.query_map([db.vec_blob(&vectors[0])], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, f32>(1)?))
         })? {
             let (mid, cosine) = row?;
@@ -1560,8 +1564,11 @@ fn write_prepared(
                 params![rid, fact, predicate_text],
             )?;
             db.sql().execute(
-                "INSERT INTO relations_vec(rowid,embedding) VALUES(?1,?2)",
-                params![rid, vec_blob(&vectors[fact_base + ri])],
+                &format!(
+                    "INSERT INTO relations_vec(rowid,embedding) VALUES (?1,{})",
+                    db.vec_sql("?2")
+                ),
+                params![rid, db.vec_blob(&vectors[fact_base + ri])],
             )?;
             // Polarity flip: the same stored triple asserted with the opposite
             // polarity ends the older live assertion (both stay history). An
@@ -1967,8 +1974,11 @@ fn knn_memory(db: &Db, v: &[f32], threshold: f32) -> Result<Option<(i64, f32)>> 
     let row: Option<(i64, f32)> = db
         .sql()
         .query_row(
-            "SELECT rowid,1-distance FROM memories_vec WHERE embedding MATCH ?1 AND k=1 AND live=1 ORDER BY distance",
-            [vec_blob(v)],
+            &format!(
+                "SELECT rowid,1-distance FROM memories_vec WHERE embedding MATCH {} AND k=1 AND live=1 ORDER BY distance",
+                db.vec_sql("?1")
+            ),
+            [db.vec_blob(v)],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;

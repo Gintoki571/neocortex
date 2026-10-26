@@ -14,10 +14,105 @@ use std::sync::Once;
 /// refuses to start on any other value).
 pub const SCHEMA_VERSION: i64 = 4;
 
+/// Storage mode of the four vec0 tables. `F32` is 768 x f32 (3,072 B per
+/// vector); `Int8` is 768 x i8 (768 B), see [`INT8_LEVELS`]. A database
+/// records its mode in `schema_meta.vec_mode` and keeps it on every open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VecMode {
+    F32,
+    Int8,
+}
+
+/// Mode of a new database when `NEOCORTEX_VEC` is unset.
+const NEW_DB_MODE: VecMode = VecMode::F32;
+
+/// Int8 levels: each vector is scaled so its largest element maps to 127. Cosine
+/// is scale-invariant, so sqlite-vec and the readers need no stored scale; the
+/// decoder renormalises to unit length (embedders return unit vectors). A fixed
+/// [-1, 1] scale wasted about 4x of the range and cost 0.004 holdout MRR.
+const INT8_LEVELS: f32 = 127.0;
+
+impl VecMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            VecMode::F32 => "f32",
+            VecMode::Int8 => "int8",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<VecMode> {
+        match s {
+            "f32" => Ok(VecMode::F32),
+            "int8" => Ok(VecMode::Int8),
+            _ => Err(crate::err!("unknown vector mode '{s}' (use f32 or int8)")),
+        }
+    }
+
+    /// `NEOCORTEX_VEC` for a new database; unset or empty means [`NEW_DB_MODE`].
+    pub fn from_env() -> Result<VecMode> {
+        match std::env::var("NEOCORTEX_VEC") {
+            Ok(s) if !s.is_empty() => VecMode::parse(&s),
+            _ => Ok(NEW_DB_MODE),
+        }
+    }
+
+    /// Blob for a vec0 column of this mode.
+    pub fn encode(self, v: &[f32]) -> Vec<u8> {
+        match self {
+            VecMode::F32 => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            VecMode::Int8 => {
+                let max = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                let k = if max > 0.0 { INT8_LEVELS / max } else { 0.0 };
+                v.iter().map(|x| ((x * k).round() as i8) as u8).collect()
+            }
+        }
+    }
+
+    /// Inverse of [`VecMode::encode`]; None unless the blob is one DIMS-long vector.
+    pub fn decode(self, blob: &[u8]) -> Option<Vec<f32>> {
+        match self {
+            VecMode::F32 if blob.len() == DIMS * 4 => Some(
+                blob.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|x| f32::from_le_bytes(*x))
+                    .collect(),
+            ),
+            VecMode::Int8 if blob.len() == DIMS => {
+                let mut v: Vec<f32> = blob.iter().map(|b| f32::from(*b as i8)).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    v.iter_mut().for_each(|x| *x /= norm);
+                }
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    /// SQL expression that passes a blob bound to `arg` as a vector of this
+    /// mode: sqlite-vec rejects an int8 vector without its subtype.
+    pub fn bind_sql(self, arg: &str) -> String {
+        match self {
+            VecMode::F32 => arg.to_string(),
+            VecMode::Int8 => format!("vec_int8({arg})"),
+        }
+    }
+}
+
+/// The four vec0 tables, in rewrite order for `migrate_vectors`.
+const VEC_TABLES: [&str; 4] = [
+    "memories_vec",
+    "entities_vec",
+    "predicates_vec",
+    "relations_vec",
+];
+
 /// One connection for everything (relational, FTS5, vec0, Cypher), so a
 /// write is one transaction.
 pub struct Db {
     g: graphqlite::Connection,
+    vec: VecMode,
 }
 
 fn register_vec() {
@@ -32,7 +127,17 @@ fn register_vec() {
 }
 
 impl Db {
+    /// Open or create. A new file takes its vector mode from `NEOCORTEX_VEC`.
     pub fn open(path: &Path) -> Result<Db> {
+        Self::open_as(path, None)
+    }
+
+    /// Open or create; a new file gets `mode` (an existing one keeps its own).
+    pub fn open_with_mode(path: &Path, mode: VecMode) -> Result<Db> {
+        Self::open_as(path, Some(mode))
+    }
+
+    fn open_as(path: &Path, new_mode: Option<VecMode>) -> Result<Db> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             // Never chmod a directory this process did not create: `--db /tmp/x.db`
             // must not change /tmp, and `--db ./x.db` must not change the checkout.
@@ -46,7 +151,7 @@ impl Db {
         }
         register_vec();
         let conn = rusqlite::Connection::open(path)?;
-        let db = Self::init(conn)?;
+        let db = Self::init(conn, new_mode)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -65,11 +170,20 @@ impl Db {
     }
 
     pub fn open_in_memory() -> Result<Db> {
-        register_vec();
-        Self::init(rusqlite::Connection::open_in_memory()?)
+        Self::open_in_memory_as(None)
     }
 
-    fn init(conn: rusqlite::Connection) -> Result<Db> {
+    pub fn open_in_memory_with_mode(mode: VecMode) -> Result<Db> {
+        Self::open_in_memory_as(Some(mode))
+    }
+
+    fn open_in_memory_as(new_mode: Option<VecMode>) -> Result<Db> {
+        register_vec();
+        Self::init(rusqlite::Connection::open_in_memory()?, new_mode)
+    }
+
+    /// `new_mode` is the mode of a fresh database; None reads `NEOCORTEX_VEC`.
+    fn init(conn: rusqlite::Connection, new_mode: Option<VecMode>) -> Result<Db> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // journal_mode returns a row, so it cannot go through execute_batch.
         // Switching a brand-new file to WAL ignores busy_timeout, so two
@@ -91,12 +205,20 @@ impl Db {
         }
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
         let g = graphqlite::Connection::from_rusqlite(conn)?;
-        let db = Db { g };
+        let mut db = Db {
+            g,
+            vec: VecMode::F32,
+        };
         // graphqlite stamps `user_version=1` when it creates its own schema in
         // a fresh file, so presence of our tables, not the number alone, says
         // whether this database was ever initialised.
         if !db.table_exists("memories")? {
-            db.create_schema()?;
+            let mode = match new_mode {
+                Some(m) => m,
+                None => VecMode::from_env()?,
+            };
+            db.create_schema(mode)?;
+            db.vec = mode;
             return Ok(db);
         }
         let v = db.schema_version()?;
@@ -119,10 +241,24 @@ impl Db {
         // relational shape the ladder guards, so they are ensured for every
         // v4 database instead of renumbering the schema. Idempotent by design.
         db.ensure_additive_tables()?;
+        db.vec = db.stored_vec_mode()?;
         Ok(db)
     }
 
+    fn stored_vec_mode(&self) -> Result<VecMode> {
+        let s: String =
+            self.sql()
+                .query_row("SELECT vec_mode FROM schema_meta LIMIT 1", [], |r| r.get(0))?;
+        VecMode::parse(&s)
+    }
+
     fn ensure_additive_tables(&self) -> Result<()> {
+        // Databases before the vector mode existed hold f32 vectors.
+        if !self.column_exists("schema_meta", "vec_mode")? {
+            self.sql().execute_batch(
+                "ALTER TABLE schema_meta ADD COLUMN vec_mode TEXT NOT NULL DEFAULT 'f32'",
+            )?;
+        }
         self.sql().execute_batch(
             "CREATE TABLE IF NOT EXISTS memory_links (
                a INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -163,11 +299,120 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// Fresh database: create every table, then stamp the version.
-    fn create_schema(&self) -> Result<()> {
+    /// Fresh database: create every table, then stamp the version and mode.
+    fn create_schema(&self, mode: VecMode) -> Result<()> {
         self.sql().execute_batch(include_str!("schema.sql"))?;
+        self.create_vec_tables(mode)?;
         self.seed_predicates()?;
-        self.set_version(SCHEMA_VERSION)
+        self.set_version(SCHEMA_VERSION)?;
+        self.sql()
+            .execute("UPDATE schema_meta SET vec_mode=?1", [mode.name()])?;
+        Ok(())
+    }
+
+    /// chunk_size=64: the 1024 default reserves 12.6 MiB on the first insert
+    /// (a whole chunk per table). Chunk bytes scale with the mode, not the count.
+    fn create_vec_tables(&self, mode: VecMode) -> Result<()> {
+        for name in VEC_TABLES {
+            self.create_vec_tables_one(name, mode)?;
+        }
+        Ok(())
+    }
+
+    fn create_vec_tables_one(&self, name: &str, mode: VecMode) -> Result<()> {
+        let ty = match mode {
+            VecMode::F32 => "float",
+            VecMode::Int8 => "int8",
+        };
+        // memories_vec carries the `live` filter column.
+        let live = if name == "memories_vec" {
+            ", live integer"
+        } else {
+            ""
+        };
+        self.sql().execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING vec0(embedding {ty}[768] distance_metric=cosine{live}, chunk_size=64)"
+        ))?;
+        Ok(())
+    }
+
+    /// Storage mode of the vec0 tables (`schema_meta.vec_mode`).
+    pub fn vec_mode(&self) -> VecMode {
+        self.vec
+    }
+
+    /// Blob to bind for a vec0 column (write or KNN query), in this database's mode.
+    pub fn vec_blob(&self, v: &[f32]) -> Vec<u8> {
+        self.vec.encode(v)
+    }
+
+    /// Vector read back from a vec0 column, dequantized to f32 in int8 mode.
+    pub fn blob_to_vec(&self, blob: &[u8]) -> Option<Vec<f32>> {
+        self.vec.decode(blob)
+    }
+
+    /// SQL argument for a vec0 vector bound to `arg` (see [`VecMode::bind_sql`]).
+    pub fn vec_sql(&self, arg: &str) -> String {
+        self.vec.bind_sql(arg)
+    }
+
+    /// Rewrite the vector tables into `to` in one transaction, then VACUUM.
+    /// Only f32 -> int8 exists. Rows are read into memory first, since the
+    /// vec0 tables are dropped and recreated in place.
+    pub fn migrate_vectors(&mut self, to: VecMode) -> Result<()> {
+        if to == self.vec {
+            return Ok(());
+        }
+        if to != VecMode::Int8 {
+            return Err(crate::err!("only migration to int8 is supported"));
+        }
+        self.write(|db| {
+            for name in VEC_TABLES {
+                let has_live = name == "memories_vec";
+                let live_col = if has_live { "live" } else { "NULL" };
+                let rows: Vec<(i64, Vec<f32>, Option<i64>)> = {
+                    let mut st = db
+                        .sql()
+                        .prepare(&format!("SELECT rowid, embedding, {live_col} FROM {name}"))?;
+                    let rows = st.query_map([], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get(2)?))
+                    })?;
+                    let mut out = Vec::new();
+                    for row in rows {
+                        let (id, blob, live) = row?;
+                        let v = db
+                            .vec
+                            .decode(&blob)
+                            .ok_or_else(|| crate::err!("{name} row {id} is not a f32 vector"))?;
+                        out.push((id, v, live));
+                    }
+                    out
+                };
+                db.sql().execute_batch(&format!("DROP TABLE {name}"))?;
+                db.create_vec_tables_one(name, to)?;
+                let bind = to.bind_sql("?2");
+                let insert = if has_live {
+                    format!("INSERT INTO {name}(rowid,embedding,live) VALUES (?1,{bind},?3)")
+                } else {
+                    format!("INSERT INTO {name}(rowid,embedding) VALUES (?1,{bind})")
+                };
+                for (id, v, live) in rows {
+                    let blob = to.encode(&v);
+                    if has_live {
+                        db.sql()
+                            .execute(&insert, rusqlite::params![id, blob, live])?;
+                    } else {
+                        db.sql().execute(&insert, rusqlite::params![id, blob])?;
+                    }
+                }
+            }
+            db.sql()
+                .execute("UPDATE schema_meta SET vec_mode=?1", [to.name()])?;
+            Ok(())
+        })?;
+        self.sql().execute_batch("VACUUM")?;
+        self.vec = to;
+        Ok(())
     }
 
     /// Hand-written predicate ontology. Small on purpose: a wrong seed merges
@@ -580,9 +825,15 @@ impl Db {
     fn set_version(&self, v: i64) -> Result<()> {
         self.sql()
             .execute_batch("CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL)")?;
-        self.sql().execute("DELETE FROM schema_meta", [])?;
-        self.sql()
-            .execute("INSERT INTO schema_meta(version) VALUES(?1)", [v])?;
+        // UPDATE keeps the row's vec_mode column.
+        if self
+            .sql()
+            .execute("UPDATE schema_meta SET version=?1", [v])?
+            == 0
+        {
+            self.sql()
+                .execute("INSERT INTO schema_meta(version) VALUES(?1)", [v])?;
+        }
         Ok(())
     }
 
@@ -674,25 +925,6 @@ pub fn is_unique_violation(e: &rusqlite::Error) -> bool {
     )
 }
 
-/// f32 slice as the little-endian blob vec0 expects.
-pub fn vec_blob(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
-/// Inverse of [`vec_blob`]; None when the blob is not one DIMS-long vector.
-pub fn blob_to_vec(blob: &[u8]) -> Option<Vec<f32>> {
-    if blob.len() != DIMS * 4 {
-        return None;
-    }
-    Some(
-        blob.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|x| f32::from_le_bytes(*x))
-            .collect(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,19 +941,23 @@ mod tests {
         let c = db.sql();
         for (id, i, live) in [(1, 0, 1), (2, 0, 0), (3, 1, 1)] {
             c.execute(
-                "INSERT INTO memories_vec(rowid, embedding, live) VALUES (?1, ?2, ?3)",
-                rusqlite::params![id, vec_blob(&unit(i)), live],
+                &format!(
+                    "INSERT INTO memories_vec(rowid, embedding, live) VALUES (?1, {}, ?3)",
+                    db.vec_sql("?2")
+                ),
+                rusqlite::params![id, db.vec_blob(&unit(i)), live],
             )
             .unwrap();
         }
         let knn = |sql: &str| -> Vec<i64> {
             let mut st = c.prepare(sql).unwrap();
-            st.query_map([vec_blob(&unit(0))], |r| r.get(0))
+            st.query_map([db.vec_blob(&unit(0))], |r| r.get(0))
                 .unwrap()
                 .map(|r| r.unwrap())
                 .collect()
         };
-        let q = "SELECT rowid FROM memories_vec WHERE embedding MATCH ?1 AND k = 3 AND live = 1 ORDER BY distance";
+        let q = format!("SELECT rowid FROM memories_vec WHERE embedding MATCH {} AND k = 3 AND live = 1 ORDER BY distance", db.vec_sql("?1"));
+        let q = q.as_str();
         assert_eq!(knn(q), vec![1, 3]);
         c.execute("UPDATE memories_vec SET live = 0 WHERE rowid = 1", [])
             .unwrap();
@@ -816,9 +1052,48 @@ mod tests {
     }
 
     #[test]
-    fn blob_to_vec_round_trips_and_rejects_wrong_lengths() {
+    fn f32_round_trips_and_rejects_wrong_lengths() {
         let v = unit(3);
-        assert_eq!(blob_to_vec(&vec_blob(&v)), Some(v));
-        assert_eq!(blob_to_vec(&[0u8; 4]), None);
+        assert_eq!(VecMode::F32.decode(&VecMode::F32.encode(&v)), Some(v));
+        assert_eq!(VecMode::F32.decode(&[0u8; 4]), None);
+        assert_eq!(VecMode::Int8.decode(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn int8_round_trip_error_is_within_one_level() {
+        // Deterministic unit vectors with elements spread over [-1, 1].
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..50 {
+            let mut v: Vec<f32> = (0..768)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed % 2001) as f32 / 1000.0 - 1.0
+                })
+                .collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= norm);
+            let back = VecMode::Int8.decode(&VecMode::Int8.encode(&v)).unwrap();
+            let worst = v
+                .iter()
+                .zip(&back)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let max = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            assert!(worst <= max / 127.0, "round trip error {worst} (max {max})");
+        }
+        // The largest element maps to 127; -64 is 192 as a byte.
+        assert_eq!(
+            VecMode::Int8.encode(&[1.0, -1.0, 2.0, 0.0]),
+            vec![64, 192, 127, 0]
+        );
+    }
+
+    #[test]
+    fn vec_mode_parses_names() {
+        assert_eq!(VecMode::parse("int8").unwrap(), VecMode::Int8);
+        assert_eq!(VecMode::parse("f32").unwrap(), VecMode::F32);
+        assert!(VecMode::parse("i8").is_err());
     }
 }

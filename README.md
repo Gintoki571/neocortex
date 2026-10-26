@@ -78,6 +78,7 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 | `alias <entity> <alias>` | add another name to an entity |
 | `overview [query...]` | communities with labels, key predicates and date spans |
 | `stats` | counts, database size, embedder, cold-tier hint |
+| `migrate-vectors --to int8` | rewrite the four vector tables from f32 to int8 in one transaction, then VACUUM (databases stay f32 unless migrated) |
 | `reindex` | rebuild the graph projection from the relational tables |
 | `validate` | report integrity problems (exit 1 when any) |
 | `cypher <query>` | read-only Cypher over the graph projection |
@@ -330,6 +331,7 @@ of supporting-hop memories on the multi-hop world (0.965 -> 0.816), and adds
 | `NEOCORTEX_TZ` | system local offset | offset for relative dates and displayed dates, `+HH:MM` or `Z` |
 | `NEOCORTEX_MAX_TOKENS` | `1024` | max tokens per embedding |
 | `NEOCORTEX_EMBEDDER` | unset | `hash` selects the deterministic test embedder |
+| `NEOCORTEX_VEC` | `f32` | vector storage of a **new** database: `f32` or `int8` (one byte per element, scale 127); an existing database keeps the mode in `schema_meta.vec_mode` |
 | `NEOCORTEX_RERANK_MODEL` | `~/.neocortex/models/ms-marco-MiniLM-L-6-v2` | reranker model directory (optional) |
 | `NEOCORTEX_RERANK` | unset | `<N>` reranks the top N fused candidates, `off` disables; unset = built-in default |
 

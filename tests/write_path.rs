@@ -196,7 +196,13 @@ fn embedding_similarity_only_creates_similar_edges() {
     assert_ne!(second.entities[0].id, london);
     assert_eq!(second.entities[0].similar.len(), 1);
     assert_eq!(second.entities[0].similar[0].0, london);
-    assert!((second.entities[0].similar[0].2 - 0.9).abs() < 1e-4);
+    // int8 cosines carry the quantization error (about 1e-3 for these vectors).
+    let tol = if engine.db.vec_mode() == neocortex::db::VecMode::Int8 {
+        5e-3
+    } else {
+        1e-4
+    };
+    assert!((second.entities[0].similar[0].2 - 0.9).abs() < tol);
     assert_eq!(count(&engine, "SELECT count(*) FROM similar"), 1);
     assert_eq!(count(&engine, "SELECT count(*) FROM entities"), 2);
 }
