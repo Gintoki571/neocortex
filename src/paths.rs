@@ -696,7 +696,7 @@ pub(crate) fn search_semantic(
             let Some(vector) = entity_vector_st
                 .query_row([other], |r| r.get::<_, Vec<u8>>(0))
                 .optional()?
-                .and_then(|blob| crate::db::blob_to_vec(&blob))
+                .and_then(|blob| db.blob_to_vec(&blob))
             else {
                 continue;
             };
@@ -1454,7 +1454,7 @@ mod residual_tests {
 #[cfg(test)]
 mod name_part_tests {
     use super::{evidence, search_semantic, Visibility};
-    use crate::db::{vec_blob, Db};
+    use crate::db::Db;
     use rusqlite::params;
 
     fn vector(axis: usize) -> Vec<f32> {
@@ -1475,7 +1475,7 @@ mod name_part_tests {
         db.sql()
             .execute(
                 "INSERT INTO entities_vec(rowid,embedding) VALUES (?1,?2)",
-                params![id, vec_blob(&vector(axis))],
+                params![id, db.vec_blob(&vector(axis))],
             )
             .unwrap();
         id
@@ -1493,7 +1493,7 @@ mod name_part_tests {
         db.sql()
             .execute(
                 "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,?2,1)",
-                params![id, vec_blob(&vector(axis))],
+                params![id, db.vec_blob(&vector(axis))],
             )
             .unwrap();
         id
