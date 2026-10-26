@@ -1031,7 +1031,7 @@ pub(crate) fn prose_facts(
     margin: f64,
     cutoff: i64,
 ) -> Result<Vec<FactHit>> {
-    let Some(best) = hits.first() else {
+    let Some(best) = hits.first().filter(|_| margin.is_finite()) else {
         return Ok(Vec::new());
     };
     let rival = hits.iter().find(|h| terminal(h) != terminal(best));

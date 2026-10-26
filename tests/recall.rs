@@ -527,14 +527,17 @@ fn a_prose_terminal_chain_renders_its_memory_as_a_fact() {
         })
         .unwrap()
     };
+    // Opt-in: off by default.
+    assert!(ask(&e).facts.iter().all(|f| !f.memory));
+    e.cfg.prose_margin = 0.0;
     let out = ask(&e);
     let fact = out.facts.iter().find(|f| f.memory && f.id == answer);
     assert!(fact.is_some(), "{:?}", out.facts);
     assert!(fact.unwrap().fact.contains("Braga"));
     let text = neocortex::render::render_recall(&out, &|t| t.to_string());
     assert!(text.contains(&format!("[m{answer}] ")), "{text}");
-    // A margin nothing can reach switches the line off.
-    e.cfg.prose_margin = 1e9;
+    // Infinity switches the line off again.
+    e.cfg.prose_margin = f64::INFINITY;
     assert!(ask(&e).facts.iter().all(|f| !f.memory));
 }
 
