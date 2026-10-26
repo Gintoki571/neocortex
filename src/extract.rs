@@ -19,8 +19,15 @@ pub struct Candidate {
 /// file paths, code identifiers (snake_case, camelCase, dotted.names),
 /// versioned names ("Postgres 16"). Deduped by norm_name, document order.
 pub fn heuristic_entities(text: &str) -> Vec<Candidate> {
+    heuristic_entities_with(text, &|_| false)
+}
+
+/// As `heuristic_entities`, with `known` telling whether a name is already an
+/// entity or alias (EX-03: "Cypher Memory nodes" keeps "Cypher" when "Cypher"
+/// is known and the compound never was).
+pub fn heuristic_entities_with(text: &str, known: &dyn Fn(&str) -> bool) -> Vec<Candidate> {
     let (mut cands, consumed) = scan_specials(text);
-    cands.extend(word_candidates(text, &consumed));
+    cands.extend(word_candidates(text, &consumed, known));
     cands.sort_by(|a, b| {
         a.start
             .cmp(&b.start)
@@ -498,10 +505,17 @@ fn is_foreign_title_case(word: &str) -> bool {
         && cs.iter().any(|c| !c.is_ascii())
 }
 
-fn word_candidates(text: &str, consumed: &[(usize, usize)]) -> Vec<Candidate> {
+fn word_candidates(
+    text: &str,
+    consumed: &[(usize, usize)],
+    known: &dyn Fn(&str) -> bool,
+) -> Vec<Candidate> {
     let words = word_tokens(text, consumed);
     let mut cands = Vec::new();
-    for word in &words {
+    for (idx, word) in words.iter().enumerate() {
+        if is_unit_after_number(&words, text, idx) {
+            continue;
+        }
         if let Some(hint) = word_hint(word.text) {
             cands.push(Candidate {
                 name: word.text.to_string(),
@@ -511,10 +525,14 @@ fn word_candidates(text: &str, consumed: &[(usize, usize)]) -> Vec<Candidate> {
             });
         }
     }
+    cands.extend(unit_label_candidates(text, &words));
 
     let mut i = 0;
     while i < words.len() {
-        if !is_span_start(words[i].text) {
+        if !is_span_start(words[i].text)
+            || is_unit_after_number(&words, text, i)
+            || unit_label_follows(&words, text, i)
+        {
             i += 1;
             continue;
         }
@@ -528,7 +546,10 @@ fn word_candidates(text: &str, consumed: &[(usize, usize)]) -> Vec<Candidate> {
             if is_acronym(words[k - 1].text) && is_acronym(w) {
                 break;
             }
-            if is_proper_word(w) {
+            if unit_label_follows(&words, text, k) {
+                break;
+            }
+            if is_proper_word(w) && !is_unit_after_number(&words, text, k) {
                 last = k;
                 k += 1;
             } else if is_connector(w)
@@ -604,7 +625,16 @@ fn word_candidates(text: &str, consumed: &[(usize, usize)]) -> Vec<Candidate> {
                 && is_sentence_start(text, w0.start)
                 && (w0.text.chars().count() <= 1 || is_ordinary_word(w0.text));
 
-            if !reject_span {
+            if is_known_head_span(text, &words, s_idx, e_idx, known) {
+                // EX-03: a known first word stands alone; its compound is not an entity.
+                let w = &words[s_idx];
+                cands.push(Candidate {
+                    name: w.text.to_string(),
+                    hint: "proper",
+                    start: w.start,
+                    end: w.end,
+                });
+            } else if !reject_span {
                 let has_calendar = words[s_idx..=e_idx]
                     .iter()
                     .any(|w| is_weekday_or_month(&fold(w.text)));
@@ -633,6 +663,158 @@ fn word_candidates(text: &str, consumed: &[(usize, usize)]) -> Vec<Candidate> {
 
 fn gap_is_space(text: &str, left: &Word<'_>, right: &Word<'_>) -> bool {
     text[left.end..right.start].chars().all(char::is_whitespace)
+}
+
+/// Measures that follow a number ("1.2 MB", "120 ms"): not entities (EX-02).
+/// A bare "%" never reaches here, since it is not a word token.
+const UNITS: &[&str] = &[
+    "kb", "mb", "gb", "tb", "kib", "mib", "gib", "ms", "s", "px", "mhz", "ghz", "km", "kg",
+];
+
+/// Head nouns of unit, room and gate labels ("Apt 3B", "Suite 210") (EX-01).
+const UNIT_HEADS: &[&str] = &[
+    "apt",
+    "apartment",
+    "flat",
+    "room",
+    "suite",
+    "unit",
+    "gate",
+    "building",
+    "bldg",
+    "floor",
+    "office",
+    "bay",
+    "wing",
+    "lot",
+];
+
+/// Lowercase nouns that may close a known-name span (EX-03). A closed list on
+/// purpose: a verb ("Alice Smith lives") must never split a real name.
+const SPAN_NOUNS: &[&str] = &[
+    "nodes",
+    "edges",
+    "queries",
+    "tables",
+    "records",
+    "rows",
+    "files",
+    "logs",
+    "tests",
+    "models",
+    "memories",
+    "entries",
+    "items",
+    "pages",
+    "indexes",
+    "columns",
+    "fields",
+    "values",
+    "keys",
+    "functions",
+    "modules",
+    "crates",
+    "packages",
+    "servers",
+    "services",
+    "endpoints",
+    "tools",
+    "commands",
+    "options",
+    "settings",
+    "rules",
+    "errors",
+    "events",
+    "messages",
+    "requests",
+    "facts",
+    "entities",
+    "relations",
+    "users",
+    "rooms",
+    "buildings",
+    "devices",
+    "tasks",
+    "bugs",
+    "features",
+    "versions",
+    "releases",
+    "projects",
+    "scripts",
+    "tickets",
+    "reports",
+];
+
+fn is_unit_after_number(words: &[Word<'_>], text: &str, k: usize) -> bool {
+    k > 0
+        && is_number(words[k - 1].text)
+        && gap_is_space(text, &words[k - 1], &words[k])
+        && UNITS.contains(&words[k].text.to_ascii_lowercase().as_str())
+}
+
+/// A letter+digit label ("3B", "B12", "5A"). Plain numbers stay with the span rules.
+fn is_mixed_label(word: &str) -> bool {
+    let letters = word.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let digits = word.chars().filter(|c| c.is_ascii_digit()).count();
+    word.is_ascii()
+        && (1..=2).contains(&letters)
+        && (1..=4).contains(&digits)
+        && letters + digits == word.len()
+}
+
+/// A label after a unit head: a plain number ("210") or a letter+digit label ("3B").
+fn is_unit_label(word: &str) -> bool {
+    is_number(word) || is_mixed_label(word)
+}
+
+fn is_unit_head(word: &str) -> bool {
+    is_proper_word(word) && UNIT_HEADS.contains(&fold(word).as_str())
+}
+
+/// True when word `k` is a unit head ("Apt") followed by a mixed label ("3B").
+/// The head is then neither a span member nor an entity on its own.
+fn unit_label_follows(words: &[Word<'_>], text: &str, k: usize) -> bool {
+    k + 1 < words.len()
+        && is_unit_head(words[k].text)
+        && is_unit_label(words[k + 1].text)
+        && gap_is_space(text, &words[k], &words[k + 1])
+}
+
+fn unit_label_candidates(text: &str, words: &[Word<'_>]) -> Vec<Candidate> {
+    (0..words.len())
+        .filter(|&k| unit_label_follows(words, text, k))
+        .map(|k| {
+            let (start, end) = (words[k].start, words[k + 1].end);
+            Candidate {
+                name: text[start..end].to_string(),
+                hint: "label",
+                start,
+                end,
+            }
+        })
+        .collect()
+}
+
+/// EX-03: "Cypher Memory nodes" is a known first word plus a noun when the
+/// first word is already an entity or alias, the compound is not, and the
+/// next word is in `SPAN_NOUNS`. Two-word spans only.
+fn is_known_head_span(
+    text: &str,
+    words: &[Word<'_>],
+    s_idx: usize,
+    e_idx: usize,
+    known: &dyn Fn(&str) -> bool,
+) -> bool {
+    if e_idx != s_idx + 1 || !is_proper_word(words[e_idx].text) {
+        return false;
+    }
+    let Some(next) = words.get(e_idx + 1) else {
+        return false;
+    };
+    SPAN_NOUNS.contains(&next.text)
+        && gap_is_space(text, &words[e_idx], next)
+        && known(words[s_idx].text)
+        && !known(&text[words[s_idx].start..words[e_idx].end])
 }
 
 fn word_hint(text: &str) -> Option<&'static str> {
@@ -996,6 +1178,96 @@ mod tests {
         assert!(g
             .iter()
             .any(|(n, s, e)| n == "house" && &text[*s..*e] == "house"));
+    }
+
+    fn names(text: &str, known: &dyn Fn(&str) -> bool) -> Vec<String> {
+        heuristic_entities_with(text, known)
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    }
+
+    #[test]
+    fn unit_labels_with_head_nouns_are_entities() {
+        // EX-01: head noun + letter/digit label; plain numbers keep the span rules.
+        for (text, label) in [
+            (
+                "Apt 3B in the Harbor Building has a leaking pipe.",
+                "Apt 3B",
+            ),
+            ("We met in Unit 5A today.", "Unit 5A"),
+            ("Take the Gate B12 shuttle.", "Gate B12"),
+            ("Room 101 is booked.", "Room 101"),
+            ("Flat 4 needs paint.", "Flat 4"),
+            ("Suite 210 is quiet.", "Suite 210"),
+            ("Building 7 closed.", "Building 7"),
+            ("Version 2 shipped.", "Version 2"),
+        ] {
+            let got = names(text, &|_| false);
+            assert!(got.iter().any(|n| n == label), "{label:?} in {got:?}");
+        }
+        let got = names("Apt 3B in the Harbor Building has a leaking pipe.", &|_| {
+            false
+        });
+        assert!(got.contains(&"Harbor Building".to_string()), "{got:?}");
+        assert!(!got.contains(&"Apt".to_string()), "{got:?}");
+        // Mid-sentence "Visited Apt 3B" must not glue the head onto a span.
+        let got = names("We visited Apt 3B.", &|_| false);
+        assert!(got.contains(&"Apt 3B".to_string()), "{got:?}");
+        assert!(!got.contains(&"Visited Apt".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn units_after_numbers_are_never_entities() {
+        // EX-02: a unit after a number is a measure; acronyms stay.
+        let got = names("The fresh DB is 1.2 MB and recall takes 120 ms.", &|_| {
+            false
+        });
+        assert!(!got.iter().any(|n| n == "MB" || n == "ms"), "{got:?}");
+        assert!(got.contains(&"DB".to_string()), "{got:?}");
+        for unit in [
+            "KB", "GB", "TB", "KiB", "MiB", "GiB", "MHz", "GHz", "km", "kg",
+        ] {
+            let text = format!("The cache is 512 {unit} in size.");
+            let got = names(&text, &|_| false);
+            assert!(!got.iter().any(|n| n == unit), "{unit} in {got:?}");
+        }
+        let got = names("Use SQL and MCP on the CPU with 2 GB RAM.", &|_| false);
+        for kept in ["SQL", "MCP", "CPU", "RAM"] {
+            assert!(got.contains(&kept.to_string()), "{kept} in {got:?}");
+        }
+        assert!(!got.iter().any(|n| n == "GB"), "{got:?}");
+    }
+
+    #[test]
+    fn known_head_before_plural_noun_drops_the_compound() {
+        // EX-03: a known first word + a never-seen compound + a plural noun.
+        let cypher = |n: &str| n.eq_ignore_ascii_case("cypher");
+        let got = names("Cypher Memory nodes are readable now.", &cypher);
+        assert!(got.contains(&"Cypher".to_string()), "{got:?}");
+        assert!(!got.contains(&"Cypher Memory".to_string()), "{got:?}");
+        // Unknown head, or a compound already known, keeps the span.
+        let got = names("Cypher Memory nodes are readable now.", &|_| false);
+        assert!(got.contains(&"Cypher Memory".to_string()), "{got:?}");
+        let both =
+            |n: &str| n.eq_ignore_ascii_case("cypher") || n.eq_ignore_ascii_case("cypher memory");
+        let got = names("Cypher Memory nodes are readable now.", &both);
+        assert!(got.contains(&"Cypher Memory".to_string()), "{got:?}");
+        // Real two-word names survive: a verb or other non-noun never splits them.
+        let known = |n: &str| {
+            ["bergen", "harbor", "alice"]
+                .iter()
+                .any(|k| n.eq_ignore_ascii_case(k))
+        };
+        for text in [
+            "Bergen Airport opened in 1992.",
+            "Harbor Building has a leak.",
+            "Alice Smith lives in Oslo.",
+        ] {
+            let got = names(text, &known);
+            let span = text.split(' ').take(2).collect::<Vec<_>>().join(" ");
+            assert!(got.contains(&span), "{span:?} in {got:?}");
+        }
     }
 
     #[test]

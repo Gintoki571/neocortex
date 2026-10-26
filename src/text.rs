@@ -362,9 +362,9 @@ pub fn name_blocker(a: &str, b: &str) -> Option<&'static str> {
     let digit_runs = |s: &str| -> Vec<String> {
         let mut runs = Vec::new();
         for word in s.split_whitespace() {
-            let run: String = word.chars().filter(|c| c.is_ascii_digit()).collect();
-            if !run.is_empty() {
-                runs.push(run);
+            // The whole token, letters included: "3b" and "3c" (Apt 3B/Apt 3C) differ.
+            if word.chars().any(|c| c.is_ascii_digit()) {
+                runs.push(word.to_string());
             }
         }
         runs
@@ -1218,7 +1218,8 @@ mod regression_tests {
         for (a, b, cause) in [
             ("Novak Group", "Novak Group North", "subset"),
             ("Bergen Airport", "Bergen Airport South", "subset"),
-            ("Apt 3B", "Apt 3C", "label"),
+            ("Apt 3B", "Apt 3C", "digits"),
+            ("Gate B12", "Gate B13", "digits"),
             ("Room B", "Room C", "label"),
         ] {
             assert_eq!(
