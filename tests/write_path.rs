@@ -7,6 +7,9 @@ use neocortex::{
     temporal::Clock,
     Result,
 };
+mod common;
+
+use common::TempDir;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -1462,19 +1465,6 @@ fn memory_ends_when_all_its_facts_end() {
 
 // ------------------------------------------------- audit regressions (#2..#22)
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "neocortex-writepath-{}-{tag}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 fn engine_at(path: &std::path::Path) -> Engine {
     Engine::open(path, Arc::new(HashEmbedder))
         .unwrap()
@@ -1860,7 +1850,7 @@ fn hard_forget_clears_superseded_by_references() {
 #[test]
 fn opening_a_db_does_not_chmod_an_existing_directory() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = temp_dir("chmod");
+    let dir = TempDir::new("writepath-chmod");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     drop(engine_at(&dir.join("mem.db")));
     let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
@@ -1875,7 +1865,7 @@ fn opening_a_db_does_not_chmod_an_existing_directory() {
 /// #17: a v1 database with duplicate live hashes migrates cleanly to v2.
 #[test]
 fn a_v1_database_with_duplicate_live_hashes_migrates_to_v2() {
-    let dir = temp_dir("migrate");
+    let dir = TempDir::new("writepath-migrate");
     let path = dir.join("mem.db");
     {
         let engine = engine_at(&path);
@@ -1977,7 +1967,7 @@ fn relation_endpoints_are_mentioned_by_their_memory() {
 
 #[test]
 fn a_v2_database_gains_polarity_and_seeded_predicates_on_open() {
-    let dir = temp_dir("migrate-v3");
+    let dir = TempDir::new("writepath-migrate-v3");
     let path = dir.join("mem.db");
     {
         let engine = engine_at(&path);
@@ -2038,7 +2028,7 @@ fn a_v2_database_gains_polarity_and_seeded_predicates_on_open() {
 /// the v2 step — has to survive every pre-f2 predicate shape.
 #[test]
 fn a_baseline_v3_database_with_three_column_predicates_opens() {
-    let dir = temp_dir("migrate-baseline-v3");
+    let dir = TempDir::new("writepath-migrate-baseline-v3");
     let path = dir.join("mem.db");
     {
         let engine = engine_at(&path);

@@ -3,9 +3,10 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+mod common;
+use common::TempDir;
 
 const PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const TOOLS: [&str; 10] = [
@@ -21,23 +22,18 @@ const TOOLS: [&str; 10] = [
     "stats",
 ];
 
-fn temp_dir() -> PathBuf {
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("neocortex-mcp-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 struct Mcp {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    // Declared last: Drop kills and reaps the child first, then this removes the dir.
+    _dir: TempDir,
 }
 
 impl Mcp {
     fn start() -> Mcp {
-        let db = temp_dir().join("memory.db");
+        let dir = TempDir::new("mcp");
+        let db = dir.join("memory.db");
         let mut child = Command::new(env!("CARGO_BIN_EXE_neocortex"))
             .arg("mcp")
             .env("NEOCORTEX_DB", &db)
@@ -53,6 +49,7 @@ impl Mcp {
             child,
             stdin,
             stdout,
+            _dir: dir,
         }
     }
 

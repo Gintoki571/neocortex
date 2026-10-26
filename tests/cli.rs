@@ -1,9 +1,11 @@
 //! CLI surface: version, help, usage errors and exit codes.
 //! Commands that need the engine are `#[ignore]` until phase 2 lands.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+mod common;
+use common::TempDir;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_neocortex"))
@@ -19,14 +21,6 @@ fn stdout(o: &Output) -> String {
 
 fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
-}
-
-fn temp_db() -> PathBuf {
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("neocortex-cli-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("memory.db")
 }
 
 #[test]
@@ -105,8 +99,7 @@ fn cli_recall_k_budget_and_entity_limit_are_bounded() {
 
 #[test]
 fn eval_empty_queries_returns_zero_metrics() {
-    let dir = std::env::temp_dir().join(format!("neocortex-empty-eval-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::new("empty-eval");
     let fixture = dir.join("empty.json");
     std::fs::write(
         &fixture,
@@ -124,8 +117,7 @@ fn eval_empty_queries_returns_zero_metrics() {
 
 #[test]
 fn eval_unknown_expected_key_is_an_error() {
-    let dir = std::env::temp_dir().join(format!("neocortex-bad-eval-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::new("bad-eval");
     let fixture = dir.join("bad.json");
     std::fs::write(
         &fixture,
@@ -154,7 +146,8 @@ fn memory_cmd(db: &Path, args: &[&str]) -> Output {
 
 #[test]
 fn remember_then_recall_from_the_cli() {
-    let db = temp_db();
+    let dir = TempDir::new("cli");
+    let db = dir.join("memory.db");
     let o = memory_cmd(
         &db,
         &[
@@ -186,7 +179,8 @@ fn remember_then_recall_from_the_cli() {
 #[test]
 fn remember_reads_json_from_stdin() {
     use std::io::Write;
-    let db = temp_db();
+    let dir = TempDir::new("cli");
+    let db = dir.join("memory.db");
     let mut child = bin()
         .env("NEOCORTEX_DB", &db)
         .env("NEOCORTEX_EMBEDDER", "hash")
@@ -208,7 +202,8 @@ fn remember_reads_json_from_stdin() {
 
 #[test]
 fn invalidate_forget_and_stats_from_the_cli() {
-    let db = temp_db();
+    let dir = TempDir::new("cli");
+    let db = dir.join("memory.db");
     let o = memory_cmd(&db, &["remember", "The deploy runs on Fridays."]);
     assert!(o.status.success(), "{}", stderr(&o));
 
@@ -225,7 +220,8 @@ fn invalidate_forget_and_stats_from_the_cli() {
 
 #[test]
 fn json_after_the_command_and_unquoted_multi_word_entities_work() {
-    let db = temp_db();
+    let dir = TempDir::new("cli");
+    let db = dir.join("memory.db");
     let o = memory_cmd(
         &db,
         &[
@@ -253,7 +249,8 @@ fn json_after_the_command_and_unquoted_multi_word_entities_work() {
 
 #[test]
 fn eval_never_opens_the_configured_database() {
-    let db = temp_db();
+    let dir = TempDir::new("cli");
+    let db = dir.join("memory.db");
     std::fs::write(&db, b"not a sqlite database").unwrap();
     let fixtures = db.with_extension("fixtures.json");
     std::fs::write(
