@@ -2,7 +2,7 @@
 //! the MCP server. Inputs deserialize straight from MCP tool arguments, so
 //! field names here are the tool schema.
 
-use crate::db::Db;
+use crate::db::{Db, VecMode};
 use crate::embed::Embedder;
 use crate::error::Result;
 use crate::rerank::{LazyReranker, Reranker};
@@ -193,14 +193,23 @@ pub struct Engine {
 
 impl Engine {
     pub fn open(path: &Path, emb: Arc<dyn Embedder>) -> Result<Engine> {
-        Ok(Engine {
-            db: Db::open(path)?,
+        Ok(Self::with_db(Db::open(path)?, emb))
+    }
+
+    /// Like `open`, but a new database gets `mode` instead of `NEOCORTEX_VEC`.
+    pub fn open_with_mode(path: &Path, emb: Arc<dyn Embedder>, mode: VecMode) -> Result<Engine> {
+        Ok(Self::with_db(Db::open_with_mode(path, mode)?, emb))
+    }
+
+    fn with_db(db: Db, emb: Arc<dyn Embedder>) -> Engine {
+        Engine {
+            db,
             emb,
             reranker: Arc::new(LazyReranker::new()),
             cfg: Config::default(),
             fixed_clock: None,
             snapshot_cache: Mutex::new(None),
-        })
+        }
     }
 
     pub fn open_in_memory(emb: Arc<dyn Embedder>) -> Result<Engine> {

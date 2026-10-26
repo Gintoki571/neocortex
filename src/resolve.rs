@@ -6,7 +6,7 @@
 //! merge tool. Embedding similarity alone only creates soft `similar` edges.
 
 use crate::{
-    db::{blob_to_vec, vec_blob, Db},
+    db::Db,
     engine::{Config, EntityCandidate, EntityIn},
     error::Result,
     text,
@@ -46,7 +46,7 @@ pub(crate) fn embeddings_for(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<f3
     })?;
     for row in rows {
         let (id, blob) = row?;
-        if let Some(v) = blob_to_vec(&blob) {
+        if let Some(v) = db.blob_to_vec(&blob) {
             out.insert(id, v);
         }
     }
@@ -207,7 +207,7 @@ pub(crate) fn memory_context_scores(
         let best = st
             .query_map([id], |r| r.get::<_, Vec<u8>>(0))?
             .filter_map(|row| row.ok())
-            .filter_map(|blob| blob_to_vec(&blob))
+            .filter_map(|blob| db.blob_to_vec(&blob))
             .map(|v| cosine(context, &v))
             .fold(0.0f32, f32::max);
         out.insert(*id, best);
@@ -324,11 +324,12 @@ fn candidates(db: &Db, norm: &str, embedding: &[f32]) -> Result<Candidates> {
     let mut knn: HashMap<i64, f32> = HashMap::new();
     let mut knn_order: Vec<i64> = Vec::new();
     {
-        let mut st = db.sql().prepare(
+        let mut st = db.sql().prepare(&format!(
             "SELECT rowid, 1-distance FROM entities_vec
-             WHERE embedding MATCH ?1 AND k=10 ORDER BY distance",
-        )?;
-        let rows = st.query_map([vec_blob(embedding)], |r| {
+             WHERE embedding MATCH {} AND k=10 ORDER BY distance",
+            db.vec_sql("?1")
+        ))?;
+        let rows = st.query_map([db.vec_blob(embedding)], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, f32>(1)?))
         })?;
         for row in rows {
@@ -864,8 +865,11 @@ fn insert_entity(
     }
     refresh_entity_fts(db, id)?;
     db.sql().execute(
-        "INSERT INTO entities_vec(rowid,embedding) VALUES (?1,?2)",
-        params![id, vec_blob(embedding)],
+        &format!(
+            "INSERT INTO entities_vec(rowid,embedding) VALUES (?1,{})",
+            db.vec_sql("?2")
+        ),
+        params![id, db.vec_blob(embedding)],
     )?;
     Ok(id)
 }
@@ -1222,8 +1226,11 @@ pub fn resolve_predicate(
         )?;
         if !has_vec {
             db.sql().execute(
-                "INSERT INTO predicates_vec(rowid,embedding) VALUES (?1,?2)",
-                params![id, vec_blob(embedding)],
+                &format!(
+                    "INSERT INTO predicates_vec(rowid,embedding) VALUES (?1,{})",
+                    db.vec_sql("?2")
+                ),
+                params![id, db.vec_blob(embedding)],
             )?;
         }
         db.sql().execute(
@@ -1235,9 +1242,12 @@ pub fn resolve_predicate(
     let nearest: Option<(i64, f32)> = db
         .sql()
         .query_row(
-            "SELECT rowid, 1-distance FROM predicates_vec
-             WHERE embedding MATCH ?1 AND k=1 ORDER BY distance",
-            [vec_blob(embedding)],
+            &format!(
+                "SELECT rowid, 1-distance FROM predicates_vec
+                 WHERE embedding MATCH {} AND k=1 ORDER BY distance",
+                db.vec_sql("?1")
+            ),
+            [db.vec_blob(embedding)],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f32>(1)?)),
         )
         .optional()?;
@@ -1275,8 +1285,11 @@ pub fn resolve_predicate(
         params![norm, id],
     )?;
     db.sql().execute(
-        "INSERT INTO predicates_vec(rowid,embedding) VALUES (?1,?2)",
-        params![id, vec_blob(embedding)],
+        &format!(
+            "INSERT INTO predicates_vec(rowid,embedding) VALUES (?1,{})",
+            db.vec_sql("?2")
+        ),
+        params![id, db.vec_blob(embedding)],
     )?;
     predicate_row(db, id)
 }

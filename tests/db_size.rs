@@ -2,7 +2,7 @@
 //! vector table on the first insert, so a new database must not reserve a
 //! 1024-vector chunk (3 MiB x 4 tables) for a handful of memories.
 
-use neocortex::db::{vec_blob, Db};
+use neocortex::db::Db;
 
 fn unit(i: usize) -> Vec<f32> {
     let mut v = vec![0.0f32; 768];
@@ -23,8 +23,11 @@ fn fresh_vector_tables_use_small_chunks() {
             .unwrap();
         db.sql()
             .execute(
-                "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,?2,1)",
-                rusqlite::params![id, vec_blob(&unit(id as usize))],
+                &format!(
+                    "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,{},1)",
+                    db.vec_sql("?2")
+                ),
+                rusqlite::params![id, db.vec_blob(&unit(id as usize))],
             )
             .unwrap();
     }
@@ -67,19 +70,23 @@ fn knn_still_works_with_small_chunks() {
             .unwrap();
         db.sql()
             .execute(
-                "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,?2,1)",
-                rusqlite::params![id, vec_blob(&unit(id as usize))],
+                &format!(
+                    "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,{},1)",
+                    db.vec_sql("?2")
+                ),
+                rusqlite::params![id, db.vec_blob(&unit(id as usize))],
             )
             .unwrap();
     }
     let mut st = db
         .sql()
-        .prepare(
-            "SELECT rowid FROM memories_vec WHERE embedding MATCH ?1 AND k=3 ORDER BY distance",
-        )
+        .prepare(&format!(
+            "SELECT rowid FROM memories_vec WHERE embedding MATCH {} AND k=3 ORDER BY distance",
+            db.vec_sql("?1")
+        ))
         .unwrap();
     let rows: Vec<i64> = st
-        .query_map([vec_blob(&unit(42))], |r| r.get(0))
+        .query_map([db.vec_blob(&unit(42))], |r| r.get(0))
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
