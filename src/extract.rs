@@ -420,6 +420,29 @@ const ORDINARY_WORDS: &[&str] = &[
     "parts",
     "phase",
     "phases",
+    // shortcut: closed list of common lab/meeting nouns that EX-05 would keep
+    // before a verb ("Protein is split ..."); a real name is never on it,
+    // upgrade to a general common-noun lexicon when one exists.
+    "protein",
+    "proteins",
+    "sample",
+    "samples",
+    "freezer",
+    "freezers",
+    "aliquot",
+    "aliquots",
+    "alarm",
+    "alarms",
+    "result",
+    "results",
+    "meeting",
+    "talk",
+    "drill",
+    "exercise",
+    "experiment",
+    "culture",
+    "buffer",
+    "batch",
 ];
 
 fn is_ordinary_word(word: &str) -> bool {

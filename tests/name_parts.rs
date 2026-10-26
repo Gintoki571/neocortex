@@ -193,6 +193,13 @@ fn sentence_initial_ordinary_words_stay_out() {
 }
 
 #[test]
+fn sentence_initial_common_noun_before_a_verb_stays_out() {
+    // "Protein" is a common noun, not a name, even before "is".
+    let got = names("Protein is now split into aliquots across two separate freezers.");
+    assert!(!got.iter().any(|n| n == "Protein"), "leaked: {got:?}");
+}
+
+#[test]
 fn sentence_initial_stored_alias_is_kept_without_a_verb() {
     let e = engine();
     remember(
