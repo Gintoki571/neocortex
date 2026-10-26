@@ -1,0 +1,77 @@
+{
+ "max_tokens": 256,
+ "pairs": [
+  {
+   "query": "How many people live in Berlin?",
+   "text": "Berlin had a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
+   "logit": 8.607139587402344,
+   "tokens": 34
+  },
+  {
+   "query": "How many people live in Berlin?",
+   "text": "Berlin is well known for its museums.",
+   "logit": -4.320080757141113,
+   "tokens": 18
+  },
+  {
+   "query": "How many people live in Berlin?",
+   "text": "Berlin has a population of 3,520,031 registered inhabitants in an area of 891.82 square kilometers.",
+   "logit": 8.84585189819336,
+   "tokens": 34
+  },
+  {
+   "query": "How many people live in Berlin?",
+   "text": "New York City is famous for the Metropolitan Museum of Art.",
+   "logit": -11.245561599731445,
+   "tokens": 22
+  },
+  {
+   "query": "who is Ravi's partner",
+   "text": "Ravi Menon is married to Meera Iyer.",
+   "logit": 6.061806678771973,
+   "tokens": 19
+  },
+  {
+   "query": "who is Ravi's partner",
+   "text": "Ravi Menon works at Initech as a data engineer.",
+   "logit": -1.0418164730072021,
+   "tokens": 21
+  },
+  {
+   "query": "what does Alex drink in the morning",
+   "text": "Alex switched from coffee to green tea in March 2026.",
+   "logit": 0.3134198784828186,
+   "tokens": 22
+  },
+  {
+   "query": "what does Alex drink in the morning",
+   "text": "The production database runs PostgreSQL 16.",
+   "logit": -11.352947235107422,
+   "tokens": 21
+  },
+  {
+   "query": "where did Noor move",
+   "text": "Noor Haddad relocated to Lisbon in 2025 after leaving Cairo.",
+   "logit": 8.273796081542969,
+   "tokens": 22
+  },
+  {
+   "query": "café in Münster",
+   "text": "Das Café Müller in Münster serves excellent Kaffee.",
+   "logit": 8.831787109375,
+   "tokens": 17
+  },
+  {
+   "query": "who reviewed the quarterly report",
+   "text": "Sentence 0 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 1 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 2 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 3 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 4 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 5 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 6 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 7 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 8 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 9 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 10 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 11 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 12 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 13 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 14 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 15 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 16 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 17 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 18 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 19 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 20 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 21 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 22 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 23 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 24 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 25 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 26 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 27 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 28 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 29 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 30 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 31 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 32 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 33 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 34 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 35 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 36 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 37 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 38 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 39 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 40 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 41 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 42 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 43 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 44 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 45 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 46 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 47 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 48 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 49 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 50 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 51 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 52 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 53 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 54 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 55 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 56 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 57 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 58 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei. Sentence 59 says the quarterly report for the data platform team was reviewed by Maria Alvarez and Chen Wei.",
+   "logit": 7.384098052978516,
+   "tokens": 256
+  },
+  {
+   "query": "short",
+   "text": "a",
+   "logit": -6.313121795654297,
+   "tokens": 5
+  }
+ ]
+}

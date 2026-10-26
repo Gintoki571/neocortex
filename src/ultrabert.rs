@@ -15,6 +15,19 @@ const INTERMEDIATE: usize = 1024;
 /// back to computing the table on the fly.
 const ROPE_CACHE: usize = 1024;
 
+/// candle asks gemm for `get_num_threads()` (the physical core count unless
+/// RAYON_NUM_THREADS is set) while rayon's shared pool defaults to logical
+/// cores; that mismatch costs ~50% on small batches, so pin the pool to the
+/// size gemm will request. Shared by every candle model in the process.
+pub(crate) fn pin_rayon_threads() {
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        std::env::set_var(
+            "RAYON_NUM_THREADS",
+            candle_core::utils::get_num_threads().to_string(),
+        );
+    }
+}
+
 struct Layer {
     input_norm: Tensor,
     post_norm: Tensor,
@@ -98,16 +111,7 @@ impl UltraBert {
         weights: &std::path::Path,
         config: &serde_json::Value,
     ) -> crate::Result<Self> {
-        // candle asks gemm for `get_num_threads()` (the physical core count
-        // unless RAYON_NUM_THREADS is set) while rayon's shared pool defaults
-        // to logical cores; that mismatch costs ~50% on small batches, so
-        // pin the pool to the size gemm will request.
-        if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-            std::env::set_var(
-                "RAYON_NUM_THREADS",
-                candle_core::utils::get_num_threads().to_string(),
-            );
-        }
+        pin_rayon_threads();
         let device = Device::Cpu;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device) }?;
         let rope_theta: Vec<f64> = serde_json::from_value(config["rope_theta"].clone())?;

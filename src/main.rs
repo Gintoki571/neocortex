@@ -220,7 +220,18 @@ fn db_path(globals: &Globals) -> std::result::Result<PathBuf, Fail> {
 
 fn open_engine(globals: &Globals) -> std::result::Result<Engine, Fail> {
     let path = db_path(globals)?;
-    Engine::open(&path, make_embedder()).map_err(runtime)
+    let mut engine = Engine::open(&path, make_embedder()).map_err(runtime)?;
+    // NEOCORTEX_RERANK: `off`/`0`, or the number of fused candidates to rerank.
+    match std::env::var("NEOCORTEX_RERANK").as_deref() {
+        Ok("off") => engine.cfg.rerank_top = 0,
+        Ok(n) => {
+            if let Ok(n) = n.parse() {
+                engine.cfg.rerank_top = n;
+            }
+        }
+        Err(_) => {}
+    }
+    Ok(engine)
 }
 
 fn make_embedder() -> Arc<dyn Embedder> {
