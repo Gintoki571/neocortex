@@ -54,6 +54,12 @@ const RETRACTIONS: &[(&[&str], &str)] = &[
     (&["resigned", "from"], "work at"),
     (&["quit"], "work at"),
     (&["left", "the", "job", "at"], "work at"),
+    (&["left", "his", "job", "at"], "work at"),
+    (&["left", "her", "job", "at"], "work at"),
+    (&["left", "their", "job", "at"], "work at"),
+    (&["left", "his", "position", "at"], "work at"),
+    (&["left", "her", "position", "at"], "work at"),
+    (&["left", "their", "position", "at"], "work at"),
     (&["left"], "work at"),
     (&["moved", "out", "of"], "live in"),
     (&["broke", "up", "with"], "married to"),
@@ -642,6 +648,10 @@ fn end_text_retractions(
                 None => continue,
             }
         };
+        // A live fact recorded at ingest time may start after the retraction's
+        // inferred date ("divorced ... in 2024"): match it and let the
+        // correction branch retire it. Ended rows still need to contain the
+        // retraction date.
         let mut st = db.sql().prepare(
             "SELECT r.id,r.fact,r.valid_from FROM relations r
              JOIN predicates p ON p.id=r.predicate_id
@@ -649,7 +659,7 @@ fn end_text_retractions(
              JOIN entities d ON d.id=r.dst
              WHERE r.expired_at IS NULL AND r.polarity=1
                AND ((s.norm=?1 AND d.norm=?2) OR (s.norm=?2 AND d.norm=?1))
-               AND r.valid_from<=?3 AND (r.valid_to IS NULL OR r.valid_to>?3)
+               AND (r.valid_to IS NULL OR (r.valid_from<=?3 AND r.valid_to>?3))
                AND (?4 IS NULL OR COALESCE(NULLIF(p.group_id,0),p.id)=?4)",
         )?;
         let rows: Vec<(i64, String, i64)> = st
@@ -661,8 +671,9 @@ fn end_text_retractions(
         match rows.as_slice() {
             [(rid, _, old_from)] if !retraction.candidate => {
                 if *old_from >= at {
-                    // Same instant: the retraction is a correction, so the
-                    // older row is system-retired rather than zero-length.
+                    // The recorded start is at or after the retraction date
+                    // (ingest-time recording): retire the row as a correction
+                    // rather than write a zero-length interval.
                     db.sql().execute(
                         "UPDATE relations SET valid_to=?1, expired_at=?2 WHERE id=?3",
                         params![old_from, now, rid],
