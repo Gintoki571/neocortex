@@ -164,7 +164,7 @@ Input: `query`, `k` (default 8), `budget` tokens (default 1200, approx chars/4),
    - **vector**: query-mode embedding, KNN on `memories_vec` over live rows (plus expired rows when history or as_of applies).
    - **graph** (HippoRAG 2 style):
      - Seeds:
-       - (a) alias n-gram exact matches in the query and in agent-supplied entities, weight 1.0;
+       - (a) alias n-gram exact matches in the query and in agent-supplied entities, weight 1.0 (optional weak tiers under `Config.anchor_tiers`, `src/anchor.rs`: demoted generic aliases, unique first/last name words, role nouns; weak anchors seed and start beams but do not block pass-through or enable prose hops unless asked);
        - (b) entity KNN (query embedding vs `entities_vec`) with cosine ≥ 0.55 (calibrated), weight = cosine;
        - (c) relation-fact hits (`relations_fts` + `relations_vec`, top 10), whose endpoints get 0.5 × score;
        - each seed weight × specificity `1/|mentions(e)|` (floor 1), normalised to mass 0.95;
