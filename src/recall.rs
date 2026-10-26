@@ -38,13 +38,15 @@ fn generation(db: &Db) -> Result<i64> {
 }
 
 fn snapshot(engine: &Engine, as_of: Option<i64>, history: bool) -> Result<Arc<kg::Snapshot>> {
+    // The snapshot cache is cleared by eval when a knob changes.
     let gen = generation(&engine.db)?;
     if let Some((g, a, h, snap)) = engine.snapshot_cache.lock().unwrap().as_ref() {
         if *g == gen && *a == as_of && *h == history {
             return Ok(Arc::clone(snap));
         }
     }
-    let snap = Arc::new(kg::snapshot(&engine.db, as_of, history)?);
+    let name_parts = paths::name_hop_on(engine.cfg.name_part_hop);
+    let snap = Arc::new(kg::snapshot_with(&engine.db, as_of, history, name_parts)?);
     *engine.snapshot_cache.lock().unwrap() = Some((gen, as_of, history, Arc::clone(&snap)));
     Ok(snap)
 }
@@ -1159,6 +1161,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                 &nearest_memories,
                 vis,
                 engine.cfg.hop_scorer == "on",
+                engine.cfg.name_part_hop,
             )?
         } else {
             Vec::new()

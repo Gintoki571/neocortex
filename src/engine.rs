@@ -73,6 +73,10 @@ pub struct Config {
     pub w_temporal: f64,
     /// RRF weight of semantic multi-hop paths (`paths::search_semantic`).
     pub w_sempath: f64,
+    /// Hop weight of B5 containment links in the semantic beam, and whether
+    /// `name_part` edges enter the PPR snapshot. 0 (or non-finite) ignores
+    /// them in both; the links are still written.
+    pub name_part_hop: f64,
     /// RRF weight of temporal memory-memory links (E4a); 0 disables the
     /// channel while the links are still written.
     pub w_tlink: f64,
@@ -150,6 +154,7 @@ impl Default for Config {
             w_graph: 1.5,
             w_temporal: 1.0,
             w_sempath: 0.25,
+            name_part_hop: crate::paths::NAME_PART_HOP,
             w_tlink: 0.0,
             tlink_window_hours: 24.0,
             tlink_cap: 20,

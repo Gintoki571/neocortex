@@ -554,6 +554,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "w_graph",
     "w_temporal",
     "w_sempath",
+    "name_part_hop",
     "rrf_k",
     "alpha",
     "entity_seed",
@@ -604,6 +605,7 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "w_graph" => cfg.w_graph = number(key, value)?,
         "w_temporal" => cfg.w_temporal = number(key, value)?,
         "w_sempath" => cfg.w_sempath = number(key, value)?,
+        "name_part_hop" => cfg.name_part_hop = number(key, value)?,
         "hop_scorer" => cfg.hop_scorer = value.to_string(),
         "anchor_tiers" => {
             // "0" alone = exact aliases only (a sweep list cannot hold "").

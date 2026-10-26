@@ -420,30 +420,38 @@ const ORDINARY_WORDS: &[&str] = &[
     "parts",
     "phase",
     "phases",
-    // shortcut: closed list of common lab/meeting nouns that EX-05 would keep
-    // before a verb ("Protein is split ..."); a real name is never on it,
-    // upgrade to a general common-noun lexicon when one exists.
-    "protein",
-    "proteins",
-    "sample",
-    "samples",
-    "freezer",
-    "freezers",
-    "aliquot",
-    "aliquots",
-    "alarm",
-    "alarms",
-    "result",
-    "results",
-    "meeting",
-    "talk",
-    "drill",
-    "exercise",
-    "experiment",
-    "culture",
-    "buffer",
-    "batch",
 ];
+
+/// shortcut: a fixed list of frequent general English nouns, no names, no
+/// project jargon; upgrade to a frequency lexicon when one is loaded.
+const COMMON_NOUNS: &[&str] = &[
+    "time", "year", "day", "week", "month", "hour", "morning", "evening", "night", "summer",
+    "winter", "spring", "people", "person", "man", "woman", "child", "family", "friend", "thing",
+    "work", "life", "world", "school", "home", "house", "car", "city", "country", "room", "office",
+    "team", "group", "company", "project", "system", "service", "report", "meeting", "plan",
+    "problem", "question", "answer", "example", "result", "number", "place", "point", "fact",
+    "hand", "line", "end", "money", "story", "right", "data", "file", "model", "network",
+    "process", "method", "value", "change", "state", "level", "power", "area", "body", "idea",
+    "mind", "food", "water", "light", "field", "paper", "book", "letter", "card", "phone", "drug",
+    "protein", "cell", "gene", "tool", "device", "machine", "plant", "animal", "dog", "cat",
+    "bird", "fish", "tree", "river", "street", "road", "market", "store", "shop", "order",
+    "budget", "result", "talk", "exercise",
+];
+
+/// A capitalised word that also appears lowercase elsewhere in the memory is a
+/// common word used at a sentence start, not a name.
+fn lowercase_elsewhere(text: &str, word: &str) -> bool {
+    let lower = word.to_lowercase();
+    text.match_indices(&lower).any(|(pos, _)| {
+        let before = text[..pos].chars().next_back();
+        let after = text[pos + lower.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+fn is_common_noun(word: &str) -> bool {
+    COMMON_NOUNS.contains(&fold(word).as_str())
+}
 
 fn is_ordinary_word(word: &str) -> bool {
     let f = fold(word);
@@ -640,7 +648,9 @@ fn word_candidates(
                     || known(w.text)
                     || (verb_like_follows(text, &words, s_idx)
                         && !is_ordinary_word(w.text)
-                        && !is_status_word(w.text))
+                        && !is_status_word(w.text)
+                        && !is_common_noun(w.text)
+                        && !lowercase_elsewhere(text, w.text))
             } else {
                 true
             };

@@ -430,7 +430,7 @@ const PROSE_HOP: f64 = 0.8;
 /// Score factor for a hop through a name-containment link (B5): the write
 /// path stores the same weight, and it stays below a stated relation and
 /// below prose. Such a hop carries no fact, only the next entity.
-const NAME_PART_HOP: f64 = 0.6;
+pub(crate) const NAME_PART_HOP: f64 = 0.6;
 /// Target of a hop through a memory that names no other entity.
 const NO_ENTITY: i64 = -1;
 
@@ -487,6 +487,11 @@ fn entity_degree(db: &Db, id: i64, cache: &mut HashMap<i64, f64>) -> f64 {
     v
 }
 
+/// `Config.name_part_hop` is on: finite and positive.
+pub(crate) fn name_hop_on(name_hop: f64) -> bool {
+    name_hop.is_finite() && name_hop > 0.0
+}
+
 /// Semantic twin of [`search`] for questions that paraphrase the stored
 /// predicates ("who guides Noor's career" vs `mentors`): hops may only use
 /// relations among the question's nearest facts. Each hop is scored against
@@ -504,6 +509,7 @@ pub(crate) fn search_semantic(
     nearest_memories: &[i64],
     vis: Visibility,
     use_scorer: bool,
+    name_hop: f64,
 ) -> Result<Vec<PathHit>> {
     if seeds.is_empty() {
         return Ok(Vec::new());
@@ -584,7 +590,7 @@ pub(crate) fn search_semantic(
     // scored by the target entity's own card vector. Loaded once: the beam
     // visits hundreds of entities and a per-entity query costs ~14% of p50.
     let mut name_parts: HashMap<i64, Vec<i64>> = HashMap::new();
-    {
+    if name_hop_on(name_hop) {
         let mut st = db.sql().prepare("SELECT a,b FROM name_part")?;
         for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
             let (a, b) = row?;
@@ -743,7 +749,7 @@ pub(crate) fn search_semantic(
                     let prose = step.memory.is_some();
                     let containment = step.relation_id == 0 && !prose;
                     let weight = if containment {
-                        NAME_PART_HOP
+                        name_hop
                     } else if prose {
                         PROSE_HOP
                     } else {
@@ -1453,7 +1459,7 @@ mod residual_tests {
 /// ("Aveiro" -> "Hackerspace Aveiro" -> the memory).
 #[cfg(test)]
 mod name_part_tests {
-    use super::{evidence, search_semantic, Visibility};
+    use super::{evidence, search_semantic, Visibility, NAME_PART_HOP};
     use crate::db::Db;
     use rusqlite::params;
 
@@ -1536,6 +1542,7 @@ mod name_part_tests {
             &[1],
             vis,
             false,
+            NAME_PART_HOP,
         )
         .unwrap()
     }
@@ -1580,11 +1587,11 @@ mod name_part_tests {
         // The card and the question share one axis, so the containment hop
         // scores its full weight and leaves no residual for the prose hop.
         assert!(
-            (chain.score - super::NAME_PART_HOP).abs() < 1e-9,
+            (chain.score - NAME_PART_HOP).abs() < 1e-9,
             "score {} should be the containment weight",
             chain.score
         );
-        const { assert!(super::NAME_PART_HOP < super::PROSE_HOP) };
+        const { assert!(NAME_PART_HOP < super::PROSE_HOP) };
         const { assert!(super::PROSE_HOP < 1.0) };
     }
 }

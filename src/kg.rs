@@ -258,6 +258,16 @@ pub fn rebuild_all(db: &Db) -> Result<()> {
 }
 
 pub fn snapshot(db: &Db, as_of: Option<i64>, include_ended: bool) -> Result<Snapshot> {
+    snapshot_with(db, as_of, include_ended, true)
+}
+
+/// `name_parts` = false leaves the B5 containment edges out of the snapshot.
+pub fn snapshot_with(
+    db: &Db,
+    as_of: Option<i64>,
+    include_ended: bool,
+    name_parts: bool,
+) -> Result<Snapshot> {
     let mut nodes = Vec::new();
     let mut mem_node = HashMap::new();
     let mut ent_node = HashMap::new();
@@ -345,17 +355,19 @@ pub fn snapshot(db: &Db, as_of: Option<i64>, include_ended: bool) -> Result<Snap
             edges.push((u, v, s));
         }
     }
-    let mut st = db.sql().prepare("SELECT a,b,weight FROM name_part")?;
-    for row in st.query_map([], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, f32>(2)?,
-        ))
-    })? {
-        let (a, b, w) = row?;
-        if let (Some(&u), Some(&v)) = (ent_node.get(&a), ent_node.get(&b)) {
-            edges.push((u, v, w));
+    if name_parts {
+        let mut st = db.sql().prepare("SELECT a,b,weight FROM name_part")?;
+        for row in st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, f32>(2)?,
+            ))
+        })? {
+            let (a, b, w) = row?;
+            if let (Some(&u), Some(&v)) = (ent_node.get(&a), ent_node.get(&b)) {
+                edges.push((u, v, w));
+            }
         }
     }
     Ok(Snapshot {

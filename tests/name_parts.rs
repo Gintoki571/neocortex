@@ -200,6 +200,21 @@ fn sentence_initial_common_noun_before_a_verb_stays_out() {
 }
 
 #[test]
+fn sentence_initial_word_repeated_lowercase_is_a_common_word() {
+    // "Ferry" also appears lowercase in the memory: a common word, not a name.
+    let got = names("Ferry is late today, so the ferry left without us.");
+    assert!(!got.iter().any(|n| n == "Ferry"), "leaked: {got:?}");
+}
+
+#[test]
+fn name_part_hop_knob_parses_and_defaults_on() {
+    let mut cfg = neocortex::engine::Config::default();
+    assert!((cfg.name_part_hop - 0.6).abs() < 1e-12);
+    neocortex::eval::set_config(&mut cfg, "name_part_hop", "0").unwrap();
+    assert_eq!(cfg.name_part_hop, 0.0);
+}
+
+#[test]
 fn sentence_initial_stored_alias_is_kept_without_a_verb() {
     let e = engine();
     remember(
