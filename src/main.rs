@@ -1,5 +1,5 @@
 //! CLI: hand-rolled argument parsing, one subcommand per MCP tool plus
-//! `mcp`, `reindex`, `validate`, `cypher` and `import-remem`.
+//! `mcp`, `reindex`, `validate`, `cypher`, `import-remem` and `migrate-vectors`.
 //!
 //! Exit codes: 0 ok, 1 runtime error, 2 usage error.
 
@@ -94,12 +94,14 @@ fn dispatch(args: &[String]) -> CmdResult {
         "stats" => cmd_stats(&globals),
         "reindex" => cmd_reindex(&globals),
         "validate" => cmd_validate(&globals),
+        "migrate-vectors" => cmd_migrate_vectors(&globals, rest),
         "cypher" => cmd_cypher(&globals, rest),
         "import-remem" => cmd_import(&globals, rest),
         "export" => cmd_export(&globals, rest),
         "import" => cmd_import_jsonl(&globals, rest),
         "bench" => cmd_bench(&globals, rest),
         "eval" => cmd_eval(&globals, rest),
+        "quantize-model" => cmd_quantize_model(rest),
         "mcp" => {
             let engine = open_engine(&globals)?;
             mcp::serve(&engine).map_err(runtime)
@@ -239,6 +241,35 @@ fn make_embedder() -> Arc<dyn Embedder> {
         Ok("hash") => Arc::new(HashEmbedder),
         _ => Arc::new(LazyEmbedder::new()),
     }
+}
+
+/// `quantize-model <f32 model dir> <out dir> [--dtype q8|q4k]`.
+fn cmd_quantize_model(args: &[String]) -> CmdResult {
+    let mut dtype = "q8".to_string();
+    let mut dirs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--dtype" {
+            dtype = value(args, &mut i, "--dtype")?;
+        } else {
+            dirs.push(&args[i]);
+        }
+        i += 1;
+    }
+    let [from, to] = dirs[..] else {
+        return Err(usage(
+            "quantize-model <f32 model dir> <out dir> [--dtype q8|q4k]",
+        ));
+    };
+    let started = std::time::Instant::now();
+    let bytes =
+        neocortex::embed::quantize_dir(Path::new(from), Path::new(to), &dtype).map_err(runtime)?;
+    println!(
+        "wrote {to} ({:.1} MiB weights, {dtype}) in {:.1}s; use it with NEOCORTEX_MODEL_DIR={to}",
+        bytes as f64 / 1048576.0,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 fn emit<T: Serialize>(globals: &Globals, out: &T, text: impl FnOnce() -> String) -> CmdResult {
@@ -570,6 +601,25 @@ fn cmd_reindex(globals: &Globals) -> CmdResult {
     emit(globals, &out, || render::render_change(&out))
 }
 
+fn cmd_migrate_vectors(globals: &Globals, args: &[String]) -> CmdResult {
+    let mut to = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--to" => to = Some(value(args, &mut i, "--to")?),
+            other => return Err(usage(format!("unknown migrate-vectors flag: {other}"))),
+        }
+        i += 1;
+    }
+    let to = to.ok_or_else(|| usage("migrate-vectors needs --to int8"))?;
+    let to = neocortex::db::VecMode::parse(&to).map_err(runtime)?;
+    let mut engine = open_engine(globals)?;
+    let from = engine.db.vec_mode();
+    engine.db.migrate_vectors(to).map_err(runtime)?;
+    println!("vectors: {} -> {}", from.name(), to.name());
+    Ok(())
+}
+
 fn cmd_validate(globals: &Globals) -> CmdResult {
     let engine = open_engine(globals)?;
     let problems = engine.validate().map_err(runtime)?;
@@ -865,6 +915,7 @@ Commands:
   stats                    counts, database size and embedder
   reindex                  rebuild the graph projection
   validate                 report integrity problems (exit 1 if any)
+  migrate-vectors --to int8  rewrite the vector tables to int8 (one transaction, then VACUUM)
   cypher <query>           run read-only Cypher
   import-remem <path>      import a ReMem v3 SQLite file
   export [--out FILE]      write memories as JSON Lines (--include-forgotten)
@@ -874,6 +925,8 @@ Commands:
   eval <fixtures.json>     evaluate retrieval quality (--ablation --failures
                            --set key=value --sweep key=v1,v2
                            --limit-queries N --save-db PATH --load-db PATH)
+  quantize-model <dir> <out> [--dtype q8|q4k]
+                           write a quantized copy of the f32 model (q8: ~1/4 the size)
   mcp                      run the MCP stdio server
   help                     this text
   --version                print the version
