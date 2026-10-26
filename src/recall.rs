@@ -2,7 +2,7 @@ use crate::db::Db;
 use crate::embed::Mode;
 use crate::engine::Engine;
 use crate::engine::{
-    Community, CommunityRef, EntityCard, EntityOutput, FactHit, MemoryHit, OverviewOutput,
+    Community, CommunityRef, EntityCard, EntityOutput, FactHit, MemoryHit, NextHop, OverviewOutput,
     RecallInput, RecallOutput,
 };
 use crate::{extract, graph, kg, paths, rank, rerank, temporal, text, Result};
@@ -18,6 +18,16 @@ const PATH_WEIGHT: f64 = 2.5;
 /// Top dense-retrieval cosine below which a query with no lexical or entity
 /// support is treated as "nothing relevant is stored".
 const ABSTAIN_COSINE: f64 = 0.18;
+/// Most `next` hints one recall may carry.
+const HINT_MAX: usize = 2;
+/// Words whose frame names what the question asks for.
+const WH_WORDS: [&str; 9] = [
+    "how", "what", "when", "where", "which", "who", "whom", "whose", "why",
+];
+/// Prepositions that belong to a final verb group ("grow up", "based in").
+const PARTICLES: [&str; 12] = [
+    "about", "at", "by", "for", "from", "in", "into", "of", "on", "to", "up", "with",
+];
 
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn blob_vec(blob: Vec<u8>) -> Vec<f32> {
@@ -404,6 +414,366 @@ fn relation_seeds_with_config(
         }
     }
     Ok((entities, memories))
+}
+
+/// The wh-frame of a question: what `recall` could not finish.
+struct WhFrame {
+    /// Relation or question words for `follow.predicate`.
+    want: String,
+    /// Answer-side words, compared against a hop's predicate vector.
+    frame: String,
+    /// The single word that decides whether the context already answers it.
+    guard: String,
+}
+
+fn word_forms(word: &str) -> HashSet<String> {
+    let bare = word.trim_end_matches("'s");
+    let mut out = HashSet::new();
+    for form in [
+        bare.to_string(),
+        text::singularize(bare),
+        text::norm_predicate(bare),
+    ] {
+        if form.chars().count() > 1 {
+            out.insert(form);
+        }
+    }
+    out
+}
+
+/// Every spelling of an entity name a question may use, so the name is not
+/// mistaken for a relation word.
+fn bridge_words(engine: &Engine, ids: &[i64]) -> Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for chunk in ids.chunks(400) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let marks = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT name FROM entities WHERE id IN ({marks})");
+        let mut st = engine.db.sql().prepare(&sql)?;
+        for name in st.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, String>(0))? {
+            names.push(name?);
+        }
+    }
+    for name in names {
+        for token in text::tokens(&name) {
+            let bare = token.trim_end_matches("'s").to_string();
+            let singular = text::singularize(&bare);
+            out.insert(bare);
+            out.insert(singular);
+        }
+    }
+    Ok(out)
+}
+
+fn wh_frame(query: &str, anchors: &HashSet<String>) -> Option<WhFrame> {
+    const LIGHT_VERBS: [&str; 11] = [
+        "be", "been", "did", "do", "does", "gave", "get", "got", "have", "made", "took",
+    ];
+    let words = text::tokens(query);
+    let at = words.iter().position(|w| WH_WORDS.contains(&w.as_str()))?;
+    let wh = words[at].clone();
+    let content = |w: &str| {
+        let bare = w.trim_end_matches("'s");
+        w.chars().count() > 1
+            && !text::is_stopword(w)
+            && !WH_WORDS.contains(&w)
+            && !anchors.contains(w)
+            && !anchors.contains(bare)
+            && !anchors.contains(&text::singularize(bare))
+    };
+    let mut want = vec![wh.clone()];
+    for w in words.iter().skip(at + 1) {
+        if content(w) && !want.iter().any(|x| x == w) {
+            want.push(w.clone());
+            if want.len() == 4 {
+                break;
+            }
+        }
+    }
+    let mut frame = vec![wh.clone()];
+    if matches!(wh.as_str(), "which" | "what" | "whose" | "who" | "whom") {
+        if let Some(head) = words.iter().skip(at + 1).find(|w| !text::is_stopword(w)) {
+            if content(head) {
+                frame.push(head.clone());
+            }
+        }
+    }
+    // The final verb group ("get schooled", "grow up", "based in"): the last
+    // content word plus the nearest particle and a light verb right before it.
+    let mut tail: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for (i, w) in words.iter().enumerate().rev() {
+        if !content(w) && !PARTICLES.contains(&w.as_str()) {
+            continue;
+        }
+        if PARTICLES.contains(&w.as_str()) {
+            pending.push(w.clone());
+            continue;
+        }
+        if i > 0 && LIGHT_VERBS.contains(&words[i - 1].as_str()) && content(&words[i - 1]) {
+            tail.push(words[i - 1].clone());
+        }
+        tail.push(w.clone());
+        if let Some(nearest) = pending.last() {
+            tail.push(nearest.clone());
+        }
+        break;
+    }
+    for w in tail {
+        if !frame.iter().any(|x| x == &w) {
+            frame.push(w);
+        }
+    }
+    let guard = if matches!(wh.as_str(), "which" | "what" | "whose") && frame.len() > 1 {
+        frame[1].clone()
+    } else {
+        frame.last()?.clone()
+    };
+    if want.len() == 1 && frame.len() == 1 {
+        return None;
+    }
+    Some(WhFrame {
+        want: want.join(" "),
+        frame: frame.join(" "),
+        guard,
+    })
+}
+
+fn step_end(step: &paths::Step) -> i64 {
+    if step.memory.is_some() {
+        if step.dst < 1 {
+            step.src
+        } else {
+            step.dst
+        }
+    } else if step.reverse {
+        step.src
+    } else {
+        step.dst
+    }
+}
+
+/// True when the entity has a live relation `follow` would accept for the
+/// question's relation words: a hint that names a hop no relation can walk
+/// only costs the caller a call.
+fn relation_matches_frame(
+    engine: &Engine,
+    id: i64,
+    frame_forms: &HashSet<String>,
+    exclude: Option<i64>,
+    now: i64,
+) -> Result<bool> {
+    let mut st = engine.db.sql().prepare_cached(
+        "SELECT r.id,p.canonical,r.fact FROM relations r
+           JOIN predicates p ON p.id=r.predicate_id
+          WHERE (r.src=?1 OR r.dst=?2) AND r.expired_at IS NULL
+            AND (r.valid_to IS NULL OR r.valid_to>?3)",
+    )?;
+    let rows = st.query_map(params![id, id, now], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (relation_id, predicate, fact) = row?;
+        if Some(relation_id) == exclude {
+            continue;
+        }
+        let forms = format!("{predicate} {fact}");
+        if text::tokens(&forms)
+            .iter()
+            .any(|token| !word_forms(token).is_disjoint(frame_forms))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `follow`-ready hints for the hop retrieval could not finish: name the bridge
+/// entity (the end of the best partial chain, or a fuzzy seed) and the words to
+/// ask it for. Empty when the returned context already covers the wh-frame.
+#[allow(clippy::too_many_arguments)]
+fn next_hops(
+    engine: &Engine,
+    query: &str,
+    anchors: &HashSet<i64>,
+    words_of: &[i64],
+    chains: &[&paths::PathHit],
+    seeds: &[(i64, f64)],
+    facts: &[FactHit],
+    memories: &[MemoryHit],
+    memory_vectors: &HashMap<i64, Vec<f32>>,
+    now: i64,
+    tau: f32,
+) -> Result<Vec<NextHop>> {
+    if tau <= 0.0 {
+        return Ok(Vec::new());
+    }
+    let anchor_words = bridge_words(engine, words_of)?;
+    let Some(wh) = wh_frame(query, &anchor_words) else {
+        return Ok(Vec::new());
+    };
+    // Cheap guard: a returned fact or memory already says one of the
+    // question's relation words, so the question is probably answered. Checked
+    // before the frame is embedded, which is the only added cost of hints.
+    let mut cue_forms = HashSet::new();
+    for token in text::tokens(&wh.frame) {
+        let bare = token.trim_end_matches("'s");
+        if WH_WORDS.contains(&token.as_str())
+            || text::is_stopword(&token)
+            || PARTICLES.contains(&bare)
+        {
+            continue;
+        }
+        cue_forms.extend(word_forms(&token));
+    }
+    if cue_forms.is_empty() {
+        cue_forms = word_forms(&wh.guard);
+    }
+    let seen = |value: &str| {
+        text::tokens(value)
+            .iter()
+            .any(|token| !word_forms(token).is_disjoint(&cue_forms))
+    };
+    if facts.iter().any(|f| seen(&f.predicate) || seen(&f.fact))
+        || memories.iter().any(|m| seen(&m.content))
+    {
+        return Ok(Vec::new());
+    }
+    let mut frame_forms: HashSet<String> = HashSet::new();
+    for token in text::tokens(&wh.frame) {
+        frame_forms.extend(word_forms(&token));
+    }
+    // A hint is only worth its tokens when `follow` can actually walk the hop,
+    // so find the followable bridges first and skip the frame embedding when
+    // there are none.
+    let mut bridge_ids: Vec<i64> = Vec::new();
+    let mut seed_bridges: Vec<i64> = Vec::new();
+    for chain in chains {
+        let Some(step) = chain.steps.last() else {
+            continue;
+        };
+        let end = step_end(step);
+        if end < 1 || anchors.contains(&end) || bridge_ids.contains(&end) {
+            continue;
+        }
+        let exclude = if step.memory.is_some() {
+            None
+        } else {
+            Some(step.relation_id)
+        };
+        if !relation_matches_frame(engine, end, &frame_forms, exclude, now)? {
+            continue;
+        }
+        bridge_ids.push(end);
+        if bridge_ids.len() >= HINT_MAX {
+            break;
+        }
+    }
+    if bridge_ids.is_empty() {
+        for (id, _) in seeds {
+            if bridge_ids.contains(id)
+                || !relation_matches_frame(engine, *id, &frame_forms, None, now)?
+            {
+                continue;
+            }
+            bridge_ids.push(*id);
+            seed_bridges.push(*id);
+            if bridge_ids.len() >= HINT_MAX {
+                break;
+            }
+        }
+    }
+    if bridge_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let frame_vec = engine
+        .emb
+        .embed(&[wh.frame.as_str()], Mode::Query)?
+        .remove(0);
+    // The answer may already be in the context without saying the ask word:
+    // a returned fact or memory that reads like the wh-frame ends the search.
+    let mut relation_st = engine
+        .db
+        .sql()
+        .prepare_cached("SELECT embedding FROM relations_vec WHERE rowid=?1")?;
+    let mut memory_st = engine
+        .db
+        .sql()
+        .prepare_cached("SELECT embedding FROM memories_vec WHERE rowid=?1")?;
+    let cosine = |blob: Vec<u8>| -> Option<f32> {
+        crate::db::blob_to_vec(&blob).map(|v| rank::cosine(&frame_vec, &v))
+    };
+    let mut best = 0.0f32;
+    for fact in facts {
+        if let Some(c) = relation_st
+            .query_row([fact.id], |r| r.get::<_, Vec<u8>>(0))
+            .optional()?
+            .and_then(cosine)
+        {
+            best = best.max(c);
+        }
+    }
+    for memory in memories {
+        if let Some(v) = memory_vectors.get(&memory.id) {
+            best = best.max(rank::cosine(&frame_vec, v));
+        }
+    }
+    if best >= tau {
+        return Ok(Vec::new());
+    }
+    for chain in chains {
+        let Some(step) = chain.steps.last() else {
+            continue;
+        };
+        let vector = if let Some(memory_id) = step.memory {
+            memory_st
+                .query_row([memory_id], |r| r.get::<_, Vec<u8>>(0))
+                .optional()?
+                .and_then(|b| crate::db::blob_to_vec(&b))
+        } else {
+            relation_st
+                .query_row([step.relation_id], |r| r.get::<_, Vec<u8>>(0))
+                .optional()?
+                .and_then(|b| crate::db::blob_to_vec(&b))
+        };
+        if vector.is_some_and(|v| rank::cosine(&frame_vec, &v) >= tau) {
+            // This chain's last hop already answers the wh-frame.
+            return Ok(Vec::new());
+        }
+    }
+    let mut out = Vec::new();
+    for id in bridge_ids {
+        let (name, kind): (String, String) =
+            engine
+                .db
+                .sql()
+                .query_row("SELECT name,type FROM entities WHERE id=?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+        let why = if seed_bridges.contains(&id) {
+            "no chain covers the question".to_string()
+        } else if kind.is_empty() {
+            "best chain ends here".to_string()
+        } else {
+            format!("chain ends at a {kind}")
+        };
+        out.push(NextHop {
+            entity: format!("e{id}"),
+            name,
+            want: wh.want.clone(),
+            why,
+        });
+    }
+    Ok(out)
 }
 
 pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
@@ -796,7 +1166,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         });
     }
     sem_ids.truncate(depth);
-    let path_hits: Vec<paths::PathHit> = lexical_hits.into_iter().chain(sem_hits).collect();
+    let path_hits: Vec<paths::PathHit> = lexical_hits.iter().chain(&sem_hits).cloned().collect();
     path_ids.truncate(depth);
 
     // ---------------------------------------------------------- causal
@@ -978,6 +1348,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             memories: Vec::new(),
             facts: Vec::new(),
             entities: Vec::new(),
+            next: Vec::new(),
             window: window.map(|w| (w.start, w.end, w.matched)),
             candidates: 0,
             tokens_used: 0,
@@ -1199,10 +1570,33 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             }
         })
         .collect::<Result<Vec<_>>>()?;
+    // A chain the beams could not finish is handed to the caller as one
+    // `follow` call: the bridge entity plus the relation the question wants.
+    let next = if negated || history_query || as_of.is_some() || engine.cfg.hint_tau <= 0.0 {
+        Vec::new()
+    } else {
+        let chains: Vec<&paths::PathHit> = sem_hits.iter().chain(&lexical_hits).collect();
+        let mut seeds: Vec<(i64, f64)> = ent_seeds.iter().map(|(id, w)| (*id, *w)).collect();
+        seeds.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        next_hops(
+            engine,
+            &query_text,
+            &query_alias_entities,
+            &sem_starts,
+            &chains,
+            &seeds,
+            &facts,
+            &memories,
+            &vecs,
+            now,
+            engine.cfg.hint_tau,
+        )?
+    };
     Ok(RecallOutput {
         memories,
         facts,
         entities,
+        next,
         window_empty,
         window: window.map(|w| (w.start, w.end, w.matched)),
         candidates: candidates.len(),
@@ -1928,4 +2322,238 @@ pub fn overview(engine: &Engine, query: Option<&str>, k: usize) -> Result<Overvi
         c.span = community_span(engine, c.id)?;
     }
     Ok(OverviewOutput { communities: out })
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+    use crate::embed::HashEmbedder;
+    use crate::engine::{EntityIn, RelationIn, RememberInput};
+
+    fn entity(name: &str, kind: &str) -> EntityIn {
+        EntityIn {
+            name: name.into(),
+            kind: Some(kind.into()),
+            ..Default::default()
+        }
+    }
+
+    fn rel(source: &str, predicate: &str, target: &str) -> RelationIn {
+        RelationIn {
+            source: source.into(),
+            predicate: predicate.into(),
+            target: target.into(),
+            fact: Some(format!("{source} {predicate} {target}.")),
+            ..Default::default()
+        }
+    }
+
+    /// Priya manages Mira Shah; Mira lives in Oslo; a chain Priya -> Mira whose
+    /// last hop is "manages" leaves the question "where ... live" unfinished.
+    struct Fixture {
+        engine: Engine,
+        priya: i64,
+        mira: i64,
+        step_to_mira: paths::Step,
+        step_to_anika: paths::Step,
+        lives_mira: i64,
+        lives_fact: String,
+    }
+
+    fn fixture() -> Fixture {
+        let engine = Engine::open_in_memory(Arc::new(HashEmbedder)).unwrap();
+        let out = engine
+            .remember(RememberInput {
+                content: "Priya manages Mira Shah and mentors Anika Singh.".into(),
+                entities: vec![
+                    entity("Priya", "person"),
+                    entity("Mira Shah", "person"),
+                    entity("Anika Singh", "person"),
+                ],
+                relations: vec![
+                    rel("Priya", "manages", "Mira Shah"),
+                    rel("Priya", "mentors", "Anika Singh"),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut lives: Option<(i64, String)> = None;
+        for (name, place) in [("Mira Shah", "Oslo"), ("Anika Singh", "Pune")] {
+            let out = engine
+                .remember(RememberInput {
+                    content: format!("{name} lives in {place}."),
+                    entities: vec![entity(name, "person"), entity(place, "place")],
+                    relations: vec![rel(name, "lives in", place)],
+                    ..Default::default()
+                })
+                .unwrap();
+            if name == "Mira Shah" {
+                lives = Some((out.relations[0].id, out.relations[0].fact.clone()));
+            }
+        }
+        let (lives_mira, lives_fact) = lives.unwrap();
+        let priya = resolve_entity(&engine, "Priya").unwrap();
+        let mira = resolve_entity(&engine, "Mira Shah").unwrap();
+        let anika = resolve_entity(&engine, "Anika Singh").unwrap();
+        let step = |relation_id: i64, fact: &str, dst: i64| paths::Step {
+            relation_id,
+            src: priya,
+            dst,
+            predicate: "manages".into(),
+            fact: fact.into(),
+            reverse: false,
+            matched: 1,
+            memory: None,
+        };
+        let relations: Vec<(i64, String)> = out
+            .relations
+            .iter()
+            .map(|r| (r.id, r.fact.clone()))
+            .collect();
+        let to_mira = relations
+            .iter()
+            .find(|(_, fact)| fact.contains("Mira"))
+            .unwrap()
+            .clone();
+        let to_anika = relations
+            .iter()
+            .find(|(_, fact)| fact.contains("Anika"))
+            .unwrap()
+            .clone();
+        Fixture {
+            engine,
+            priya,
+            mira,
+            step_to_mira: step(to_mira.0, &to_mira.1, mira),
+            step_to_anika: step(to_anika.0, &to_anika.1, anika),
+            lives_mira,
+            lives_fact,
+        }
+    }
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn hint(
+        f: &Fixture,
+        chains: &[&paths::PathHit],
+        seeds: &[(i64, f64)],
+        facts: &[FactHit],
+        memories: &[MemoryHit],
+        tau: f32,
+    ) -> Vec<NextHop> {
+        let anchors: HashSet<i64> = [f.priya].into();
+        next_hops(
+            &f.engine,
+            "Where does Priya's manager live?",
+            &anchors,
+            &[f.priya],
+            chains,
+            seeds,
+            facts,
+            memories,
+            &HashMap::new(),
+            NOW,
+            tau,
+        )
+        .unwrap()
+    }
+
+    fn chain(step: paths::Step) -> paths::PathHit {
+        paths::PathHit {
+            steps: vec![step],
+            coverage: 1,
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_partial_chain_hints_the_bridge_entity() {
+        let f = fixture();
+        let chain = chain(f.step_to_mira.clone());
+        let out = hint(&f, &[&chain], &[], &[], &[], 0.40);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].entity, format!("e{}", f.mira));
+        assert_eq!(out[0].name, "Mira Shah");
+        assert!(out[0].want.starts_with("where"), "{out:?}");
+        assert!(out[0].want.contains("live"), "{out:?}");
+        assert_eq!(out[0].why, "chain ends at a person");
+    }
+
+    #[test]
+    fn answered_context_suppresses_the_hint() {
+        let f = fixture();
+        let chain = chain(f.step_to_mira.clone());
+        let fact = FactHit {
+            id: 0,
+            source: "Mira Shah".into(),
+            predicate: "lives in".into(),
+            target: "Oslo".into(),
+            fact: "Mira Shah lives in Oslo.".into(),
+            valid_from: NOW,
+            valid_to: None,
+            ended: false,
+            retracted: false,
+            polarity: 1,
+            current_values: None,
+            replaced_by: None,
+        };
+        assert!(hint(&f, &[&chain], &[], &[fact], &[], 0.40).is_empty());
+        let memory = MemoryHit {
+            id: 1,
+            kind: "fact".into(),
+            content: "Mira Shah lives in Oslo.".into(),
+            valid_from: NOW,
+            valid_to: None,
+            ended: false,
+            superseded_by: None,
+            tags: Vec::new(),
+            score: 1.0,
+            reasons: Vec::new(),
+        };
+        assert!(hint(&f, &[&chain], &[], &[], &[memory], 0.40).is_empty());
+    }
+
+    #[test]
+    fn a_last_hop_that_answers_the_frame_suppresses_the_hint() {
+        let f = fixture();
+        let step = paths::Step {
+            relation_id: f.lives_mira,
+            src: f.priya,
+            dst: f.mira,
+            predicate: "lives in".into(),
+            fact: f.lives_fact.clone(),
+            reverse: false,
+            matched: 1,
+            memory: None,
+        };
+        let chain = chain(step);
+        assert!(hint(&f, &[&chain], &[], &[], &[], 0.01).is_empty());
+    }
+
+    #[test]
+    fn a_seed_bridge_gets_a_hint_without_any_chain() {
+        let f = fixture();
+        let out = hint(&f, &[], &[(f.mira, 0.9)], &[], &[], 0.40);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].name, "Mira Shah");
+        assert_eq!(out[0].why, "no chain covers the question");
+    }
+
+    #[test]
+    fn at_most_two_hints_are_returned() {
+        let f = fixture();
+        let first = chain(f.step_to_mira.clone());
+        let second = chain(f.step_to_anika.clone());
+        let out = hint(&f, &[&first, &second], &[], &[], &[], 0.40);
+        assert_eq!(out.len(), 2, "{out:?}");
+        let names: HashSet<&str> = out.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, HashSet::from(["Mira Shah", "Anika Singh"]));
+    }
+
+    #[test]
+    fn hints_are_off_when_tau_is_zero() {
+        let f = fixture();
+        let chain = chain(f.step_to_mira.clone());
+        assert!(hint(&f, &[&chain], &[(f.mira, 0.9)], &[], &[], 0.0).is_empty());
+    }
 }

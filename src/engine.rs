@@ -125,6 +125,10 @@ pub struct Config {
     /// Share of the cross-encoder's sigmoid in the blended candidate score
     /// (0 = fused order, 1 = cross-encoder order).
     pub w_rerank: f64,
+    /// Cosine at/above which a chain's last hop is taken to answer the
+    /// question's wh-frame. Below it `recall` returns `next` hints naming the
+    /// bridge entity to `follow`. 0 disables hints.
+    pub hint_tau: f32,
 }
 
 impl Default for Config {
@@ -166,6 +170,7 @@ impl Default for Config {
             hop_scorer: "off".to_string(),
             rerank_top: 0,
             w_rerank: 0.5,
+            hint_tau: 0.40,
         }
     }
 }
@@ -486,6 +491,11 @@ pub struct RecallOutput {
     pub memories: Vec<MemoryHit>,
     pub facts: Vec<FactHit>,
     pub entities: Vec<EntityCard>,
+    /// One more hop the caller can walk itself: the bridge entity `follow` should
+    /// start from and the relation or question words to ask for. At most two,
+    /// omitted when the returned context already covers the question.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub next: Vec<NextHop>,
     /// Matched time window, if the query had one: (start, end, text).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<(i64, i64, String)>,
@@ -501,6 +511,19 @@ pub struct RecallOutput {
     /// The top item alone exceeds the budget.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub over_budget: bool,
+}
+
+/// One hop `recall` could not finish, addressed precisely enough for a single
+/// `follow` call: the bridge entity and the words to ask it for.
+#[derive(Clone, Debug, Serialize)]
+pub struct NextHop {
+    /// Entity id as `follow.from` accepts it, e.g. "e151".
+    pub entity: String,
+    pub name: String,
+    /// Relation or question words to pass as `follow.predicate`.
+    pub want: String,
+    /// Why this hop is the missing one, e.g. "chain ends at a person".
+    pub why: String,
 }
 
 // ---------------------------------------------------------------- others

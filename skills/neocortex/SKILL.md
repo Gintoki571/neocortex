@@ -131,6 +131,10 @@ Store something when it will still matter next week:
   evidence) appear only when those optional channels are enabled.
 - "no memories matched" means broaden the query or drop filters, not that the
   memory does not exist.
+- A `next:` line means recall stopped one hop short, e.g.
+  `next: follow e151 Mira Lindqvist for where live — chain ends at a person`.
+  Call `follow` with that `entity` and `want`, then answer from what it returns.
+  Do not guess the missing name.
 
 ## Tools (MCP) and CLI equivalents
 
@@ -141,6 +145,7 @@ the installed binary is `~/.neocortex/bin/neocortex` (DB `~/.neocortex/neocortex
 |---|---|---|
 | `remember` | `neocortex remember <text>` | store a memory |
 | `recall` | `neocortex recall <query>` | retrieve |
+| `follow` | — (MCP only) | walk relations hop by hop (also the `next:` hint) |
 | `entity` | `neocortex entity <name\|eID>` | profile of one entity |
 | `invalidate` | `neocortex invalidate <mID\|rID> --at <date>` | end a fact |
 | `forget` | `neocortex forget <mID> [--hard]` | retire/delete (facts it alone stated are retracted) |
