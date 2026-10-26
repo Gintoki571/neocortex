@@ -231,7 +231,10 @@ fn a_longer_name_links_to_the_place_it_contains() {
     remember(
         &e,
         "Cascais marina is quiet in winter.",
-        vec![entity("Cascais marina", ""), entity("Cascais", "place")],
+        vec![
+            entity("Cascais marina", "marina"),
+            entity("Cascais", "place"),
+        ],
     );
     let rows = parts(&e);
     let marina = id_of(&e, "Cascais marina");
@@ -307,6 +310,95 @@ fn a_person_never_contains_a_place() {
 }
 
 #[test]
+fn org_never_contains_org() {
+    // Two organisations sharing words are not containers: "Novak Labs" is
+    // not part of "Novak Lab Supplies" (no singular/plural match either).
+    let e = engine();
+    remember(
+        &e,
+        "Novak Labs opened in Brno.",
+        vec![entity("Novak Labs", "org")],
+    );
+    remember(
+        &e,
+        "Novak Lab Supplies sells pipettes.",
+        vec![entity("Novak Lab Supplies", "org")],
+    );
+    assert!(parts(&e).is_empty(), "{:?}", parts(&e));
+}
+
+#[test]
+fn contained_side_must_be_a_typed_place() {
+    // "Azul" is a common word; only a place may be the contained side.
+    let e = engine();
+    remember(
+        &e,
+        "Ana joined the Clube de Leitura Mar Azul.",
+        vec![entity("Clube de Leitura Mar Azul", "org")],
+    );
+    remember(&e, "Azul is a nice word.", vec![entity("Azul", "org")]);
+    assert!(parts(&e).is_empty(), "org inside org: {:?}", parts(&e));
+    let e = engine();
+    remember(
+        &e,
+        "Ana joined the Clube de Leitura Mar Azul.",
+        vec![entity("Clube de Leitura Mar Azul", "org")],
+    );
+    remember(&e, "Azul is a nice word.", vec![entity("Azul", "")]);
+    assert!(parts(&e).is_empty(), "untyped contained: {:?}", parts(&e));
+}
+
+#[test]
+fn containment_container_must_be_typed() {
+    // An untyped longer name is not evidence that it is a place or org.
+    let e = engine();
+    remember(&e, "Aveiro is a city.", vec![entity("Aveiro", "place")]);
+    remember(
+        &e,
+        "Hackerspace Aveiro meets on Fridays.",
+        vec![entity("Hackerspace Aveiro", "")],
+    );
+    assert!(parts(&e).is_empty(), "{:?}", parts(&e));
+}
+
+#[test]
+fn possessive_ends_a_connector_span() {
+    // "Nova's" ends the span; the head after it is not part of the name.
+    let got = names("She studied at Universidade Nova's Porto campus.");
+    assert!(
+        got.iter().any(|n| n == "Universidade Nova"),
+        "missing Universidade Nova: {got:?}"
+    );
+    assert!(
+        !got.iter().any(|n| n.contains('\'')),
+        "possessive leaked into a name: {got:?}"
+    );
+}
+
+#[test]
+fn a_name_typed_after_its_first_mention_still_links() {
+    // The first mention is heuristic (untyped); the later typed mention
+    // fills the type in place, and the containment link must follow.
+    let e = engine();
+    remember(
+        &e,
+        "Trondheim is cold in winter.",
+        vec![entity("Trondheim", "place")],
+    );
+    remember(&e, "Ingrid rejoined the Trondheim Rowing Club.", Vec::new());
+    assert!(parts(&e).is_empty(), "{:?}", parts(&e));
+    remember(
+        &e,
+        "Ingrid rows at the Trondheim Rowing Club.",
+        vec![entity("Trondheim Rowing Club", "organization")],
+    );
+    let rows = parts(&e);
+    let town = id_of(&e, "Trondheim");
+    let club = id_of(&e, "Trondheim Rowing Club");
+    assert_eq!(rows, vec![(town.min(club), town.max(club), 0.6)]);
+}
+
+#[test]
 fn untyped_names_do_not_link() {
     // Without a place/org type there is no evidence the shorter name is a
     // container, so two bare names stay apart.
@@ -362,7 +454,7 @@ fn containment_edge_reaches_the_graph_projection() {
     remember(
         &e,
         "Cascais marina is quiet in winter.",
-        vec![entity("Cascais marina", "")],
+        vec![entity("Cascais marina", "marina")],
     );
     remember(
         &e,
@@ -380,7 +472,7 @@ fn containment_edge_reaches_the_graph_projection() {
     remember(
         &e,
         "Cascais marina is quiet in winter.",
-        vec![entity("Cascais marina", "")],
+        vec![entity("Cascais marina", "marina")],
     );
     projected(&e);
 }
@@ -391,7 +483,10 @@ fn containment_edge_reaches_the_ppr_snapshot() {
     remember(
         &e,
         "Cascais marina is quiet in winter.",
-        vec![entity("Cascais marina", ""), entity("Cascais", "place")],
+        vec![
+            entity("Cascais marina", "marina"),
+            entity("Cascais", "place"),
+        ],
     );
     let snap = kg::snapshot(&e.db, None, false).unwrap();
     let marina = snap.ent_node[&id_of(&e, "Cascais marina")] as usize;
@@ -416,7 +511,10 @@ fn merging_moves_the_containment_link() {
     remember(
         &e,
         "Cascais marina is quiet in winter.",
-        vec![entity("Cascais marina", ""), entity("Cascais", "place")],
+        vec![
+            entity("Cascais marina", "marina"),
+            entity("Cascais", "place"),
+        ],
     );
     remember(
         &e,
@@ -441,7 +539,10 @@ fn reindex_rebuilds_the_containment_edge() {
     remember(
         &e,
         "Cascais marina is quiet in winter.",
-        vec![entity("Cascais marina", ""), entity("Cascais", "place")],
+        vec![
+            entity("Cascais marina", "marina"),
+            entity("Cascais", "place"),
+        ],
     );
     let marina = id_of(&e, "Cascais marina");
     let cascais = id_of(&e, "Cascais");

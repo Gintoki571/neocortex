@@ -543,7 +543,10 @@ fn word_candidates(
         let mut last = i;
         let mut k = i + 1;
         while k < words.len() {
-            if !gap_is_space(text, &words[k - 1], &words[k]) {
+            // EX rule: a possessive ends the span ("Universidade Nova's Porto").
+            if possessive_len(words[k - 1].text) > 0
+                || !gap_is_space(text, &words[k - 1], &words[k])
+            {
                 break;
             }
             let w = words[k].text;
@@ -652,7 +655,7 @@ fn word_candidates(
                     .any(|w| is_weekday_or_month(&fold(w.text)));
                 if !has_calendar {
                     let start = words[s_idx].start;
-                    let end = words[e_idx].end;
+                    let end = words[e_idx].end - possessive_len(words[e_idx].text);
                     let hint = if is_number(words[e_idx].text) {
                         "version"
                     } else {
@@ -671,6 +674,14 @@ fn word_candidates(
         i = last + 1;
     }
     cands
+}
+
+/// Length of a trailing possessive ("'s", curly or capital), 0 if none.
+fn possessive_len(word: &str) -> usize {
+    ["'s", "’s", "'S", "’S"]
+        .into_iter()
+        .find(|suffix| word.ends_with(suffix))
+        .map_or(0, str::len)
 }
 
 fn gap_is_space(text: &str, left: &Word<'_>, right: &Word<'_>) -> bool {

@@ -873,7 +873,7 @@ fn insert_entity(
             params![token, id],
         )?;
     }
-    link_name_parts(db, id, norm, kind)?;
+    link_name_parts(db, id, &item.name, norm, kind)?;
     Ok(id)
 }
 
@@ -881,9 +881,9 @@ fn insert_entity(
 /// with the same constant.
 pub(crate) const NAME_PART_WEIGHT: f32 = 0.6;
 
-/// Types that make a containment link meaningful: a place or an organisation
-/// may own a longer name ("Cascais marina", "Hackerspace Aveiro").
-const PLACE_ORG_TYPES: &[&str] = &[
+/// The contained side of a containment link must be a place by type
+/// ("Cascais" in "Cascais marina"); a bare word or an org never is.
+const PLACE_TYPES: &[&str] = &[
     "place",
     "city",
     "town",
@@ -907,6 +907,11 @@ const PLACE_ORG_TYPES: &[&str] = &[
     "marina",
     "harbor",
     "harbour",
+];
+
+/// The container side may also be an organisation ("Hackerspace Aveiro").
+/// Org inside org never links ("Novak Labs" / "Novak Lab Supplies").
+const ORG_TYPES: &[&str] = &[
     "org",
     "organization",
     "organisation",
@@ -933,12 +938,14 @@ const PERSON_TYPES: &[&str] = &["person", "people", "human"];
 /// entities is a hub and would only add noise.
 const NAME_PART_CANDIDATES: usize = 200;
 
-/// B5: link a newly inserted entity to the entities whose token set strictly
-/// contains it, or is strictly contained in it, when at least one side is a
-/// place or org and neither is a person. One indexed token lookup per new
-/// entity; the link is undirected (`a < b`), so insertion order does not
-/// matter.
-fn link_name_parts(db: &Db, id: i64, norm: &str, kind: &str) -> Result<()> {
+/// B5: link a newly inserted entity to the entities whose exact token set
+/// strictly contains it, or is strictly contained in it: the contained side
+/// is a place by type, the container a place or org, and no person is on
+/// either side. One indexed token lookup per new entity (the probe uses the
+/// normalised tokens; the match uses the unsingularised ones, so "Labs" never
+/// matches "Lab"). The link is undirected (`a < b`), so insertion order does
+/// not matter.
+fn link_name_parts(db: &Db, id: i64, name: &str, norm: &str, kind: &str) -> Result<()> {
     let tokens = text::name_tokens(norm);
     if tokens.is_empty() || norm.chars().filter(|c| c.is_alphabetic()).count() < 3 {
         return Ok(());
@@ -959,38 +966,28 @@ fn link_name_parts(db: &Db, id: i64, norm: &str, kind: &str) -> Result<()> {
         return Ok(());
     }
     let placeholders = vec!["?"; ids.len()].join(",");
-    let mut others: Vec<(i64, String, String)> = Vec::new();
+    let mut others: Vec<(i64, String, String, String)> = Vec::new();
     {
-        let sql = format!("SELECT id,norm,type FROM entities WHERE id IN ({placeholders})");
+        let sql = format!("SELECT id,name,norm,type FROM entities WHERE id IN ({placeholders})");
         let mut st = db.sql().prepare(&sql)?;
         let rows = st.query_map(params_from_iter(ids.iter()), |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
             ))
         })?;
         for row in rows {
-            let (other, other_norm, other_kind) = row?;
+            let (other, other_name, other_norm, other_kind) = row?;
             if other != id {
-                others.push((other, other_norm, other_kind));
+                others.push((other, other_name, other_norm, other_kind));
             }
         }
     }
-    let mut other_tokens: HashMap<i64, Vec<String>> = HashMap::new();
-    {
-        let sql =
-            format!("SELECT entity_id,token FROM name_tokens WHERE entity_id IN ({placeholders})");
-        let mut st = db.sql().prepare(&sql)?;
-        for row in st.query_map(params_from_iter(ids.iter()), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })? {
-            let (entity, token) = row?;
-            other_tokens.entry(entity).or_default().push(token);
-        }
-    }
-    for (other, other_norm, other_kind) in others {
-        let theirs = other_tokens.remove(&other).unwrap_or_default();
+    let tokens = text::exact_name_tokens(name);
+    for (other, other_name, other_norm, other_kind) in others {
+        let theirs = text::exact_name_tokens(&other_name);
         // Strict token-set containment, in either direction.
         let we_are_part = is_subset(&tokens, &theirs);
         let they_are_part = is_subset(&theirs, &tokens);
@@ -1008,7 +1005,9 @@ fn link_name_parts(db: &Db, id: i64, norm: &str, kind: &str) -> Result<()> {
         if PERSON_TYPES.contains(&small_kind) || PERSON_TYPES.contains(&big_kind) {
             continue;
         }
-        if !(PLACE_ORG_TYPES.contains(&small_kind) || PLACE_ORG_TYPES.contains(&big_kind)) {
+        if !PLACE_TYPES.contains(&small_kind)
+            || !(PLACE_TYPES.contains(&big_kind) || ORG_TYPES.contains(&big_kind))
+        {
             continue;
         }
         if other_norm.chars().filter(|c| c.is_alphabetic()).count() < 3 {
@@ -1052,11 +1051,13 @@ fn resolve_same_as(db: &Db, target: &str) -> Result<i64> {
 
 /// Fill empty type/description from the mention and append new detail.
 fn enrich(db: &Db, id: i64, item: &EntityIn, now: i64) -> Result<()> {
-    let (mut entity_type, mut description, norm): (String, String, String) = db.sql().query_row(
-        "SELECT type,description,norm FROM entities WHERE id=?1",
-        [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
+    let (mut entity_type, mut description, norm, name): (String, String, String, String) =
+        db.sql().query_row(
+            "SELECT type,description,norm,name FROM entities WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+    let was_untyped = entity_type.is_empty();
     let mut changed = false;
     if entity_type.is_empty() {
         if let Some(kind) = item
@@ -1102,6 +1103,10 @@ fn enrich(db: &Db, id: i64, item: &EntityIn, now: i64) -> Result<()> {
             params![entity_type, description, now, id],
         )?;
         refresh_entity_fts(db, id)?;
+        // B5: containment links need a type, so a late type fills them in now.
+        if was_untyped && !entity_type.is_empty() {
+            link_name_parts(db, id, &name, &norm, &entity_type)?;
+        }
         // shortcut: the entity card embedding is not refreshed on enrichment;
         // reindex/recall tolerate the stale vector until eval shows drift.
     }

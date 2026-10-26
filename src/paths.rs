@@ -1530,6 +1530,7 @@ mod name_part_tests {
             &query,
             &[seed],
             &[seed],
+            true,
             &[1],
             vis,
             false,
