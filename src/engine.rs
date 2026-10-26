@@ -119,7 +119,7 @@ pub struct Config {
     pub update_candidate: f32,
     /// Trained hop scorer for the semantic beam: "off" (cosine residual) or "on".
     pub hop_scorer: String,
-    /// A prose-terminal semantic chain renders its memory as a fact line when
+    /// The prose memories of the best semantic chain render as fact lines when
     /// it beats the best chain with another terminal by this score margin.
     pub prose_margin: f64,
     /// Rerank the top N fused memory candidates with the cross-encoder
