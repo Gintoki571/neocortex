@@ -118,6 +118,9 @@ pub struct Config {
     pub update_candidate: f32,
     /// Trained hop scorer for the semantic beam: "off" (cosine residual) or "on".
     pub hop_scorer: String,
+    /// A prose-terminal semantic chain renders its memory as a fact line when
+    /// it beats the best chain with another terminal by this score margin.
+    pub prose_margin: f64,
 }
 
 impl Default for Config {
@@ -157,6 +160,7 @@ impl Default for Config {
             fact_memory_seed: 0.0,
             update_candidate: 0.75,
             hop_scorer: "off".to_string(),
+            prose_margin: 0.0,
         }
     }
 }
@@ -426,6 +430,10 @@ pub struct FactHit {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub retracted: bool,
     pub polarity: i64,
+    /// A text-only memory promoted from a prose-terminal chain: `id` is the
+    /// memory id (rendered `m<id>`), `source` the bridge entity, no predicate.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub memory: bool,
     /// Set when >= 2 positive values of (source, predicate) are current.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_values: Option<usize>,

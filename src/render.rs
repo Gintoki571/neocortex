@@ -55,6 +55,9 @@ fn timeline_memory_line(m: &MemoryHit, fmt: Fmt<'_>) -> String {
 
 /// `[r9] Mom —live in→ Pune (since 2026-09-14)`
 fn fact_line(f: &FactHit, fmt: Fmt<'_>) -> String {
+    if f.memory {
+        return format!("[m{}] {} · {}", f.id, f.source, f.fact);
+    }
     let span = match (f.valid_to, f.ended) {
         (Some(to), true) => match &f.replaced_by {
             Some((id, fact)) => format!(
@@ -398,6 +401,7 @@ mod tests {
             ended,
             retracted: false,
             polarity: 1,
+            memory: false,
             current_values: None,
             replaced_by: None,
         }

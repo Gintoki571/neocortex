@@ -24,6 +24,15 @@ pub struct EvalReport {
     pub acc: Option<f64>,
     #[serde(skip_serializing_if = "is_zero")]
     pub answer_queries: usize,
+    /// Mean size of the rendered recall output an agent reads, in estimated
+    /// tokens (chars / 4); guards against gaining acc@10 by adding context.
+    pub context_tokens_mean: f64,
+    /// Queries with `expect_absent` memories, and how many of them still had
+    /// one in the returned context (a memory in the top k, or a prose fact).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub absent_queries: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub absent_leaked: usize,
     pub category: serde_json::Value,
     pub latency_mean_ms: f64,
     pub latency_p50_ms: f64,
@@ -288,6 +297,8 @@ fn evaluate(
     let mut mrr_sum = 0.0;
     let mut answer_queries = 0;
     let mut acc_hits = 0;
+    let mut context_chars = 0usize;
+    let (mut absent_queries, mut absent_leaked) = (0, 0);
     let mut failures = Vec::new();
     let mut by_category: HashMap<String, CategoryScore> = HashMap::new();
     for query in queries {
@@ -329,6 +340,17 @@ fn evaluate(
             .map(|id| found.iter().position(|x| x == id).map(|p| p + 1))
             .collect();
         let first_expected = ranks.iter().flatten().copied().min();
+        context_chars += crate::render::render_recall(&out, &|t| t.to_string())
+            .chars()
+            .count();
+        if !absent.is_empty() {
+            absent_queries += 1;
+            let leaked = |id: &i64| {
+                out.memories.iter().take(k).any(|m| m.id == *id)
+                    || out.facts.iter().any(|f| f.memory && f.id == *id)
+            };
+            absent_leaked += usize::from(absent.iter().any(leaked));
+        }
         let first_absent = absent
             .iter()
             .filter_map(|id| found.iter().position(|x| x == id))
@@ -425,6 +447,13 @@ fn evaluate(
             Some(acc_hits as f64 / answer_queries as f64)
         },
         answer_queries,
+        context_tokens_mean: if n == 0 {
+            0.0
+        } else {
+            context_chars as f64 / 4.0 / n as f64
+        },
+        absent_queries,
+        absent_leaked,
         category: serde_json::Value::Object(category),
         latency_mean_ms: if n == 0 {
             0.0
@@ -534,6 +563,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "w_graph",
     "w_temporal",
     "w_sempath",
+    "prose_margin",
     "rrf_k",
     "alpha",
     "entity_seed",
@@ -580,6 +610,7 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "w_graph" => cfg.w_graph = number(key, value)?,
         "w_temporal" => cfg.w_temporal = number(key, value)?,
         "w_sempath" => cfg.w_sempath = number(key, value)?,
+        "prose_margin" => cfg.prose_margin = number(key, value)?,
         "hop_scorer" => cfg.hop_scorer = value.to_string(),
         "rrf_k" => cfg.rrf_k = number(key, value)?,
         "alpha" => cfg.alpha = number(key, value)?,
@@ -620,6 +651,16 @@ pub fn render_report(report: &EvalReport, show_failures: bool) -> String {
         out.push_str(&format!(
             "acc@{ACC_K}: {acc:.3} ({} answer queries)\n",
             report.answer_queries
+        ));
+    }
+    out.push_str(&format!(
+        "context tokens/query (chars/4): {:.1}\n",
+        report.context_tokens_mean
+    ));
+    if report.absent_queries > 0 {
+        out.push_str(&format!(
+            "expect_absent leaked: {}/{} queries\n",
+            report.absent_leaked, report.absent_queries
         ));
     }
     out.push_str(&format!(
@@ -720,8 +761,18 @@ fn category(report: &EvalReport, name: &str) -> (f64, f64) {
 /// Compact one-line-per-variant table for `--sweep`.
 pub fn sweep_table(rows: &[(String, EvalReport)]) -> String {
     let mut out = format!(
-        "{:<22} {:>7} {:>7} {:>7} {:>8} {:>7} {:>8} {:>8} {:>7}\n",
-        "variant", "recall", "mrr", "multi", "multiMRR", "syn", "synMRR", "histMRR", "agg"
+        "{:<22} {:>7} {:>7} {:>7} {:>8} {:>7} {:>8} {:>8} {:>7} {:>7} {:>5}\n",
+        "variant",
+        "recall",
+        "mrr",
+        "multi",
+        "multiMRR",
+        "syn",
+        "synMRR",
+        "histMRR",
+        "agg",
+        "ctxTok",
+        "leak"
     );
     for (name, report) in rows {
         let (multi, multi_mrr) = category(report, "multi-hop");
@@ -729,8 +780,18 @@ pub fn sweep_table(rows: &[(String, EvalReport)]) -> String {
         let (_, hist_mrr) = category(report, "history");
         let (agg, _) = category(report, "aggregation");
         out.push_str(&format!(
-            "{:<22} {:>7.3} {:>7.3} {:>7.3} {:>8.3} {:>7.3} {:>8.3} {:>8.3} {:>7.3}\n",
-            name, report.recall, report.mrr, multi, multi_mrr, syn, syn_mrr, hist_mrr, agg
+            "{:<22} {:>7.3} {:>7.3} {:>7.3} {:>8.3} {:>7.3} {:>8.3} {:>8.3} {:>7.3} {:>7.1} {:>5}\n",
+            name,
+            report.recall,
+            report.mrr,
+            multi,
+            multi_mrr,
+            syn,
+            syn_mrr,
+            hist_mrr,
+            agg,
+            report.context_tokens_mean,
+            report.absent_leaked
         ));
     }
     out

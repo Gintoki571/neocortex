@@ -729,10 +729,12 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         as_of,
         history,
     };
-    let (lexical_hits, sem_hits) = if negated || history_query {
+    // History questions ("whoever used to lead X") still need the second hop:
+    // only the lexical beam (current-state term matching) stays off for them.
+    let (lexical_hits, sem_hits) = if negated {
         (Vec::new(), Vec::new())
     } else {
-        let lexical = if path_starts.is_empty() {
+        let lexical = if path_starts.is_empty() || history_query {
             Vec::new()
         } else {
             paths::search(&engine.db, &query_text, &path_starts, vis)?
@@ -769,7 +771,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         });
     }
     sem_ids.truncate(depth);
-    let path_hits: Vec<paths::PathHit> = lexical_hits.into_iter().chain(sem_hits).collect();
+    let top_chains = paths::top_chains(&lexical_hits, &sem_hits);
     path_ids.truncate(depth);
 
     // ---------------------------------------------------------- causal
@@ -1096,13 +1098,19 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             .into_iter()
             .filter(|fact| fact.polarity == 0 || paths::has_negation_cue(&fact.fact))
             .collect()
-    } else if path_hits.is_empty() {
+    } else if top_chains.is_empty() {
         facts
     } else {
-        let top = &path_hits[..path_hits.len().min(2)];
-        let mut merged = paths::facts(&engine.db, top, cutoff, 6)?;
+        let prose_fact =
+            paths::prose_terminal_fact(&engine.db, &sem_hits, engine.cfg.prose_margin, cutoff)?
+                .filter(|fact| {
+                    rows.get(&fact.id)
+                        .is_some_and(|row| eligible(row, as_of, history, input, since, until))
+                });
+        let mut merged: Vec<FactHit> = prose_fact.into_iter().collect();
+        merged.extend(paths::facts(&engine.db, &top_chains, cutoff, 6)?);
         for fact in facts {
-            if !merged.iter().any(|x| x.id == fact.id) {
+            if !merged.iter().any(|x| x.id == fact.id && !x.memory) {
                 merged.push(fact);
             }
         }
@@ -1429,6 +1437,7 @@ fn facts_for_view(
                 ended: expired.is_some() || vt.is_some_and(|v| v <= cutoff),
                 retracted: expired.is_some() && vt.is_none(),
                 polarity,
+                memory: false,
                 current_values: if polarity == 1 && expired.is_none() && vt.is_none_or(|v| v > cutoff)
                 {
                     let n: i64 = engine.db.sql().query_row(
