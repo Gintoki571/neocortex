@@ -533,6 +533,7 @@ fn word_candidates(
     let mut i = 0;
     while i < words.len() {
         if !is_span_start(words[i].text)
+            || is_hyphen_tail(text, &words, i)
             || is_unit_after_number(&words, text, i)
             || unit_label_follows(&words, text, i)
         {
@@ -601,11 +602,19 @@ fn word_candidates(
             // Non-ASCII title-case words (Ålesund, Москва, Νίκος) are kept: the
             // stopword/openers lexicons are English, so position is their only
             // English-word signal.
+            // EX-05: a sentence-initial word is also kept when the store
+            // already knows it as an entity or alias ("Cascais hosts the
+            // regatta"), or when a verb follows it and it is not an ordinary
+            // word or a status shout ("Paris is the capital", "Cypher runs").
             let keep = if is_sentence_start(text, w.start) {
                 is_acronym(w.text)
                     || has_inner_capital_or_digit(w.text)
                     || is_foreign_title_case(w.text)
                     || appears_capitalised_not_at_sentence_start(text, w.text)
+                    || known(w.text)
+                    || (verb_like_follows(text, &words, s_idx)
+                        && !is_ordinary_word(w.text)
+                        && !is_status_word(w.text))
             } else {
                 true
             };
@@ -666,6 +675,25 @@ fn word_candidates(
 
 fn gap_is_space(text: &str, left: &Word<'_>, right: &Word<'_>) -> bool {
     text[left.end..right.start].chars().all(char::is_whitespace)
+}
+
+/// A word glued to the previous one by a bare hyphen is the tail of a
+/// compound ("cryo-ET", "IL-6"), never the start of a proper-noun span.
+fn is_hyphen_tail(text: &str, words: &[Word<'_>], idx: usize) -> bool {
+    idx > 0 && text[words[idx - 1].end..words[idx].start] == *"-"
+}
+
+/// Verb-like words that mark the preceding sentence-initial word as its
+/// subject ("Paris is", "Cypher runs") (EX-05). A closed list: the rule must
+/// not fire on "Meeting was long".
+const VERB_CUES: &[&str] = &[
+    "is", "was", "has", "had", "runs", "said", "joined", "moved", "lives", "works",
+];
+
+fn verb_like_follows(text: &str, words: &[Word<'_>], idx: usize) -> bool {
+    words.get(idx + 1).is_some_and(|next| {
+        gap_is_space(text, &words[idx], next) && VERB_CUES.contains(&fold(next.text).as_str())
+    })
 }
 
 /// Measures that follow a number ("1.2 MB", "120 ms"): not entities (EX-02).
@@ -852,10 +880,16 @@ fn is_number(word: &str) -> bool {
     word.chars().any(|c| c.is_ascii_digit()) && word.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
+/// Lower-case link words that stay inside a proper-noun span: "Rua do
+/// Instituto Bacteriológico", "Universidade da Beira Interior", "Bank of
+/// America", "Willem de Kooning", "Marina di Carrara".
+const CONNECTORS: &[&str] = &[
+    "do", "da", "dos", "das", "de", "del", "della", "di", "du", "van", "von", "der", "la", "le",
+    "of",
+];
+
 fn is_connector(word: &str) -> bool {
-    ["of", "de", "van", "&"]
-        .iter()
-        .any(|c| word.eq_ignore_ascii_case(c))
+    word == "&" || CONNECTORS.iter().any(|c| word.eq_ignore_ascii_case(c))
 }
 
 fn is_span_start(word: &str) -> bool {

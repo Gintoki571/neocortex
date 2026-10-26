@@ -710,6 +710,19 @@ pub fn tokens(s: &str) -> Vec<String> {
     fold(s).split_whitespace().map(str::to_string).collect()
 }
 
+/// The token set of a normalised name, sorted and deduplicated: the key of
+/// the B5 containment check ("cascais marina" -> ["cascais", "marina"]).
+pub fn name_tokens(norm: &str) -> Vec<String> {
+    let mut out: Vec<String> = norm
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Safe FTS5 MATCH expression: OR of quoted non-stopword tokens of `q` and
 /// `extra`; prefix arm (`"tok"*`) for tokens >= 4 chars. None when nothing
 /// searchable remains. Never lets FTS5 syntax through.

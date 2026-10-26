@@ -824,6 +824,34 @@ impl Engine {
                     rusqlite::params![lo, hi, score],
                 )?;
             }
+            // B5 containment links move the same way, and the survivor answers
+            // to the merged name's tokens.
+            let moved_parts: Vec<(i64, i64, f32)> = {
+                let mut st = db
+                    .sql()
+                    .prepare("SELECT a,b,weight FROM name_part WHERE a=?1 OR b=?1")?;
+                let rows = st.query_map([m], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            db.sql()
+                .execute("DELETE FROM name_part WHERE a=?1 OR b=?1", [m])?;
+            for (a, b, weight) in moved_parts {
+                let other = if a == m { b } else { a };
+                if other == k || other == m {
+                    continue;
+                }
+                let (lo, hi) = if other < k { (other, k) } else { (k, other) };
+                db.sql().execute(
+                    "INSERT INTO name_part(a,b,weight) VALUES (?1,?2,?3)
+                     ON CONFLICT(a,b) DO UPDATE SET weight=MAX(weight, excluded.weight)",
+                    rusqlite::params![lo, hi, weight],
+                )?;
+            }
+            db.sql().execute(
+                "INSERT OR IGNORE INTO name_tokens(token,entity_id)
+                 SELECT token,?1 FROM name_tokens WHERE entity_id=?2",
+                [k, m],
+            )?;
             db.sql().execute(
                 "UPDATE OR IGNORE mentions SET entity_id=?1 WHERE entity_id=?2",
                 [k, m],

@@ -293,6 +293,18 @@ also render the interval with a computed duration ("3 years 2 months",
 - Inverse and symmetric phrases: "X reports to Y" is stored once as "Y manages
   X" (or, for "married to", with both ends in storage order) and every side
   renders its own view: `entity` shows the phrase that starts with the profile.
+- Names in running text: a lower-case connector stays inside a name ("Rua do
+  Instituto Bacteriológico", "Universidade da Beira Interior", "Bank of
+  America"), so the generic head ("Rua", "Universidade") is never stored as an
+  entity of its own; the tail of a hyphenated compound ("cryo-ET", "C-Class")
+  never starts a name. A name at the start of a sentence is kept when the store
+  already knows it or when a verb follows ("Paris is the capital of France",
+  "Cypher runs on SQLite"), while ordinary openers stay out ("The meeting was
+  long").
+- A longer name is linked to the place or organisation it contains: "Cascais
+  marina" points at "Cascais" and "Hackerspace Aveiro" at "Aveiro" with a weak
+  edge that multi-hop retrieval can walk. The link needs a place/org type on
+  one side and no person on either, so "Paris Hilton" is not part of "Paris".
 - Predicates live in families ("resides in" and "based in" count as "lives
   in"): exclusivity and negative assertions are checked per family, and a
   brand new phrase joins a family when its vector is close enough. The seeded

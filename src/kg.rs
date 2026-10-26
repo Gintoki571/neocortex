@@ -96,6 +96,31 @@ pub fn project_similar(db: &Db, a: i64, b: i64, score: f32) -> Result<()> {
     ])
 }
 
+/// B5: a name-containment edge ("Cascais marina" contains "Cascais"), the
+/// weak hop the semantic beam and PPR walk.
+pub fn project_name_part(db: &Db, a: i64, b: i64, weight: f32) -> Result<()> {
+    run(db, "MATCH (a:Entity {id:$a}), (b:Entity {id:$b}) MERGE (a)-[r:CONTAINS]->(b) SET r.weight=$weight", &[
+        ("a", format!("e:{a}").into()), ("b", format!("e:{b}").into()), ("weight", f64::from(weight).into()),
+    ])
+}
+
+/// Project the containment edges of one entity. The caller must have
+/// projected the entity's node first: the edge MERGE matches both endpoints,
+/// and the write path links a new entity before its node exists.
+pub fn project_name_parts(db: &Db, entity: i64) -> Result<()> {
+    let rows: Vec<(i64, i64, f32)> = {
+        let mut st = db
+            .sql()
+            .prepare("SELECT a,b,weight FROM name_part WHERE a=?1 OR b=?1")?;
+        let rows = st.query_map([entity], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (a, b, weight) in rows {
+        project_name_part(db, a, b, weight)?;
+    }
+    Ok(())
+}
+
 pub fn project_relation(db: &Db, id: i64, src: i64, dst: i64, predicate: &str) -> Result<()> {
     run(db, "MATCH (a:Entity {id:$a}), (b:Entity {id:$b}) MERGE (a)-[r:REL {rid:$rid}]->(b) SET r.predicate=$predicate", &[
         ("a", format!("e:{src}").into()), ("b", format!("e:{dst}").into()),
@@ -153,6 +178,7 @@ pub fn reproject_entity(db: &Db, entity: i64) -> Result<()> {
     for (a, b, score) in similar {
         project_similar(db, a, b, score)?;
     }
+    project_name_parts(db, entity)?;
     let relations: Vec<(i64, i64, i64, String)> = {
         let mut st = db.sql().prepare(
             "SELECT r.id,r.src,r.dst,p.canonical FROM relations r
@@ -208,6 +234,15 @@ pub fn rebuild_all(db: &Db) -> Result<()> {
             .collect::<rusqlite::Result<_>>()?;
         for (a, b, s) in rows {
             project_similar(db, a, b, s)?;
+        }
+    }
+    {
+        let mut st = db.sql().prepare("SELECT a,b,weight FROM name_part")?;
+        let rows: Vec<(i64, i64, f32)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (a, b, w) in rows {
+            project_name_part(db, a, b, w)?;
         }
     }
     {
@@ -308,6 +343,19 @@ pub fn snapshot(db: &Db, as_of: Option<i64>, include_ended: bool) -> Result<Snap
         let (a, b, s) = row?;
         if let (Some(&u), Some(&v)) = (ent_node.get(&a), ent_node.get(&b)) {
             edges.push((u, v, s));
+        }
+    }
+    let mut st = db.sql().prepare("SELECT a,b,weight FROM name_part")?;
+    for row in st.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, f32>(2)?,
+        ))
+    })? {
+        let (a, b, w) = row?;
+        if let (Some(&u), Some(&v)) = (ent_node.get(&a), ent_node.get(&b)) {
+            edges.push((u, v, w));
         }
     }
     Ok(Snapshot {

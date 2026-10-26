@@ -137,8 +137,33 @@ impl Db {
                at INTEGER NOT NULL,
                PRIMARY KEY (memory_id, at)
              );
-             CREATE INDEX IF NOT EXISTS idx_memory_access_at ON memory_access(at);",
+             CREATE INDEX IF NOT EXISTS idx_memory_access_at ON memory_access(at);
+             CREATE TABLE IF NOT EXISTS name_tokens (
+               token TEXT NOT NULL,
+               entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+               PRIMARY KEY (token, entity_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_name_tokens_entity ON name_tokens(entity_id);
+             CREATE TABLE IF NOT EXISTS name_part (
+               a INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+               b INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+               weight REAL NOT NULL,
+               PRIMARY KEY (a, b),
+               CHECK (a < b)
+             );
+             CREATE INDEX IF NOT EXISTS idx_name_part_b ON name_part(b);",
         )?;
+        // B5 name tokens are derived from entities.norm; a database written
+        // before the table existed is backfilled once (the empty-table probe
+        // is a primary-key lookup, so a normal open writes nothing).
+        let empty: i64 = self.sql().query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM name_tokens LIMIT 1)",
+            [],
+            |r| r.get(0),
+        )?;
+        if empty == 1 {
+            self.backfill_name_tokens()?;
+        }
         // New seeded families (the causal group) must reach existing v4
         // databases too. Presence of the family anchor is the check: when it
         // exists the whole current seed set does, so a normal open writes
@@ -161,6 +186,27 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(n > 0)
+    }
+
+    /// Fill `name_tokens` for every entity that predates the table (B5).
+    fn backfill_name_tokens(&self) -> Result<()> {
+        let rows: Vec<(i64, String)> = {
+            let mut st = self.sql().prepare("SELECT id,norm FROM entities")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut st = self
+            .sql()
+            .prepare("INSERT OR IGNORE INTO name_tokens(token,entity_id) VALUES (?1,?2)")?;
+        for (id, norm) in rows {
+            for token in crate::text::name_tokens(&norm) {
+                st.execute(rusqlite::params![token, id])?;
+            }
+        }
+        Ok(())
     }
 
     /// Fresh database: create every table, then stamp the version.

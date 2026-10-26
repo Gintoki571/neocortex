@@ -867,7 +867,164 @@ fn insert_entity(
         "INSERT INTO entities_vec(rowid,embedding) VALUES (?1,?2)",
         params![id, vec_blob(embedding)],
     )?;
+    for token in text::name_tokens(norm) {
+        db.sql().execute(
+            "INSERT OR IGNORE INTO name_tokens(token,entity_id) VALUES (?1,?2)",
+            params![token, id],
+        )?;
+    }
+    link_name_parts(db, id, norm, kind)?;
     Ok(id)
+}
+
+/// B5 weight of a name-containment link; the semantic beam scores the hop
+/// with the same constant.
+pub(crate) const NAME_PART_WEIGHT: f32 = 0.6;
+
+/// Types that make a containment link meaningful: a place or an organisation
+/// may own a longer name ("Cascais marina", "Hackerspace Aveiro").
+const PLACE_ORG_TYPES: &[&str] = &[
+    "place",
+    "city",
+    "town",
+    "village",
+    "country",
+    "region",
+    "district",
+    "neighbourhood",
+    "neighborhood",
+    "location",
+    "address",
+    "airport",
+    "station",
+    "building",
+    "venue",
+    "park",
+    "street",
+    "road",
+    "river",
+    "island",
+    "marina",
+    "harbor",
+    "harbour",
+    "org",
+    "organization",
+    "organisation",
+    "company",
+    "institution",
+    "university",
+    "school",
+    "club",
+    "studio",
+    "lab",
+    "laboratory",
+    "museum",
+    "hotel",
+    "restaurant",
+    "cafe",
+    "store",
+    "shop",
+];
+
+/// A person is never a container: "Paris Hilton" is not part of "Paris".
+const PERSON_TYPES: &[&str] = &["person", "people", "human"];
+
+/// Largest candidate pool for one containment lookup: a token shared by more
+/// entities is a hub and would only add noise.
+const NAME_PART_CANDIDATES: usize = 200;
+
+/// B5: link a newly inserted entity to the entities whose token set strictly
+/// contains it, or is strictly contained in it, when at least one side is a
+/// place or org and neither is a person. One indexed token lookup per new
+/// entity; the link is undirected (`a < b`), so insertion order does not
+/// matter.
+fn link_name_parts(db: &Db, id: i64, norm: &str, kind: &str) -> Result<()> {
+    let tokens = text::name_tokens(norm);
+    if tokens.is_empty() || norm.chars().filter(|c| c.is_alphabetic()).count() < 3 {
+        return Ok(());
+    }
+    let marks = std::iter::repeat_n("?", tokens.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let ids: Vec<i64> = {
+        let sql = format!(
+            "SELECT DISTINCT entity_id FROM name_tokens WHERE token IN ({marks})
+             ORDER BY entity_id LIMIT {NAME_PART_CANDIDATES}"
+        );
+        let mut st = db.sql().prepare(&sql)?;
+        let rows = st.query_map(params_from_iter(tokens.iter()), |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let mut others: Vec<(i64, String, String)> = Vec::new();
+    {
+        let sql = format!("SELECT id,norm,type FROM entities WHERE id IN ({placeholders})");
+        let mut st = db.sql().prepare(&sql)?;
+        let rows = st.query_map(params_from_iter(ids.iter()), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (other, other_norm, other_kind) = row?;
+            if other != id {
+                others.push((other, other_norm, other_kind));
+            }
+        }
+    }
+    let mut other_tokens: HashMap<i64, Vec<String>> = HashMap::new();
+    {
+        let sql =
+            format!("SELECT entity_id,token FROM name_tokens WHERE entity_id IN ({placeholders})");
+        let mut st = db.sql().prepare(&sql)?;
+        for row in st.query_map(params_from_iter(ids.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (entity, token) = row?;
+            other_tokens.entry(entity).or_default().push(token);
+        }
+    }
+    for (other, other_norm, other_kind) in others {
+        let theirs = other_tokens.remove(&other).unwrap_or_default();
+        // Strict token-set containment, in either direction.
+        let we_are_part = is_subset(&tokens, &theirs);
+        let they_are_part = is_subset(&theirs, &tokens);
+        if !we_are_part && !they_are_part {
+            continue;
+        }
+        if tokens.len() == theirs.len() {
+            continue;
+        }
+        let (small_kind, big_kind) = if we_are_part {
+            (kind, other_kind.as_str())
+        } else {
+            (other_kind.as_str(), kind)
+        };
+        if PERSON_TYPES.contains(&small_kind) || PERSON_TYPES.contains(&big_kind) {
+            continue;
+        }
+        if !(PLACE_ORG_TYPES.contains(&small_kind) || PLACE_ORG_TYPES.contains(&big_kind)) {
+            continue;
+        }
+        if other_norm.chars().filter(|c| c.is_alphabetic()).count() < 3 {
+            continue;
+        }
+        let (a, b) = if id < other { (id, other) } else { (other, id) };
+        db.sql().execute(
+            "INSERT OR REPLACE INTO name_part(a,b,weight) VALUES (?1,?2,?3)",
+            params![a, b, NAME_PART_WEIGHT],
+        )?;
+    }
+    Ok(())
+}
+
+fn is_subset(part: &[String], whole: &[String]) -> bool {
+    part.iter().all(|token| whole.contains(token))
 }
 
 fn resolve_same_as(db: &Db, target: &str) -> Result<i64> {
