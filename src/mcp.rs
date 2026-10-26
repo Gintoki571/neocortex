@@ -78,7 +78,7 @@ impl Embedder for LazyEmbedder {
     }
 
     fn name(&self) -> &str {
-        "ultrabert-150m"
+        embed::identity()
     }
 }
 

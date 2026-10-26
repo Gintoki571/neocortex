@@ -206,3 +206,7 @@ objdump -d --no-show-raw-insn ~/.cargo/registry/src/*/graphqlite-0.12.0/libs/gra
 - Warm MCP p50 under 512 MiB. The server is killed during model load.
 - Cold-page-cache numbers on other storage. Here they come from ext4 on this drive at about 72 MB/s.
 - Android and ARM (out of scope per the coordinator's scope change).
+
+## After nc-lite (2026-10-26)
+
+Streaming f32 loader (one copy of the weights) and an opt-in Q8_0 model (`neocortex quantize-model`, `NEOCORTEX_EMBED_DTYPE=q8`): cold-recall peak RSS 1,187 MiB (mmap loader) -> 612 MiB (f32) -> 237 MiB (q8); model file 604 MB -> 161 MB; q8 vs f32 embedding cosine min 0.998 / mean 0.9996 over 927 eval texts. Table, gates and the reasons candle's `QMatMul` is not used (compile-time SIMD selection, scalar in the default build, 14 s per recall) are in `AGENTS.md` (Verification, Local Contracts, Layout).

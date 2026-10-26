@@ -29,13 +29,6 @@ const PARTICLES: [&str; 12] = [
     "about", "at", "by", "for", "from", "in", "into", "of", "on", "to", "up", "with",
 ];
 
-#[allow(clippy::chunks_exact_to_as_chunks)]
-fn blob_vec(blob: Vec<u8>) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]]))
-        .collect()
-}
-
 fn generation(db: &Db) -> Result<i64> {
     Ok(db.sql().query_row(
         "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='gen'),0)",
@@ -172,8 +165,12 @@ fn fetch_vectors(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<f32>>> {
         .sql()
         .prepare_cached("SELECT embedding FROM memories_vec WHERE rowid = ?1")?;
     for &id in ids {
-        if let Some(blob) = st.query_row([id], |r| r.get::<_, Vec<u8>>(0)).optional()? {
-            out.insert(id, blob_vec(blob));
+        if let Some(v) = st
+            .query_row([id], |r| r.get::<_, Vec<u8>>(0))
+            .optional()?
+            .and_then(|blob| db.blob_to_vec(&blob))
+        {
+            out.insert(id, v);
         }
     }
     Ok(out)
@@ -371,14 +368,13 @@ fn relation_seeds_with_config(
         }
     }
     {
-        let mut st = db.sql().prepare(
+        let mut st = db.sql().prepare(&format!(
             "SELECT rowid,1-distance FROM relations_vec
-             WHERE embedding MATCH ?1 AND k=10 ORDER BY distance",
-        )?;
+             WHERE embedding MATCH {} AND k=10 ORDER BY distance",
+            db.vec_sql("?1")
+        ))?;
         let hits: Vec<(i64, f32)> = st
-            .query_map([crate::db::vec_blob(query_vec)], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
+            .query_map([db.vec_blob(query_vec)], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let ids: Vec<i64> = hits
             .iter()
@@ -710,7 +706,10 @@ fn next_hops(
         .sql()
         .prepare_cached("SELECT embedding FROM memories_vec WHERE rowid=?1")?;
     let cosine = |blob: Vec<u8>| -> Option<f32> {
-        crate::db::blob_to_vec(&blob).map(|v| rank::cosine(&frame_vec, &v))
+        engine
+            .db
+            .blob_to_vec(&blob)
+            .map(|v| rank::cosine(&frame_vec, &v))
     };
     let mut best = 0.0f32;
     for fact in facts {
@@ -738,12 +737,12 @@ fn next_hops(
             memory_st
                 .query_row([memory_id], |r| r.get::<_, Vec<u8>>(0))
                 .optional()?
-                .and_then(|b| crate::db::blob_to_vec(&b))
+                .and_then(|b| engine.db.blob_to_vec(&b))
         } else {
             relation_st
                 .query_row([step.relation_id], |r| r.get::<_, Vec<u8>>(0))
                 .optional()?
-                .and_then(|b| crate::db::blob_to_vec(&b))
+                .and_then(|b| engine.db.blob_to_vec(&b))
         };
         if vector.is_some_and(|v| rank::cosine(&frame_vec, &v) >= tau) {
             // This chain's last hop already answers the wh-frame.
@@ -860,17 +859,20 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // ---------------------------------------------------------- vector
     let knn_sql = if history {
         "SELECT rowid,1-distance FROM memories_vec
-         WHERE embedding MATCH ?1 AND k=?2 ORDER BY distance"
+         WHERE embedding MATCH {} AND k=?2 ORDER BY distance"
     } else {
         "SELECT rowid,1-distance FROM memories_vec
-         WHERE embedding MATCH ?1 AND k=?2 AND live=1 ORDER BY distance"
+         WHERE embedding MATCH {} AND k=?2 AND live=1 ORDER BY distance"
     };
-    let mut st = engine.db.sql().prepare(knn_sql)?;
+    let mut st = engine
+        .db
+        .sql()
+        .prepare(&knn_sql.replace("{}", &engine.db.vec_sql("?1")))?;
     // At least SEM_FACTS neighbours: the semantic beam uses them as prose hops.
     let mut knn: Vec<(i64, f32)> = st
         .query_map(
             params![
-                crate::db::vec_blob(&query_vec),
+                engine.db.vec_blob(&query_vec),
                 fetch_depth.max(paths::SEM_FACTS) as i64
             ],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f32>(1)?)),
@@ -989,12 +991,13 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     }
     // (b) entity KNN against the query vector.
     {
-        let mut st = engine.db.sql().prepare(
+        let mut st = engine.db.sql().prepare(&format!(
             "SELECT rowid,1-distance FROM entities_vec
-             WHERE embedding MATCH ?1 AND k=10 ORDER BY distance",
-        )?;
+             WHERE embedding MATCH {} AND k=10 ORDER BY distance",
+            engine.db.vec_sql("?1")
+        ))?;
         let hits: Vec<(i64, f32)> = st
-            .query_map([crate::db::vec_blob(&query_vec)], |r| {
+            .query_map([engine.db.vec_blob(&query_vec)], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1892,7 +1895,8 @@ fn facts_for_view(
                     |r| r.get::<_, Vec<u8>>(0),
                 )
                 .optional()?
-                .map(|blob| rank::cosine(query, &blob_vec(blob)))
+                .and_then(|blob| engine.db.blob_to_vec(&blob))
+                .map(|v| rank::cosine(query, &v))
                 .unwrap_or(0.0)
         } else {
             0.0
@@ -2088,12 +2092,13 @@ fn lookup_entity_fuzzy(engine: &Engine, name: &str) -> Result<i64> {
         }
     }
     let vector = engine.emb.embed(&[name], Mode::Document)?.remove(0);
-    let mut st = engine.db.sql().prepare(
+    let mut st = engine.db.sql().prepare(&format!(
         "SELECT v.rowid, 1 - v.distance, e.name FROM entities_vec v JOIN entities e ON e.id = v.rowid
-         WHERE v.embedding MATCH ?1 AND k = 3 ORDER BY v.distance",
-    )?;
+         WHERE v.embedding MATCH {} AND k = 3 ORDER BY v.distance",
+        engine.db.vec_sql("?1")
+    ))?;
     let near: Vec<(i64, f64, String)> = st
-        .query_map([crate::db::vec_blob(&vector)], |r| {
+        .query_map([engine.db.vec_blob(&vector)], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -2129,11 +2134,12 @@ fn overview_ppr(engine: &Engine, query: &str) -> Result<HashMap<i64, f64>> {
             seeds.push((node, 1.0));
         }
     }
-    let mut st = engine.db.sql().prepare(
+    let mut st = engine.db.sql().prepare(&format!(
         "SELECT rowid,1-distance FROM entities_vec
-         WHERE embedding MATCH ?1 AND k=10 ORDER BY distance",
-    )?;
-    for row in st.query_map([crate::db::vec_blob(&vector)], |r| {
+         WHERE embedding MATCH {} AND k=10 ORDER BY distance",
+        engine.db.vec_sql("?1")
+    ))?;
+    for row in st.query_map([engine.db.vec_blob(&vector)], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
     })? {
         let (id, score) = row?;
@@ -2146,13 +2152,14 @@ fn overview_ppr(engine: &Engine, query: &str) -> Result<HashMap<i64, f64>> {
     // Topical queries ("embedding performance") rarely name an entity: seed the
     // walk from the nearest memories too, with the same share recall uses.
     let ent_total: f64 = seeds.iter().map(|(_, w)| w).sum();
-    let mut st = engine.db.sql().prepare(
+    let mut st = engine.db.sql().prepare(&format!(
         "SELECT rowid,1-distance FROM memories_vec
-         WHERE embedding MATCH ?1 AND k=?2 AND live=1 ORDER BY distance",
-    )?;
+         WHERE embedding MATCH {} AND k=?2 AND live=1 ORDER BY distance",
+        engine.db.vec_sql("?1")
+    ))?;
     let mem: Vec<(i64, f64)> = st
         .query_map(
-            params![crate::db::vec_blob(&vector), engine.cfg.mem_seed_top as i64],
+            params![engine.db.vec_blob(&vector), engine.cfg.mem_seed_top as i64],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?
         .collect::<rusqlite::Result<_>>()?;

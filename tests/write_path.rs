@@ -196,7 +196,13 @@ fn embedding_similarity_only_creates_similar_edges() {
     assert_ne!(second.entities[0].id, london);
     assert_eq!(second.entities[0].similar.len(), 1);
     assert_eq!(second.entities[0].similar[0].0, london);
-    assert!((second.entities[0].similar[0].2 - 0.9).abs() < 1e-4);
+    // int8 cosines carry the quantization error (about 1e-3 for these vectors).
+    let tol = if engine.db.vec_mode() == neocortex::db::VecMode::Int8 {
+        5e-3
+    } else {
+        1e-4
+    };
+    assert!((second.entities[0].similar[0].2 - 0.9).abs() < tol);
     assert_eq!(count(&engine, "SELECT count(*) FROM similar"), 1);
     assert_eq!(count(&engine, "SELECT count(*) FROM entities"), 2);
 }
@@ -376,7 +382,12 @@ fn relation_endpoints_use_their_own_embedding() {
         )
         .unwrap();
     // vectors[1] (the London card) would give 1.0 here.
-    assert!((score - 0.9).abs() < 1e-3, "score {score}");
+    let tol = if engine.db.vec_mode() == neocortex::db::VecMode::Int8 {
+        5e-3
+    } else {
+        1e-3
+    };
+    assert!((score - 0.9).abs() < tol, "score {score}");
     assert_eq!(count(&engine, "SELECT count(*) FROM relations"), 1);
 }
 
