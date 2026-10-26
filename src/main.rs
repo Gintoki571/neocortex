@@ -100,6 +100,7 @@ fn dispatch(args: &[String]) -> CmdResult {
         "import" => cmd_import_jsonl(&globals, rest),
         "bench" => cmd_bench(&globals, rest),
         "eval" => cmd_eval(&globals, rest),
+        "quantize-model" => cmd_quantize_model(rest),
         "mcp" => {
             let engine = open_engine(&globals)?;
             mcp::serve(&engine).map_err(runtime)
@@ -239,6 +240,35 @@ fn make_embedder() -> Arc<dyn Embedder> {
         Ok("hash") => Arc::new(HashEmbedder),
         _ => Arc::new(LazyEmbedder::new()),
     }
+}
+
+/// `quantize-model <f32 model dir> <out dir> [--dtype q8|q4k]`.
+fn cmd_quantize_model(args: &[String]) -> CmdResult {
+    let mut dtype = "q8".to_string();
+    let mut dirs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--dtype" {
+            dtype = value(args, &mut i, "--dtype")?;
+        } else {
+            dirs.push(&args[i]);
+        }
+        i += 1;
+    }
+    let [from, to] = dirs[..] else {
+        return Err(usage(
+            "quantize-model <f32 model dir> <out dir> [--dtype q8|q4k]",
+        ));
+    };
+    let started = std::time::Instant::now();
+    let bytes =
+        neocortex::embed::quantize_dir(Path::new(from), Path::new(to), &dtype).map_err(runtime)?;
+    println!(
+        "wrote {to} ({:.1} MiB weights, {dtype}) in {:.1}s; use it with NEOCORTEX_MODEL_DIR={to}",
+        bytes as f64 / 1048576.0,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 fn emit<T: Serialize>(globals: &Globals, out: &T, text: impl FnOnce() -> String) -> CmdResult {
@@ -874,6 +904,8 @@ Commands:
   eval <fixtures.json>     evaluate retrieval quality (--ablation --failures
                            --set key=value --sweep key=v1,v2
                            --limit-queries N --save-db PATH --load-db PATH)
+  quantize-model <dir> <out> [--dtype q8|q4k]
+                           write a quantized copy of the f32 model (q8: ~1/4 the size)
   mcp                      run the MCP stdio server
   help                     this text
   --version                print the version

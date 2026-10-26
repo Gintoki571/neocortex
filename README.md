@@ -35,6 +35,25 @@ or point at it explicitly:
 export NEOCORTEX_MODEL_DIR=/path/to/UltraBERT-Embed-150M
 ```
 
+### Small machines: the q8 model
+
+The f32 model needs about 615 MB of RAM and a 604 MB download. For old laptops,
+cheap VPSes and anything with 2-3 GB of RAM in total, convert it once (on any
+machine that has the f32 model) to Q8_0, which needs about 240 MB of RAM and a
+160 MB file:
+
+```bash
+neocortex quantize-model ~/.neocortex/models/UltraBERT-Embed-150M ~/.neocortex/models/UltraBERT-Embed-150M-q8
+export NEOCORTEX_MODEL_DIR=~/.neocortex/models/UltraBERT-Embed-150M-q8
+```
+
+Copy that directory (`model.q8_0.gguf`, `config.json`, `tokenizer.json`) to the
+device instead of the f32 one; a directory without `model.safetensors` is
+picked up as q8 automatically. `NEOCORTEX_EMBED_DTYPE=f32|q8|q4k` forces a
+choice. q8 vectors have cosine >= 0.998 to the f32 ones, so a database built
+with one dtype is queried correctly with the other. `q4k` (100 MB) is lossier
+(mean cosine 0.95) and counts as a different embedder.
+
 The model is loaded lazily: the MCP server starts immediately and loads it on
 the first `remember`/`recall`. For tests and wiring checks you can skip the
 model entirely:
@@ -95,7 +114,7 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 --until --as-of --history --entities --keywords`.
 
 Every CLI invocation loads the embedder before it answers: the tokenizer parse
-plus the safetensors copies cost about half a second of CPU, so a run of
+plus reading the weights cost about a second of CPU, so a run of
 one-off commands pays it each time. An agent that stays in the store for a
 session should start `neocortex mcp` once and keep that process resident; a
 unix-socket `serve` mode was considered and is not provided, because the MCP
@@ -327,6 +346,7 @@ of supporting-hop memories on the multi-hop world (0.965 -> 0.816), and adds
 |---|---|---|
 | `NEOCORTEX_DB` | `~/.neocortex/neocortex.db` | database file (`--db` overrides) |
 | `NEOCORTEX_MODEL_DIR` | `~/.neocortex/models/UltraBERT-Embed-150M` | embedding model directory |
+| `NEOCORTEX_EMBED_DTYPE` | `f32` if `model.safetensors` exists, else `q8` | weight file: `f32` (`model.safetensors`), `q8` (`model.q8_0.gguf`) or `q4k` (`model.q4_k.gguf`) |
 | `NEOCORTEX_TZ` | system local offset | offset for relative dates and displayed dates, `+HH:MM` or `Z` |
 | `NEOCORTEX_MAX_TOKENS` | `1024` | max tokens per embedding |
 | `NEOCORTEX_EMBEDDER` | unset | `hash` selects the deterministic test embedder |
