@@ -5,6 +5,7 @@
 use crate::db::Db;
 use crate::embed::Embedder;
 use crate::error::Result;
+use crate::rerank::{LazyReranker, Reranker};
 use crate::temporal::Clock;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,16 @@ pub struct Config {
     pub update_candidate: f32,
     /// Trained hop scorer for the semantic beam: "off" (cosine residual) or "on".
     pub hop_scorer: String,
+    /// Rerank the top N fused memory candidates with the cross-encoder
+    /// (0 = off). Without a model directory `recall` ignores it.
+    pub rerank_top: usize,
+    /// Share of the cross-encoder's sigmoid in the blended candidate score
+    /// (0 = fused order, 1 = cross-encoder order).
+    pub w_rerank: f64,
+    /// Cosine at/above which a chain's last hop is taken to answer the
+    /// question's wh-frame. Below it `recall` returns `next` hints naming the
+    /// bridge entity to `follow`. 0 disables hints.
+    pub hint_tau: f32,
 }
 
 impl Default for Config {
@@ -157,6 +168,9 @@ impl Default for Config {
             fact_memory_seed: 0.0,
             update_candidate: 0.75,
             hop_scorer: "off".to_string(),
+            rerank_top: 0,
+            w_rerank: 0.5,
+            hint_tau: 0.40,
         }
     }
 }
@@ -164,6 +178,8 @@ impl Default for Config {
 pub struct Engine {
     pub db: Db,
     pub emb: Arc<dyn Embedder>,
+    /// Optional cross-encoder; loads lazily and only when `cfg.rerank_top > 0`.
+    pub reranker: Arc<dyn Reranker>,
     pub cfg: Config,
     /// Fixed "now" for tests/eval; None = system clock.
     pub fixed_clock: Option<Clock>,
@@ -175,6 +191,7 @@ impl Engine {
         Ok(Engine {
             db: Db::open(path)?,
             emb,
+            reranker: Arc::new(LazyReranker::new()),
             cfg: Config::default(),
             fixed_clock: None,
             snapshot_cache: Mutex::new(None),
@@ -185,10 +202,16 @@ impl Engine {
         Ok(Engine {
             db: Db::open_in_memory()?,
             emb,
+            reranker: Arc::new(LazyReranker::new()),
             cfg: Config::default(),
             fixed_clock: None,
             snapshot_cache: Mutex::new(None),
         })
+    }
+
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Engine {
+        self.reranker = reranker;
+        self
     }
 
     pub fn with_clock(mut self, clock: Clock) -> Engine {
@@ -409,6 +432,10 @@ pub struct MemoryHit {
     pub score: f64,
     /// e.g. ["bm25#2", "vec#1", "graph#1", "time"]
     pub reasons: Vec<String>,
+    /// Set when the query asks for a duration: "3 years 2 months" or
+    /// "ongoing since 2023-04-01".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -432,6 +459,10 @@ pub struct FactHit {
     /// The newer relation that ended this one, as (id, fact).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaced_by: Option<(i64, String)>,
+    /// Set when the query asks for a duration: "3 years 2 months" or
+    /// "ongoing since 2023-04-01".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -460,6 +491,11 @@ pub struct RecallOutput {
     pub memories: Vec<MemoryHit>,
     pub facts: Vec<FactHit>,
     pub entities: Vec<EntityCard>,
+    /// One more hop the caller can walk itself: the bridge entity `follow` should
+    /// start from and the relation or question words to ask for. At most two,
+    /// omitted when the returned context already covers the question.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub next: Vec<NextHop>,
     /// Matched time window, if the query had one: (start, end, text).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<(i64, i64, String)>,
@@ -475,6 +511,19 @@ pub struct RecallOutput {
     /// The top item alone exceeds the budget.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub over_budget: bool,
+}
+
+/// One hop `recall` could not finish, addressed precisely enough for a single
+/// `follow` call: the bridge entity and the words to ask it for.
+#[derive(Clone, Debug, Serialize)]
+pub struct NextHop {
+    /// Entity id as `follow.from` accepts it, e.g. "e151".
+    pub entity: String,
+    pub name: String,
+    /// Relation or question words to pass as `follow.predicate`.
+    pub want: String,
+    /// Why this hop is the missing one, e.g. "chain ends at a person".
+    pub why: String,
 }
 
 // ---------------------------------------------------------------- others

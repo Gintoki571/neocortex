@@ -57,6 +57,8 @@ const RETRACTIONS: &[(&[&str], &str)] = &[
     (&["left"], "work at"),
     (&["moved", "out", "of"], "live in"),
     (&["broke", "up", "with"], "married to"),
+    (&["split", "up", "with"], "married to"),
+    (&["separated", "from"], "married to"),
     (&["divorced"], "married to"),
     (&["sold"], "own"),
     (&["stopped", "using"], "use"),
@@ -72,6 +74,201 @@ const RETRACTIONS: &[(&[&str], &str)] = &[
 const RETRACTION_BREAKS: &[&str] = &[
     "and", "but", "because", "while", "although", "though", "who", "which", "that",
 ];
+
+/// A determiner between the cue and a name makes the name part of a longer
+/// noun phrase ("the Acme office"), so it is not the object of the cue.
+const OBJECT_DETERMINERS: &[&str] = &[
+    "the", "a", "an", "some", "any", "his", "her", "their", "its", "my", "our", "your", "this",
+    "that", "these", "those",
+];
+
+/// Followers that end the object with a clause boundary.
+const CLAUSE_FOLLOWERS: &[&str] = &["and", "but", "then"];
+
+/// Calendar and clock words a time expression may start with or contain.
+const TIME_WORDS: &[&str] = &[
+    "yesterday",
+    "today",
+    "tomorrow",
+    "tonight",
+    "ago",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "sept",
+    "oct",
+    "nov",
+    "dec",
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "year",
+    "years",
+    "hour",
+    "hours",
+    "minute",
+    "minutes",
+    "spring",
+    "summer",
+    "autumn",
+    "fall",
+    "winter",
+    "noon",
+    "midnight",
+    "night",
+    "morning",
+    "evening",
+    "afternoon",
+];
+
+/// Hedges and modality in the clause before the cue: the sentence reports a
+/// belief, a plan or a near miss, so the fact is not ended. The relation is
+/// offered as a conflict candidate instead.
+const HEDGES: &[&str] = &[
+    "almost",
+    "nearly",
+    "might",
+    "may",
+    "could",
+    "would",
+    "should",
+    "plans",
+    "plan",
+    "planned",
+    "wants",
+    "want",
+    "considering",
+    "thinking",
+    "thought",
+    "if",
+    "unless",
+    "rumoured",
+    "rumored",
+    "reportedly",
+    "thinks",
+    "think",
+    "believes",
+    "believe",
+    "said",
+    "says",
+    "say",
+    "hopes",
+    "hope",
+];
+
+/// How the object of a cue ends. Only the first three make the name the whole
+/// object; `Noun` means the name continues into a noun phrase or is a
+/// ditransitive object ("the Acme office", "Acme's parking lot", "left Acme a
+/// voicemail"), and the sentence retracts nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObjectTail {
+    /// End of sentence, punctuation, or a clause boundary ("and", "but").
+    Boundary,
+    /// A time expression ("last month", "in June", "yesterday", "at 5pm").
+    Time,
+    /// An employment move ("to join Globex", "for Globex", "for good").
+    Employment,
+    /// The name continues into a noun phrase.
+    Noun,
+}
+
+/// Classify what follows the object. Rule 1 of the retraction contract: the
+/// object span must be the whole object of the cue.
+fn object_tail(
+    lower: &str,
+    object_end: usize,
+    words: &[(usize, usize, &str)],
+    next: usize,
+    group: &str,
+    spans: &[(usize, usize, String)],
+) -> ObjectTail {
+    let rest = &lower[object_end..];
+    // A possessive continues the noun phrase ("Acme's parking lot").
+    if rest.starts_with("'s") || rest.starts_with('\u{2019}') {
+        return ObjectTail::Noun;
+    }
+    let Some(&(start, _, word)) = words.get(next) else {
+        return ObjectTail::Boundary;
+    };
+    if start < object_end
+        || rest[..start - object_end]
+            .chars()
+            .any(|c| !c.is_whitespace())
+    {
+        // Punctuation right after the name closes the object.
+        return ObjectTail::Boundary;
+    }
+    if CLAUSE_FOLLOWERS.contains(&word) {
+        return ObjectTail::Boundary;
+    }
+    if time_tail(words, next) {
+        return ObjectTail::Time;
+    }
+    match (word, words.get(next + 1).map(|w| w.2)) {
+        ("for", Some("good")) | ("to", Some("join")) => ObjectTail::Employment,
+        ("for", Some(_))
+            if group == "work at" && spans.iter().any(|(s, _, _)| *s == words[next + 1].0) =>
+        {
+            ObjectTail::Employment
+        }
+        _ => ObjectTail::Noun,
+    }
+}
+
+/// True when the word at `i` starts a time expression. `at` needs a clock
+/// time, so "at the station" stays a noun phrase.
+fn time_tail(words: &[(usize, usize, &str)], i: usize) -> bool {
+    let word = words[i].2;
+    let next = words.get(i + 1).map(|w| w.2);
+    match word {
+        "yesterday" | "today" | "tomorrow" | "tonight" | "ago" => true,
+        "last" | "this" | "next" => next.is_some_and(|n| TIME_WORDS.contains(&n)),
+        "in" | "on" => {
+            next.is_some_and(|n| TIME_WORDS.contains(&n) || n.chars().all(|c| c.is_ascii_digit()))
+        }
+        "at" => next.is_some_and(|n| {
+            n.chars().any(|c| c.is_ascii_digit())
+                || matches!(
+                    n,
+                    "noon" | "midnight" | "night" | "morning" | "evening" | "afternoon"
+                )
+        }),
+        _ => false,
+    }
+}
+
+/// True when the clause from word `from` up to the cue hedges, plans or
+/// reports the event.
+fn hedged(words: &[(usize, usize, &str)], from: usize, cue: usize) -> bool {
+    words[from..cue].iter().any(|w| HEDGES.contains(&w.2))
+}
 
 fn words_of(text: &str) -> Vec<String> {
     text.split_whitespace()
@@ -182,6 +379,319 @@ fn cue_before(words: &[String], verb_pos: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// A retraction the text states without agent-supplied relations: the
+/// sentence names a subject and an object, and the phrase maps to a group.
+struct TextRetraction {
+    subject: String,
+    object: String,
+    group: &'static str,
+    /// The sentence hedges or reports the event: offer the relation as a
+    /// conflict candidate, never end it.
+    candidate: bool,
+}
+
+/// Spans where a name occurs as whole words in the content, as
+/// (start, end, normalized name). The name is lower-cased first, so offsets
+/// index the lower-cased copy used by the caller.
+fn name_spans(
+    content: &str,
+    names: impl IntoIterator<Item = String>,
+) -> Vec<(usize, usize, String)> {
+    let lower = content.to_lowercase();
+    let mut spans = Vec::new();
+    for name in names {
+        let needle = name.to_lowercase();
+        let norm = text::norm_name(&name);
+        if needle.is_empty() || norm.is_empty() {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(&needle) {
+            let start = from + rel;
+            let end = start + needle.len();
+            let before = lower[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+            let after = lower[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric());
+            if before && after {
+                spans.push((start, end, norm.clone()));
+            }
+            from = end;
+        }
+    }
+    spans
+}
+
+/// Every name span in the text that names a known entity: this memory's
+/// entities, the heuristic proper-noun spans (so a sentence-initial name is
+/// not lost), and alias n-grams already in the gazetteer.
+fn retraction_spans(
+    db: &Db,
+    content: &str,
+    entities: &[EntityIn],
+) -> Result<Vec<(usize, usize, String)>> {
+    let mut names: Vec<String> = entities.iter().map(|e| e.name.clone()).collect();
+    names.extend(
+        extract::heuristic_entities(content)
+            .into_iter()
+            .map(|c| c.name),
+    );
+    let mut spans = name_spans(content, names);
+    for (norm, start, end) in extract::ngrams(content, 4) {
+        if norm.chars().count() < 3 {
+            continue;
+        }
+        let known: bool = db.sql().query_row(
+            "SELECT EXISTS(SELECT 1 FROM entity_aliases WHERE alias_norm=?1)",
+            [&norm],
+            |r| r.get(0),
+        )?;
+        if known {
+            spans.push((start, end, norm));
+        }
+    }
+    // Longest span first at the same start, so "New York City" beats "New".
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    spans.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+    Ok(spans)
+}
+
+/// Retractions stated by a text-only memory. The object is the first named
+/// entity after the phrase (or "there" points back); the subject is the
+/// nearest named entity before it, falling back to the subject of an earlier
+/// clause whose object it was ("Alice moved out of Austin and broke up with
+/// Bob" shares Alice).
+fn text_retractions(content: &str, spans: &[(usize, usize, String)]) -> Vec<TextRetraction> {
+    let lower = content.to_lowercase();
+    let words: Vec<(usize, usize, &str)> = {
+        let mut out = Vec::new();
+        let mut start = None;
+        for (i, ch) in lower.char_indices() {
+            if ch.is_alphanumeric() {
+                start.get_or_insert(i);
+            } else if let Some(s) = start.take() {
+                out.push((s, i, &lower[s..i]));
+            }
+        }
+        if let Some(s) = start {
+            out.push((s, lower.len(), &lower[s..]));
+        }
+        out
+    };
+    let mut found: Vec<(usize, TextRetraction)> = Vec::new();
+    for (phrase, group) in RETRACTIONS {
+        let plen = phrase.len();
+        if plen == 0 || words.len() < plen {
+            continue;
+        }
+        for p in 0..=words.len() - plen {
+            if !words[p..p + plen]
+                .iter()
+                .map(|w| w.2)
+                .eq(phrase.iter().copied())
+            {
+                continue;
+            }
+            let phrase_start = words[p].0;
+            let phrase_end = words[p + plen - 1].1;
+            let max_end = words.get(p + plen + 2).map(|w| w.1).unwrap_or(usize::MAX);
+            let mut object_span = spans
+                .iter()
+                .find(|(s, _, _)| *s >= phrase_end && *s <= max_end)
+                .cloned();
+            if object_span.is_none() && words.iter().skip(p + plen).take(4).any(|w| w.2 == "there")
+            {
+                object_span = spans
+                    .iter()
+                    .rev()
+                    .find(|(_, e, _)| *e <= phrase_start)
+                    .cloned();
+            }
+            let Some((object_start, object_end, object)) = object_span else {
+                continue;
+            };
+            let mut candidate = false;
+            if object_start >= phrase_end {
+                // A span may start before the name it normalises to ("the
+                // Acme" from the alias n-grams), so the gap and the tail are
+                // measured from different edges.
+                let gap_end = words.partition_point(|w| w.0 < object_start);
+                let next_word = words.partition_point(|w| w.0 < object_end);
+                // Rule 1: a determiner between the cue and the name means the
+                // name is inside a longer noun phrase, not the object.
+                if words[p + plen..gap_end]
+                    .iter()
+                    .any(|w| OBJECT_DETERMINERS.contains(&w.2))
+                {
+                    continue;
+                }
+                // Rules 1+2: the object must be the whole object. A bare
+                // "left" also means "departed from" or "left behind", so it
+                // ends nothing unless a clause boundary, a time expression or
+                // an employment tail follows (rule 4).
+                if object_tail(&lower, object_end, &words, next_word, group, spans)
+                    == ObjectTail::Noun
+                {
+                    continue;
+                }
+                // Rule 3: a hedge or report before the cue ("almost quit",
+                // "thinks Bob left") is a candidate, not an end.
+                let clause = lower[..phrase_start]
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| matches!(c, '.' | ';' | '!' | '?' | '\n'))
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                let from = words.partition_point(|w| w.0 < clause);
+                candidate = hedged(&words, from, p);
+            }
+            let min_start = words.get(p.saturating_sub(10)).map(|w| w.0).unwrap_or(0);
+            let Some(subject) = spans
+                .iter()
+                .rev()
+                .find(|(s, e, name)| *e <= phrase_start && *s >= min_start && *name != object)
+                .map(|(_, _, name)| name.clone())
+            else {
+                continue;
+            };
+            found.push((
+                phrase_start,
+                TextRetraction {
+                    subject,
+                    object,
+                    group,
+                    candidate,
+                },
+            ));
+        }
+    }
+    found.sort_by_key(|(pos, _)| *pos);
+    let mut out: Vec<TextRetraction> = Vec::new();
+    let mut subject_of_object: HashMap<String, String> = HashMap::new();
+    for (_, mut retraction) in found {
+        // An elided subject after "and" is the subject of the clause whose
+        // object it repeats: "Alice left Acme and broke up with Bob".
+        if let Some(shared) = subject_of_object.get(&retraction.subject) {
+            if *shared != retraction.object {
+                retraction.subject = shared.clone();
+            }
+        }
+        if retraction.subject == retraction.object {
+            continue;
+        }
+        subject_of_object.insert(retraction.object.clone(), retraction.subject.clone());
+        if let Some(seen) = out.iter_mut().find(|r| {
+            r.subject == retraction.subject
+                && r.object == retraction.object
+                && r.group == retraction.group
+        }) {
+            // A plain statement of the same retraction outranks a hedged one.
+            seen.candidate &= retraction.candidate;
+        } else {
+            out.push(retraction);
+        }
+    }
+    out
+}
+
+/// End the one live relation a text-only retraction names. Exactly one match
+/// ends; several matches are reported as conflict candidates and nothing is
+/// ended.
+fn end_text_retractions(
+    db: &Db,
+    content: &str,
+    entities: &[EntityIn],
+    at: i64,
+    now: i64,
+    invalidated: &mut Vec<i64>,
+    conflicts: &mut Vec<crate::engine::Conflict>,
+) -> Result<()> {
+    // Most text-only memories state nothing retracted; skip the alias scan.
+    let words = words_of(content);
+    let has_cue = RETRACTIONS.iter().any(|(phrase, _)| {
+        phrase.len() <= words.len()
+            && words
+                .windows(phrase.len())
+                .any(|window| window.iter().map(String::as_str).eq(phrase.iter().copied()))
+    });
+    if !has_cue {
+        return Ok(());
+    }
+    let spans = retraction_spans(db, content, entities)?;
+    for retraction in text_retractions(content, &spans) {
+        let group_id: Option<i64> = if retraction.group.is_empty() {
+            None
+        } else {
+            let id = db
+                .sql()
+                .query_row(
+                    "SELECT id FROM predicates WHERE canonical=?1",
+                    [retraction.group],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match id {
+                Some(id) => Some(id),
+                // The group is not in this database's ontology.
+                None => continue,
+            }
+        };
+        let mut st = db.sql().prepare(
+            "SELECT r.id,r.fact,r.valid_from FROM relations r
+             JOIN predicates p ON p.id=r.predicate_id
+             JOIN entities s ON s.id=r.src
+             JOIN entities d ON d.id=r.dst
+             WHERE r.expired_at IS NULL AND r.polarity=1
+               AND ((s.norm=?1 AND d.norm=?2) OR (s.norm=?2 AND d.norm=?1))
+               AND r.valid_from<=?3 AND (r.valid_to IS NULL OR r.valid_to>?3)
+               AND (?4 IS NULL OR COALESCE(NULLIF(p.group_id,0),p.id)=?4)",
+        )?;
+        let rows: Vec<(i64, String, i64)> = st
+            .query_map(
+                params![retraction.subject, retraction.object, at, group_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        match rows.as_slice() {
+            [(rid, _, old_from)] if !retraction.candidate => {
+                if *old_from >= at {
+                    // Same instant: the retraction is a correction, so the
+                    // older row is system-retired rather than zero-length.
+                    db.sql().execute(
+                        "UPDATE relations SET valid_to=?1, expired_at=?2 WHERE id=?3",
+                        params![old_from, now, rid],
+                    )?;
+                } else {
+                    db.sql().execute(
+                        "UPDATE relations SET valid_to=?1 WHERE id=?2",
+                        params![at, rid],
+                    )?;
+                }
+                if !invalidated.contains(rid) {
+                    invalidated.push(*rid);
+                }
+            }
+            [] => {}
+            rows => {
+                for (rid, fact, valid_from) in rows {
+                    if !conflicts.iter().any(|c| c.relation_id == *rid) {
+                        conflicts.push(crate::engine::Conflict {
+                            relation_id: *rid,
+                            fact: fact.clone(),
+                            valid_from: *valid_from,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn check_embedder(db: &Db, emb: &dyn Embedder) -> Result<()> {
@@ -352,6 +862,16 @@ fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Resul
             crate::engine::KINDS.join(", ")
         ));
     }
+    // Future tense and recurrence are properties of the sentence, not of the
+    // clock: a plan gets a future start (or a `planned` tag), and a rule keeps
+    // its wording with a `recurring` tag.
+    let plan = temporal::plan_intent(&content, &clock);
+    let recurring = temporal::recurrence(&content);
+    let future_plan = if plan {
+        temporal::future_window(&content, &clock)
+    } else {
+        None
+    };
     // Without --when, a date written in the content is the start (one only).
     let (valid_from, span_end, when_inferred) = match inp.valid_from.as_deref() {
         Some(s) => match temporal::parse_span(s, &clock) {
@@ -367,6 +887,11 @@ fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Resul
                 (start, None, None)
             }
         },
+        None if plan => match future_plan {
+            Some(w) => (w.start, None, Some(w.matched)),
+            // A plan with no resolvable date is not a past event either.
+            None => (clock.now, None, None),
+        },
         // A future date in a decision/note is the subject's date, not when the
         // memory became true; only events are dated in the future.
         None => match temporal::text_date(&content, &clock) {
@@ -374,6 +899,9 @@ fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Resul
             _ => (clock.now, None, None),
         },
     };
+    // A plan stated in the text, or anything dated after now, has not happened
+    // yet: recall keeps it out of current answers until its date arrives.
+    let planned = (plan && inp.valid_from.is_none()) || valid_from > clock.now;
     let valid_to = inp
         .valid_to
         .as_deref()
@@ -407,6 +935,12 @@ fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Resul
         .map(|x| text::fold(x))
         .filter(|x| !x.is_empty())
         .collect();
+    if planned {
+        tags.push("planned".into());
+    }
+    if recurring {
+        tags.push("recurring".into());
+    }
     tags.sort();
     tags.dedup();
     let tags = tags.join(" ");
@@ -1085,6 +1619,20 @@ fn write_prepared(
                 "new".into()
             },
         });
+    }
+    // Text-only memories can still retract a fact ("Ivan left Acme") when the
+    // agent supplied no relations: end the one live relation the sentence
+    // names, or report candidates when the pair is ambiguous.
+    if relations.is_empty() && duplicate_of.is_none() {
+        end_text_retractions(
+            db,
+            &content,
+            &entities,
+            valid_from,
+            now,
+            &mut invalidated,
+            &mut conflicts,
+        )?;
     }
     // A memory with an end (--until) ends the relations only it keeps current.
     if let (None, Some(to)) = (duplicate_of, valid_to) {

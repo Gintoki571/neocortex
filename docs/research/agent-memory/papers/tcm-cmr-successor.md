@@ -1,0 +1,23 @@
+# Temporal context model (TCM) / CMR and its identity with the successor representation (Howard & Kahana 2002; Polyn, Norman, Kahana 2009; Gershman et al. 2012)
+Sources read: Gershman, Moore, Todd, Norman, Sederberg 2012, "The successor representation and temporal context" (https://gershmanlab.com/pubs/Gershman12.pdf, Sec 4, eq 4.1-4.3); Howard 2004 "Scaling behavior in the temporal context model" (https://sites.bu.edu/tcn/files/2015/12/Howard04-JMP.pdf). The original Howard & Kahana 2002 and Polyn 2009 PDFs were not fetchable; their equations are quoted through these two.
+
+**Problem it solves.** Why free recall shows the **contiguity effect** (after recalling item n, the next recalled item is most likely n+1 or n-1) and the **forward asymmetry** (forward transitions more frequent), and the **recency effect**, with one mechanism.
+
+**Equations (exact).**
+- Context drift: `t_n = rho * t_{n-1} + f_n` (Gershman 4.1, unnormalised); the original TCM form (Howard 2004, Eq 1-4): `t_i = rho_i t_{i-1} + beta t_i^IN` with `0 < beta < 1` and `rho_i` chosen each step so that `||t_i|| = 1`; when input vectors are orthonormal `rho = sqrt(1 - beta^2)` (Eq 3, exponent garbled in the extracted text) and **context similarity decays geometrically with lag: `t_i . t_j = rho^|i-j|`** (Eq 4). `f_n`/`t^IN` = item vector.
+- Hebbian binding of item to the context present at study: `M_ij <- M_ij + alpha * f_{n+1,j} * t_{n,i}` (4.2): an outer-product item-context matrix.
+- Retrieval: the current context (or the retrieved context of the item just recalled) is the cue; the item with the largest `M * cue` wins; because the retrieved item reinstates the context it was *studied in*, neighbours on both sides are cued, with a forward bias because the studied context at time n contains items before n but the item itself adds the future-side context (Gershman Sec 2).
+- Identity with RL: with `rho = lambda * gamma`, the TCM update equals TD(lambda) learning of the **successor representation** `M(s,s') = E[sum_t gamma^t 1(s_t = s') | s_0 = s]` (Gershman 4.3; Stachenfeld 2017 Eq 3, 6: `M = (I - gamma T)^-1`). Context vector = eligibility trace.
+
+**What an SQLite + embedding system implements (LLM-free).**
+1. **Context vector per stream.** Maintain `c_t = rho * c_{t-1} + (1-rho) * e_t` over the embeddings `e_t` of memories as they are written, per session/agent stream (a 768-d float row in a `contexts` table, or only the running vector in memory). Store, with each memory, the context vector *at write time*: `context_vec` (one more vec0 column) — this binds the item to the temporal context.
+2. **Context-aware recall.** At query time form `c_q = rho * c_now + (1-rho) * e_query`; add a retrieval channel: KNN of `c_q` against stored `context_vec`s, fused by RRF. This brings back memories written in a similar episode/period even if the query shares no words with them (the "what else happened around then" cue; temporal reasoning over months when `rho` is slow).
+3. **Chained recall (contiguity).** After retrieving memory m, cue with *m's stored context vector* (not its content) to fetch its temporal neighbours, forward-weighted: this is EM-LLM's contiguity buffer made principled. The existing `temporal_link_ids` (`recall.rs:104`) approximates it with fixed neighbours; test forward weight > backward weight.
+4. Multi-timescale: keep several `rho` (e.g., 0.5, 0.9, 0.99: minutes, days, months) as separate context columns (Howard 2004's scale-invariant variant uses a spectrum of rates) — retrieval at the right timescale for "last week" vs "last spring".
+5. SR as learned association strength between entities: TD(lambda) update per observed consecutive mention pair; gives PPR-like scores incrementally (`ppr-successor-equivalence.md`).
+
+**Evidence.** Free-recall data (contiguity, asymmetry, recency) across many studies (Gershman Fig 1; Howard & Kahana). For LLM agents: EM-LLM adopts the contiguity buffer and reports gains on long-context tasks (`em-llm.md`); no agent-memory benchmark in this review ablates a context-drift channel directly. (inference) It would help questions of the form "what was going on when X happened" and temporal ordering, not single-fact lookup.
+
+**Weak / wrong.** Parameters (rho, beta) fitted to word-list free recall of seconds-minutes; unit-norm drift in 768-d embedding space blurs content (item embeddings are not orthogonal like the one-hot items TCM assumes), so the integrated vector is a smeared average; needs the experiment to choose rho.
+
+**What neocortex could steal, concretely.** A `context_vec` column written in `remember.rs::write_prepared` and a context-similarity RRF channel plus forward-biased chaining in `recall.rs` (replacing fixed neighbours in `temporal_link_ids`). No LLM.
