@@ -132,6 +132,26 @@ CREATE TABLE IF NOT EXISTS similar (
 );
 CREATE INDEX IF NOT EXISTS idx_similar_b ON similar(b);
 
+-- B5: entity name tokens, one row per (token, entity), derived from
+-- entities.norm. Drives the indexed containment lookup on entity insert.
+CREATE TABLE IF NOT EXISTS name_tokens (
+  token TEXT NOT NULL,
+  entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  PRIMARY KEY (token, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_name_tokens_entity ON name_tokens(entity_id);
+
+-- B5: name-containment links ("Cascais marina" contains "Cascais"), a < b.
+-- A weak undirected edge for the semantic beam and PPR.
+CREATE TABLE IF NOT EXISTS name_part (
+  a INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  b INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  weight REAL NOT NULL,
+  PRIMARY KEY (a, b),
+  CHECK (a < b)
+);
+CREATE INDEX IF NOT EXISTS idx_name_part_b ON name_part(b);
+
 CREATE TABLE IF NOT EXISTS communities (
   entity_id INTEGER PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
   community INTEGER NOT NULL,

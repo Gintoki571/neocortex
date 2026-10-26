@@ -427,6 +427,10 @@ pub(crate) const SEM_FACTS: usize = 100;
 const SEM_EDGES: usize = 6;
 /// Score factor for a hop through a text-only memory.
 const PROSE_HOP: f64 = 0.8;
+/// Score factor for a hop through a name-containment link (B5): the write
+/// path stores the same weight, and it stays below a stated relation and
+/// below prose. Such a hop carries no fact, only the next entity.
+pub(crate) const NAME_PART_HOP: f64 = 0.6;
 /// Target of a hop through a memory that names no other entity.
 const NO_ENTITY: i64 = -1;
 
@@ -483,6 +487,11 @@ fn entity_degree(db: &Db, id: i64, cache: &mut HashMap<i64, f64>) -> f64 {
     v
 }
 
+/// `Config.name_part_hop` is on: finite and positive.
+pub(crate) fn name_hop_on(name_hop: f64) -> bool {
+    name_hop.is_finite() && name_hop > 0.0
+}
+
 /// Semantic twin of [`search`] for questions that paraphrase the stored
 /// predicates ("who guides Noor's career" vs `mentors`): hops may only use
 /// relations among the question's nearest facts. Each hop is scored against
@@ -500,6 +509,7 @@ pub(crate) fn search_semantic(
     nearest_memories: &[i64],
     vis: Visibility,
     use_scorer: bool,
+    name_hop: f64,
 ) -> Result<Vec<PathHit>> {
     if seeds.is_empty() {
         return Ok(Vec::new());
@@ -576,6 +586,21 @@ pub(crate) fn search_semantic(
          FROM relations r JOIN predicates p ON p.id=r.predicate_id
          WHERE (r.src=?1 OR r.dst=?1) AND r.polarity=1",
     )?;
+    // B5: containment links are weak hops ("Aveiro" -> "Hackerspace Aveiro"),
+    // scored by the target entity's own card vector. Loaded once: the beam
+    // visits hundreds of entities and a per-entity query costs ~14% of p50.
+    let mut name_parts: HashMap<i64, Vec<i64>> = HashMap::new();
+    if name_hop_on(name_hop) {
+        let mut st = db.sql().prepare("SELECT a,b FROM name_part")?;
+        for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+            let (a, b) = row?;
+            name_parts.entry(a).or_default().push(b);
+            name_parts.entry(b).or_default().push(a);
+        }
+    }
+    let mut entity_vector_st = db
+        .sql()
+        .prepare_cached("SELECT embedding FROM entities_vec WHERE rowid=?1")?;
     let mut vector_st = db
         .sql()
         .prepare_cached("SELECT embedding FROM memories_vec WHERE rowid=?1")?;
@@ -670,6 +695,32 @@ pub(crate) fn search_semantic(
                 ));
             }
         }
+        for &other in name_parts.get(&entity).into_iter().flatten() {
+            if other == entity {
+                continue;
+            }
+            let Some(vector) = entity_vector_st
+                .query_row([other], |r| r.get::<_, Vec<u8>>(0))
+                .optional()?
+                .and_then(|blob| db.blob_to_vec(&blob))
+            else {
+                continue;
+            };
+            out.push((
+                Step {
+                    relation_id: 0,
+                    src: entity,
+                    dst: other,
+                    predicate: String::new(),
+                    fact: String::new(),
+                    reverse: false,
+                    matched: 0,
+                    memory: None,
+                },
+                other,
+                vector,
+            ));
+        }
         out.truncate(64);
         cache.insert(entity, out.clone());
         Ok(out)
@@ -693,9 +744,17 @@ pub(crate) fn search_semantic(
                 // through one: that walk lists sibling facts about the anchor.
                 .filter(|(_, other, _)| !visited.contains(other) && !anchors.contains(other))
                 .map(|(step, other, vector)| {
-                    // Prose is weaker evidence of a link than a stated relation.
+                    // Prose is weaker evidence of a link than a stated
+                    // relation; a containment hop carries no fact at all.
                     let prose = step.memory.is_some();
-                    let weight = if prose { PROSE_HOP } else { 1.0 };
+                    let containment = step.relation_id == 0 && !prose;
+                    let weight = if containment {
+                        name_hop
+                    } else if prose {
+                        PROSE_HOP
+                    } else {
+                        1.0
+                    };
                     let cos_residual = f64::from(crate::rank::cosine(residual, &vector));
                     let cosine = weight * cos_residual;
                     // Features cost a degree lookup per entity: built only when used.
@@ -924,6 +983,8 @@ pub(crate) fn evidence(db: &Db, hits: &[PathHit]) -> Result<Vec<i64>> {
             let weight = base * if position == last { 3.0 } else { 1.0 };
             let ids: Vec<i64> = match step.memory {
                 Some(memory_id) => vec![memory_id],
+                // A containment hop is a link between names, not evidence.
+                None if step.relation_id == 0 => continue,
                 None => st
                     .query_map([step.relation_id], |r| r.get::<_, i64>(0))?
                     .collect::<rusqlite::Result<_>>()?,
@@ -956,6 +1017,10 @@ pub(crate) fn facts(db: &Db, hits: &[PathHit], cutoff: i64, limit: usize) -> Res
     let mut out = Vec::new();
     for hit in hits {
         for step in hit.steps.iter().rev() {
+            // Prose and containment hops carry no relation to render.
+            if step.relation_id == 0 {
+                continue;
+            }
             if !seen.insert(step.relation_id) {
                 continue;
             }
@@ -1519,5 +1584,147 @@ mod tests {
             .map(|h| h.steps[0].relation_id)
             .collect();
         assert_eq!(only, vec![1, 2]);
+    }
+}
+
+/// B5: the semantic beam walks a containment link as a weak hop, so a
+/// question seeded on a place reaches the memory that names the compound
+/// ("Aveiro" -> "Hackerspace Aveiro" -> the memory).
+#[cfg(test)]
+mod name_part_tests {
+    use super::{evidence, search_semantic, Visibility, NAME_PART_HOP};
+    use crate::db::Db;
+    use rusqlite::params;
+
+    fn vector(axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; 768];
+        v[axis] = 1.0;
+        v
+    }
+
+    fn entity(db: &Db, name: &str, kind: &str, axis: usize) -> i64 {
+        db.sql()
+            .execute(
+                "INSERT INTO entities(name,norm,type,homonym,created_at,updated_at)
+                 VALUES (?1,?1,?2,0,0,0)",
+                params![name, kind],
+            )
+            .unwrap();
+        let id = db.sql().last_insert_rowid();
+        db.sql()
+            .execute(
+                "INSERT INTO entities_vec(rowid,embedding) VALUES (?1,?2)",
+                params![id, db.vec_blob(&vector(axis))],
+            )
+            .unwrap();
+        id
+    }
+
+    fn memory(db: &Db, content: &str, axis: usize) -> i64 {
+        db.sql()
+            .execute(
+                "INSERT INTO memories(content,kind,tags,importance,created_at,valid_from,content_hash)
+                 VALUES (?1,'fact','',0.5,0,0,?1)",
+                params![content],
+            )
+            .unwrap();
+        let id = db.sql().last_insert_rowid();
+        db.sql()
+            .execute(
+                "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,?2,1)",
+                params![id, db.vec_blob(&vector(axis))],
+            )
+            .unwrap();
+        id
+    }
+
+    fn mention(db: &Db, memory: i64, entity: i64) {
+        db.sql()
+            .execute(
+                "INSERT INTO mentions(memory_id,entity_id) VALUES (?1,?2)",
+                params![memory, entity],
+            )
+            .unwrap();
+    }
+
+    /// Seed `Aveiro`, one prose memory naming `Hackerspace Aveiro`, and the
+    /// containment row the write path would have written.
+    fn fixture() -> (Db, i64, i64) {
+        let db = Db::open_in_memory().unwrap();
+        let aveiro = entity(&db, "aveiro", "place", 0);
+        let space = entity(&db, "hackerspace aveiro", "org", 0);
+        let m = memory(&db, "Hackerspace Aveiro meets on Fridays.", 0);
+        mention(&db, m, space);
+        (db, aveiro, space)
+    }
+
+    fn hits(db: &Db, seed: i64) -> Vec<super::PathHit> {
+        let query = vector(0);
+        let vis = Visibility {
+            now: 0,
+            as_of: None,
+            history: false,
+        };
+        search_semantic(
+            db,
+            "who meets in Aveiro",
+            &query,
+            &[seed],
+            &[seed],
+            true,
+            &[1],
+            vis,
+            false,
+            NAME_PART_HOP,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_containment_link_carries_the_beam_to_the_compound_memory() {
+        let (db, aveiro, space) = fixture();
+        db.sql()
+            .execute(
+                "INSERT INTO name_part(a,b,weight) VALUES (?1,?2,0.6)",
+                params![aveiro.min(space), aveiro.max(space)],
+            )
+            .unwrap();
+        let hits = hits(&db, aveiro);
+        let chain = hits
+            .iter()
+            .find(|h| h.steps.len() == 2)
+            .unwrap_or_else(|| panic!("no two-hop chain: {hits:?}"));
+        assert_eq!(chain.steps[0].dst, space, "first hop is the containment");
+        assert_eq!(chain.steps[1].memory, Some(1));
+        assert_eq!(evidence(&db, &hits).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn without_the_link_the_beam_cannot_reach_the_compound() {
+        let (db, aveiro, _space) = fixture();
+        let hits = hits(&db, aveiro);
+        assert!(evidence(&db, &hits).unwrap().is_empty(), "{hits:?}");
+    }
+
+    #[test]
+    fn a_containment_hop_scores_below_a_relation_hop() {
+        let (db, aveiro, space) = fixture();
+        db.sql()
+            .execute(
+                "INSERT INTO name_part(a,b,weight) VALUES (?1,?2,0.6)",
+                params![aveiro.min(space), aveiro.max(space)],
+            )
+            .unwrap();
+        let hits = hits(&db, aveiro);
+        let chain = hits.iter().find(|h| h.steps.len() == 2).unwrap();
+        // The card and the question share one axis, so the containment hop
+        // scores its full weight and leaves no residual for the prose hop.
+        assert!(
+            (chain.score - NAME_PART_HOP).abs() < 1e-9,
+            "score {} should be the containment weight",
+            chain.score
+        );
+        const { assert!(NAME_PART_HOP < super::PROSE_HOP) };
+        const { assert!(super::PROSE_HOP < 1.0) };
     }
 }

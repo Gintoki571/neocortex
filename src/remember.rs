@@ -1229,6 +1229,7 @@ fn write_prepared(
         let eid = resolved.id;
         ids.insert(text::norm_name(&entity.name), eid);
         kg::project_entity_from_db(db, eid)?;
+        kg::project_name_parts(db, eid)?;
         add_mention(db, id, eid, now)?;
         for (other, _name, score) in &resolved.similar {
             write_similar(db, eid, *other, *score)?;
@@ -1890,6 +1891,7 @@ fn resolve_endpoint(
     )?;
     ids.insert(norm, resolved.id);
     kg::project_entity_from_db(db, resolved.id)?;
+    kg::project_name_parts(db, resolved.id)?;
     add_mention(db, memory, resolved.id, now)?;
     for (other, _name, score) in &resolved.similar {
         write_similar(db, resolved.id, *other, *score)?;

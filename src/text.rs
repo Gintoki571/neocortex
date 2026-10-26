@@ -73,15 +73,8 @@ fn push_ascii(out: &mut String, c: char) {
 /// (the, a, an, my, our, your, his, her, their), drop trailing "'s",
 /// singularise the last token. "The Houses" -> "house", "my bros" -> "bro".
 pub fn norm_name(s: &str) -> String {
-    const DETERMINERS: [&str; 9] = ["the", "a", "an", "my", "our", "your", "his", "her", "their"];
     let folded = fold(strip_possessive(s));
-    let mut words: Vec<String> = folded.split_whitespace().map(str::to_string).collect();
-    while words
-        .first()
-        .is_some_and(|w| DETERMINERS.contains(&w.as_str()))
-    {
-        words.remove(0);
-    }
+    let mut words = name_words(&folded);
     if words.is_empty() {
         return folded;
     }
@@ -91,7 +84,29 @@ pub fn norm_name(s: &str) -> String {
     words.join(" ")
 }
 
-fn strip_possessive(s: &str) -> &str {
+/// Sorted token set of a raw name with no singularising: "Novak Labs" never
+/// contains "Novak Lab Supplies". The B5 containment key.
+pub fn exact_name_tokens(name: &str) -> Vec<String> {
+    let mut words = name_words(&fold(strip_possessive(name)));
+    words.sort();
+    words.dedup();
+    words
+}
+
+/// Folded words of a name with leading determiners removed.
+fn name_words(folded: &str) -> Vec<String> {
+    const DETERMINERS: [&str; 9] = ["the", "a", "an", "my", "our", "your", "his", "her", "their"];
+    let mut words: Vec<String> = folded.split_whitespace().map(str::to_string).collect();
+    while words
+        .first()
+        .is_some_and(|w| DETERMINERS.contains(&w.as_str()))
+    {
+        words.remove(0);
+    }
+    words
+}
+
+pub(crate) fn strip_possessive(s: &str) -> &str {
     let trimmed = s.trim_end();
     for suffix in ["'s", "’s", "'S", "’S"] {
         if let Some(stem) = trimmed.strip_suffix(suffix) {
@@ -708,6 +723,19 @@ pub fn is_stopword(w: &str) -> bool {
 /// Folded word tokens (split on non-alphanumerics).
 pub fn tokens(s: &str) -> Vec<String> {
     fold(s).split_whitespace().map(str::to_string).collect()
+}
+
+/// The token set of a normalised name, sorted and deduplicated: the key of
+/// the B5 containment check ("cascais marina" -> ["cascais", "marina"]).
+pub fn name_tokens(norm: &str) -> Vec<String> {
+    let mut out: Vec<String> = norm
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Safe FTS5 MATCH expression: OR of quoted non-stopword tokens of `q` and

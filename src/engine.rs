@@ -73,6 +73,10 @@ pub struct Config {
     pub w_temporal: f64,
     /// RRF weight of semantic multi-hop paths (`paths::search_semantic`).
     pub w_sempath: f64,
+    /// Hop weight of B5 containment links in the semantic beam, and whether
+    /// `name_part` edges enter the PPR snapshot. 0 (or non-finite) ignores
+    /// them in both; the links are still written.
+    pub name_part_hop: f64,
     /// RRF weight of temporal memory-memory links (E4a); 0 disables the
     /// channel while the links are still written.
     pub w_tlink: f64,
@@ -154,6 +158,7 @@ impl Default for Config {
             w_graph: 1.5,
             w_temporal: 1.0,
             w_sempath: 0.25,
+            name_part_hop: crate::paths::NAME_PART_HOP,
             w_tlink: 0.0,
             tlink_window_hours: 24.0,
             tlink_cap: 20,
@@ -847,6 +852,34 @@ impl Engine {
                     rusqlite::params![lo, hi, score],
                 )?;
             }
+            // B5 containment links move the same way, and the survivor answers
+            // to the merged name's tokens.
+            let moved_parts: Vec<(i64, i64, f32)> = {
+                let mut st = db
+                    .sql()
+                    .prepare("SELECT a,b,weight FROM name_part WHERE a=?1 OR b=?1")?;
+                let rows = st.query_map([m], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            db.sql()
+                .execute("DELETE FROM name_part WHERE a=?1 OR b=?1", [m])?;
+            for (a, b, weight) in moved_parts {
+                let other = if a == m { b } else { a };
+                if other == k || other == m {
+                    continue;
+                }
+                let (lo, hi) = if other < k { (other, k) } else { (k, other) };
+                db.sql().execute(
+                    "INSERT INTO name_part(a,b,weight) VALUES (?1,?2,?3)
+                     ON CONFLICT(a,b) DO UPDATE SET weight=MAX(weight, excluded.weight)",
+                    rusqlite::params![lo, hi, weight],
+                )?;
+            }
+            db.sql().execute(
+                "INSERT OR IGNORE INTO name_tokens(token,entity_id)
+                 SELECT token,?1 FROM name_tokens WHERE entity_id=?2",
+                [k, m],
+            )?;
             db.sql().execute(
                 "UPDATE OR IGNORE mentions SET entity_id=?1 WHERE entity_id=?2",
                 [k, m],
