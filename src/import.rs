@@ -7,6 +7,10 @@ use crate::error::Result;
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
+
 /// Import every live, non-superseded ReMem memory. Returns
 /// `(imported, skipped)` where skipped counts deleted/superseded rows.
 ///
@@ -98,22 +102,13 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use super::test_common::TempDir;
     use super::*;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    fn temp_db(tag: &str) -> PathBuf {
-        static N: AtomicUsize = AtomicUsize::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("neocortex-import-{}-{tag}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("remem.db")
-    }
 
     #[test]
     fn maps_live_rows_and_skips_deleted_and_superseded() {
-        let path = temp_db("v3");
+        let dir = TempDir::new("import-v3");
+        let path = dir.join("remem.db");
         {
             let c = Connection::open(&path).unwrap();
             c.execute_batch(
@@ -149,13 +144,12 @@ mod tests {
         assert_eq!(second.valid_from.as_deref(), Some("2000"));
         assert!(second.tags.is_empty(), "bad tags JSON degrades to none");
         assert_eq!(second.source, None, "empty agent_id is dropped");
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn works_without_the_superseded_at_column() {
-        let path = temp_db("v2");
+        let dir = TempDir::new("import-v2");
+        let path = dir.join("remem.db");
         {
             let c = Connection::open(&path).unwrap();
             c.execute_batch(
@@ -171,12 +165,12 @@ mod tests {
         assert_eq!(skipped, 0);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].valid_from.as_deref(), Some("7"));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn missing_file_is_an_error() {
-        let path = temp_db("absent").with_file_name("nope.db");
+        let dir = TempDir::new("import-absent");
+        let path = dir.join("nope.db");
         assert!(read_memories(&path).is_err());
     }
 }
