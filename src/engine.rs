@@ -132,6 +132,10 @@ pub struct Config {
     /// question's wh-frame. Below it `recall` returns `next` hints naming the
     /// bridge entity to `follow`. 0 disables hints.
     pub hint_tau: f32,
+    /// Extra query-anchor tiers (`anchor.rs`): `w` generic-alias demotion,
+    /// `1` unique first/last name word, `2` role noun via a relation; `b` / `x`
+    /// / `p` let weak anchors block pass-through / enable prose hops / both. Empty or `0` = exact aliases only.
+    pub anchor_tiers: String,
 }
 
 impl Default for Config {
@@ -175,6 +179,7 @@ impl Default for Config {
             rerank_top: 0,
             w_rerank: 0.5,
             hint_tau: 0.40,
+            anchor_tiers: String::new(),
         }
     }
 }
