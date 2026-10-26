@@ -570,6 +570,18 @@ pub fn resolve_entity(
         });
     }
 
+    // EX-04: a unique alias prefix resolves on write as it does on read.
+    if let Some(id) = unique_prefix(db, &norm, &item.name, &kind, &exclude)? {
+        add_aliases(db, id, item, "prefix")?;
+        enrich(db, id, item, now)?;
+        return Ok(Resolved {
+            id,
+            status: "alias".into(),
+            similar: Vec::new(),
+            candidates: Vec::new(),
+        });
+    }
+
     let (generated, knn_order) = candidates(db, &norm, embedding)?;
     let ids: Vec<i64> = generated.iter().map(|(id, _)| *id).collect();
     let mut details = Vec::new();
@@ -937,6 +949,74 @@ fn enrich(db: &Db, id: i64, item: &EntityIn, now: i64) -> Result<()> {
         // reindex/recall tolerate the stale vector until eval shows drift.
     }
     Ok(())
+}
+
+/// Whether a name is already stored as an entity name or alias (EX-03 uses it
+/// to tell a known first word from a new compound).
+pub(crate) fn alias_known(db: &Db, name: &str) -> Result<bool> {
+    let norm = text::norm_name(name);
+    if norm.is_empty() {
+        return Ok(false);
+    }
+    let found: Option<i64> = db
+        .sql()
+        .query_row(
+            "SELECT 1 FROM entity_aliases WHERE alias_norm=?1 LIMIT 1",
+            [&norm],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// EX-04: the unique alias-prefix rule of `recall::lookup_entity_fuzzy`, on
+/// write. A mention of 3+ chars that prefixes the alias of exactly one entity
+/// (same type filter as `exact_ids`) resolves to it, but only when that alias
+/// continues the mention after a separator ("UltraBERT" + "-Embed-150M"). A
+/// space or letters ("Paris" + " TX", "Alex" + "is") are sibling names, which
+/// the candidate stages keep apart. Two or more entities stay ambiguous. The
+/// separator is read from the raw entity name: `norm_name` folds "-" to " ".
+fn unique_prefix(
+    db: &Db,
+    norm: &str,
+    raw: &str,
+    kind: &str,
+    exclude: &HashSet<i64>,
+) -> Result<Option<i64>> {
+    if norm.chars().count() < 3 {
+        return Ok(None);
+    }
+    let mut st = db.sql().prepare(
+        "SELECT DISTINCT a.entity_id, e.name FROM entity_aliases a
+         JOIN entities e ON e.id = a.entity_id
+         WHERE a.alias_norm >= ?1 AND a.alias_norm < ?1 || char(1114111)
+           AND (?2='' OR e.type='' OR e.type=?2)
+         LIMIT 50",
+    )?;
+    let rows: Vec<(i64, String)> = st
+        .query_map(params![norm, kind], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let raw = raw.trim().to_lowercase();
+    // (entity, its raw name continues the mention after a separator)
+    let mut entities: Vec<(i64, bool)> = Vec::new();
+    for (id, name) in rows {
+        if exclude.contains(&id) {
+            continue;
+        }
+        let separator = name
+            .to_lowercase()
+            .strip_prefix(raw.as_str())
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| matches!(c, '-' | '_' | '/' | '.'));
+        match entities.iter_mut().find(|(e, _)| *e == id) {
+            Some(entry) => entry.1 |= separator,
+            None => entities.push((id, separator)),
+        }
+    }
+    Ok(match entities.as_slice() {
+        [(id, true)] => Some(*id),
+        _ => None,
+    })
 }
 
 /// Add the mention's name and aliases to an entity. Never touches

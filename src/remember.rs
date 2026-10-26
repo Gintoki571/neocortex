@@ -753,7 +753,7 @@ pub fn remember(
     inp: RememberInput,
 ) -> Result<RememberOutput> {
     check_embedder(db, emb)?;
-    let mut prepared = prepare(cfg, clock, inp)?;
+    let mut prepared = prepare(db, cfg, clock, inp)?;
     embed_prepared(emb, std::slice::from_mut(&mut prepared))?;
     db.write(|db| write_prepared(db, cfg, clock, emb.name(), prepared))
 }
@@ -780,7 +780,7 @@ pub fn remember_batch(
     for chunk in inputs.chunks(BATCH_SIZE) {
         let mut prepared: Vec<(usize, Prepared)> = Vec::with_capacity(chunk.len());
         for (offset, inp) in chunk.iter().enumerate() {
-            match prepare(cfg, clock, inp.clone()) {
+            match prepare(db, cfg, clock, inp.clone()) {
                 Ok(item) => prepared.push((base + offset, item)),
                 Err(e) => slots[base + offset] = Some(Err(e)),
             }
@@ -835,7 +835,7 @@ pub fn remember_batch(
 }
 
 /// Validate one input and lay out the texts that must be embedded for it.
-fn prepare(cfg: &Config, clock: Clock, mut inp: RememberInput) -> Result<Prepared> {
+fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Result<Prepared> {
     let content = inp.content.trim().to_string();
     if content.is_empty() {
         return Err(crate::err!("content must not be empty"));
@@ -946,7 +946,8 @@ fn prepare(cfg: &Config, clock: Clock, mut inp: RememberInput) -> Result<Prepare
     let tags = tags.join(" ");
     let mut entities = inp.entities.clone();
     if entities.is_empty() {
-        entities = extract::heuristic_entities(&content)
+        let known = |name: &str| resolve::alias_known(db, name).unwrap_or(false);
+        entities = extract::heuristic_entities_with(&content, &known)
             .into_iter()
             .map(|c| EntityIn {
                 name: c.name,
