@@ -88,6 +88,8 @@ When the user requests a durable behavior change, record it here or in the relev
 
 Long-term memory for AI agents, v0.1.4. Rust, one crate, one binary `neocortex` (CLI + MCP stdio server). One SQLite file holds memories (FTS5 BM25 + sqlite-vec), an entity/relation knowledge graph (graphqlite projection) and bi-temporal facts. Embeddings: UltraBERT-Embed-150M on candle (pure Rust, CPU). No LLM inside, no Python at runtime (offline tooling only, in `scripts/` and `eval/extract/reference/`), no network.
 
+Target hardware (binding, user requirement 2026-10-26): neocortex must run well on resource-constrained devices: Android phones with < 6 GB RAM and a few-generations-old ARM CPU (aarch64, e.g. Cortex-A53/A73 class, via Termux or an app), cheap VPSes (1-2 vCPU, 1-2 GB RAM) and old laptops. Every change is judged on accuracy AND footprint: peak RSS, cold start, recall/remember latency on 1-2 slow cores, model and DB size on disk, and no x86-only code paths (SIMD must have a portable fallback; C extensions must cross-compile for aarch64). Footprint numbers and the constrained-profile gate live in Verification once measured.
+
 Design (binding): `docs/superpowers/specs/2026-10-22-neocortex-design.md`. Plan: `docs/superpowers/plans/2026-10-23-neocortex-plan.md`. Pre-rewrite ReMem code: git tag `remem-final`.
 
 ## Ownership
