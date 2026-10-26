@@ -6,8 +6,10 @@
 use neocortex::embed::HashEmbedder;
 use neocortex::engine::{Engine, EntityIn, RecallInput, RelationIn, RememberInput};
 use neocortex::temporal::Clock;
-use std::path::PathBuf;
 use std::sync::Arc;
+
+mod common;
+use common::TempDir;
 
 const NOW: i64 = 1_700_000_000;
 const DAY: i64 = 86_400;
@@ -52,17 +54,6 @@ fn link_count(engine: &Engine, id: i64) -> i64 {
             |r| r.get(0),
         )
         .unwrap()
-}
-
-fn temp_path(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!(
-        "neocortex-links-{}-{tag}-{nanos}.db",
-        std::process::id()
-    ))
 }
 
 // ------------------------------------------------------------------- E4a
@@ -152,7 +143,8 @@ fn temporal_links_do_not_cross_entities_or_the_window() {
 
 #[test]
 fn a_v4_database_gains_the_additive_tables_on_open() {
-    let path = temp_path("migrate");
+    let dir = TempDir::new("links-migrate");
+    let path = dir.join("links.db");
     {
         let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
         e.db.sql()
@@ -177,9 +169,6 @@ fn a_v4_database_gains_the_additive_tables_on_open() {
         assert_eq!(exists, 1, "{table} missing after reopening a v4 database");
     }
     drop(e);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
 }
 
 // ------------------------------------------------------------------- E4b
@@ -364,7 +353,8 @@ fn retention_prefers_important_recent_and_accessed_memories() {
 
 #[test]
 fn concurrent_recalls_keep_access_counters_consistent() {
-    let path = temp_path("concurrent");
+    let dir = TempDir::new("links-concurrent");
+    let path = dir.join("links.db");
     let seeded = {
         let e = Engine::open(&path, Arc::new(HashEmbedder))
             .unwrap()
@@ -419,7 +409,4 @@ fn concurrent_recalls_keep_access_counters_consistent() {
             .unwrap();
     assert!(kept <= e.cfg.access_keep as i64, "{kept}");
     drop(e);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
 }

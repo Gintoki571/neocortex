@@ -283,11 +283,18 @@ struct World {
 }
 
 fn retraction_world() -> (Engine, World) {
+    retraction_world_at(Some("2020-01-01"))
+}
+
+/// `valid_from` dates every setup relation; `None` records them at ingest
+/// time, as a plain `remember` with relations does.
+fn retraction_world_at(valid_from: Option<&str>) -> (Engine, World) {
     let e = engine();
+    let vf = || valid_from.map(str::to_string);
     let work = e
         .remember(RememberInput {
             content: "Ivan works at Acme.".into(),
-            valid_from: Some("2020-01-01".into()),
+            valid_from: vf(),
             entities: vec![person("Ivan"), org("Acme")],
             relations: vec![rel("Ivan", "works at", "Acme", true)],
             ..Default::default()
@@ -298,7 +305,7 @@ fn retraction_world() -> (Engine, World) {
     let married = e
         .remember(RememberInput {
             content: "Maria is married to Tom.".into(),
-            valid_from: Some("2018-01-01".into()),
+            valid_from: vf(),
             entities: vec![person("Maria"), person("Tom")],
             relations: vec![rel("Maria", "married to", "Tom", true)],
             ..Default::default()
@@ -309,7 +316,7 @@ fn retraction_world() -> (Engine, World) {
     let residence = e
         .remember(RememberInput {
             content: "Ivan lives in Bergen.".into(),
-            valid_from: Some("2019-01-01".into()),
+            valid_from: vf(),
             entities: vec![person("Ivan"), place("Bergen")],
             relations: vec![rel("Ivan", "lives in", "Bergen", true)],
             ..Default::default()
@@ -450,6 +457,104 @@ fn tm10b_split_and_separated_end_the_marriage() {
         let (e, w) = retraction_world();
         let out = plain(&e, content);
         assert_ended(&out, w.married);
+    }
+}
+
+#[test]
+fn tm10c_a_past_dated_retraction_ends_a_fact_recorded_at_ingest() {
+    // The nc-f3 review stored the marriage without a date (valid_from = now)
+    // and then wrote "divorced ... in 2024"; the inferred date precedes the
+    // recorded start, so the row must be retired rather than skipped.
+    let (e, w) = retraction_world_at(None);
+    let out = plain(&e, "Maria divorced Tom in 2024.");
+    assert_ended(&out, w.married);
+    let (valid_to, expired): (Option<i64>, Option<i64>) =
+        e.db.sql()
+            .query_row(
+                "SELECT valid_to,expired_at FROM relations WHERE id=?1",
+                [w.married],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+    assert!(valid_to.is_some() && expired.is_some(), "row stayed live");
+}
+
+#[test]
+fn tm10c_an_ended_interval_after_the_retraction_date_is_left_alone() {
+    let e = engine();
+    let rid = e
+        .remember(RememberInput {
+            content: "Ivan works at Acme.".into(),
+            valid_from: Some("2025-01-01".into()),
+            valid_to: Some("2026-01-01".into()),
+            entities: vec![person("Ivan"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap()
+        .relations[0]
+        .id;
+    // The row starts after 2024 and is already over: no overlap to correct.
+    let out = plain(&e, "Ivan left Acme in 2024.");
+    assert!(!out.invalidated_relations.contains(&rid), "{out:?}");
+    assert_eq!(relation_end(&e, rid), Some(day(2026, 1, 1)));
+}
+
+#[test]
+fn tm10c_partner_cues_end_a_fact_recorded_at_ingest() {
+    for content in [
+        "Maria divorced Tom in 2024.",
+        "Maria split up with Tom.",
+        "Maria separated from Tom.",
+    ] {
+        let (e, w) = retraction_world_at(None);
+        let out = plain(&e, content);
+        assert_ended(&out, w.married);
+    }
+}
+
+/// A single live employment relation for `name`, recorded at ingest time.
+fn works_world(name: &str) -> (Engine, i64) {
+    let e = engine();
+    let rid = e
+        .remember(RememberInput {
+            content: format!("{name} works at Acme."),
+            entities: vec![person(name), org("Acme")],
+            relations: vec![rel(name, "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap()
+        .relations[0]
+        .id;
+    (e, rid)
+}
+
+#[test]
+fn tm10c_left_a_job_or_position_at_ends_the_work_relation() {
+    for (name, content) in [
+        ("Ivan", "Ivan left his job at Acme."),
+        ("Ivan", "Ivan left his position at Acme."),
+        ("Dana", "Dana left her job at Acme."),
+        ("Dana", "Dana left her position at Acme last year."),
+        ("Dana", "Dana left their job at Acme."),
+        ("Dana", "Dana left their position at Acme to join Globex."),
+    ] {
+        let (e, rid) = works_world(name);
+        let out = plain(&e, content);
+        assert_ended(&out, rid);
+    }
+}
+
+#[test]
+fn tm10c_left_a_possession_at_a_place_is_not_a_retraction() {
+    for content in [
+        "Ivan left his bag at Acme.",
+        "Ivan left his badge at Acme.",
+        "Ivan left her laptop at Acme.",
+    ] {
+        let (e, rid) = works_world("Ivan");
+        let out = plain(&e, content);
+        assert_kept(&e, &out, rid);
     }
 }
 

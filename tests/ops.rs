@@ -1,6 +1,9 @@
 //! Operational guarantees: JSON Lines export/import round-trips history, and
 //! concurrent CLI writers plus a reader leave one consistent database.
 
+mod common;
+
+use common::TempDir;
 use neocortex::embed::HashEmbedder;
 use neocortex::engine::{Engine, EntityIn, RelationIn, RememberInput};
 use std::path::{Path, PathBuf};
@@ -9,19 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 // ------------------------------------------------------------ export/import
-
-fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "neocortex-ops-{}-{tag}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn engine(path: &Path) -> Engine {
     // Fixed UTC offset: the system default is the machine's local offset.
@@ -205,7 +195,7 @@ fn fact_rows(engine: &Engine) -> Vec<FactRow> {
 
 #[test]
 fn export_import_round_trips_history_entities_and_facts() {
-    let dir = temp_dir("roundtrip");
+    let dir = TempDir::new("ops-roundtrip");
     let source = engine(&dir.join("source.db"));
     seed(&source);
     let lines = dir.join("export.jsonl");
@@ -269,7 +259,7 @@ fn export_import_round_trips_history_entities_and_facts() {
 
 #[test]
 fn include_forgotten_keeps_retired_rows_retired() {
-    let dir = temp_dir("forgotten");
+    let dir = TempDir::new("ops-forgotten");
     let source = engine(&dir.join("source.db"));
     seed(&source);
     let lines = dir.join("export.jsonl");
@@ -310,7 +300,7 @@ fn cli(db: &Path, args: &[&str]) -> Output {
 
 #[test]
 fn concurrent_writers_and_reader_leave_one_consistent_database() {
-    let dir = temp_dir("concurrency");
+    let dir = TempDir::new("ops-concurrency");
     let db = dir.join("memory.db");
     // Create the schema once, as an installed agent does on first use: opening
     // a *brand-new* file from many processes at once races on
@@ -380,7 +370,7 @@ fn concurrent_writers_and_reader_leave_one_consistent_database() {
 /// identical writers leave exactly one live row and agree on its id.
 #[test]
 fn concurrent_identical_writes_keep_one_live_row() {
-    let dir = temp_dir("identical");
+    let dir = TempDir::new("ops-identical");
     let db = dir.join("memory.db");
     drop(engine(&db)); // create the schema once (a fresh WAL open races)
     let content = "one sentence written by many agents at once";
@@ -420,7 +410,7 @@ fn concurrent_identical_writes_keep_one_live_row() {
 /// that the import merely re-created as a duplicate.
 #[test]
 fn importing_an_expired_line_never_forgets_a_live_memory() {
-    let dir = temp_dir("no-forget");
+    let dir = TempDir::new("ops-no-forget");
     let target = engine(&dir.join("target.db"));
     target
         .remember(RememberInput {
@@ -443,7 +433,7 @@ fn importing_an_expired_line_never_forgets_a_live_memory() {
 /// #6: import-remem is all or nothing and the error names the failing row.
 #[test]
 fn import_remem_is_atomic_and_names_the_bad_row() {
-    let dir = temp_dir("atomic");
+    let dir = TempDir::new("ops-atomic");
     let source = dir.join("remem.db");
     {
         let c = rusqlite::Connection::open(&source).unwrap();
@@ -470,7 +460,7 @@ fn import_remem_is_atomic_and_names_the_bad_row() {
 /// #6: pre-2001 unix seconds (including 0) are accepted as instants.
 #[test]
 fn import_remem_accepts_zero_and_old_unix_seconds() {
-    let dir = temp_dir("old-seconds");
+    let dir = TempDir::new("ops-old-seconds");
     let source = dir.join("remem.db");
     {
         let c = rusqlite::Connection::open(&source).unwrap();
@@ -496,7 +486,7 @@ fn import_remem_accepts_zero_and_old_unix_seconds() {
 #[test]
 fn export_files_are_created_private() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = temp_dir("export-mode");
+    let dir = TempDir::new("ops-export-mode");
     let e = engine(&dir.join("memory.db"));
     seed(&e);
     let out = dir.join("export.jsonl");
@@ -511,7 +501,7 @@ fn export_files_are_created_private() {
 #[test]
 fn the_wal_side_files_are_private() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = temp_dir("wal-mode");
+    let dir = TempDir::new("ops-wal-mode");
     let db = dir.join("memory.db");
     let e = engine(&db);
     e.remember(RememberInput {

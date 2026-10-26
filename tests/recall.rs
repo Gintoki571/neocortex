@@ -8,6 +8,9 @@ use neocortex::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod common;
+use common::TempDir;
+
 fn clock() -> Clock {
     Clock {
         now: parse_instant(
@@ -953,11 +956,8 @@ fn recall_bumps_access_count() {
 
 #[test]
 fn sweep_ingests_once_and_reports_each_variant() {
-    let path = std::env::temp_dir().join(format!(
-        "neocortex-eval-{}-{}.json",
-        std::process::id(),
-        "sweep"
-    ));
+    let dir = TempDir::new("eval-sweep");
+    let path = dir.join("sweep.json");
     std::fs::write(
         &path,
         r#"{
@@ -976,7 +976,6 @@ fn sweep_ingests_once_and_reports_each_variant() {
         ("two".to_string(), base.clone()),
     ];
     let rows = neocortex::eval::sweep(&path, Arc::new(HashEmbedder), base, variants).unwrap();
-    let _ = std::fs::remove_file(&path);
     assert_eq!(rows.len(), 2);
     for (_, report) in &rows {
         assert_eq!(report.ingested, 2, "fixture must be ingested exactly once");
