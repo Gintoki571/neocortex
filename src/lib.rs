@@ -1,5 +1,6 @@
 //! neocortex: long-term memory for AI agents.
 
+pub mod anchor;
 pub mod bench;
 pub mod db;
 pub mod embed;

@@ -496,6 +496,7 @@ pub(crate) fn search_semantic(
     query_vec: &[f32],
     seeds: &[i64],
     anchors: &[i64],
+    prose_hops: bool,
     nearest_memories: &[i64],
     vis: Visibility,
     use_scorer: bool,
@@ -526,9 +527,10 @@ pub(crate) fn search_semantic(
     // memories qualify, indexed once by the entities they mention.
     type Prose = (i64, String, Vec<i64>);
     let mut prose: HashMap<i64, Vec<Prose>> = HashMap::new();
-    // Prose hops need an exact anchor to stand on: from fuzzy seeds alone
-    // they chain unrelated memories ("the boat she takes out on the river").
-    if !anchors.is_empty() {
+    // Prose hops need an exact anchor to stand on (`prose_hops`): from fuzzy
+    // seeds alone they chain unrelated memories ("the boat she takes out on
+    // the river").
+    if prose_hops {
         // The recall vector channel's neighbours; vectors are read lazily
         // (a vec0 vector read costs ~0.3 ms) for the memories a hop reaches.
         let mut memory_st = db.sql().prepare_cached(

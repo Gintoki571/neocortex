@@ -118,6 +118,10 @@ pub struct Config {
     pub update_candidate: f32,
     /// Trained hop scorer for the semantic beam: "off" (cosine residual) or "on".
     pub hop_scorer: String,
+    /// Extra query-anchor tiers (`anchor.rs`): `w` generic-alias demotion,
+    /// `1` unique first/last name word, `2` role noun via a relation; `b` / `x`
+    /// / `p` let weak anchors block pass-through / enable prose hops / both. Empty or `0` = exact aliases only.
+    pub anchor_tiers: String,
 }
 
 impl Default for Config {
@@ -157,6 +161,7 @@ impl Default for Config {
             fact_memory_seed: 0.0,
             update_candidate: 0.75,
             hop_scorer: "off".to_string(),
+            anchor_tiers: String::new(),
         }
     }
 }

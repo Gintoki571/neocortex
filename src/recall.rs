@@ -579,8 +579,16 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     names.extend(input.entities.iter().map(|x| text::norm_name(x)));
     names.sort();
     names.dedup();
-    let query_alias_entities: HashSet<i64> =
-        alias_entities(&engine.db, &names)?.into_iter().collect();
+    // Strong anchors block pass-through and enable prose hops; weak ones
+    // (anchor_tiers) only seed and start beams.
+    let anchors = crate::anchor::query_anchors(
+        &engine.db,
+        &input.query,
+        &names,
+        &engine.cfg.anchor_tiers,
+        now,
+    )?;
+    let query_alias_entities: HashSet<i64> = anchors.all().into_iter().collect();
     for id in &query_alias_entities {
         seed_entity(*id, 1.0);
     }
@@ -706,9 +714,13 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // does the manager of X live": the destination memory shares no words with
     // the question, so no lexical or vector channel can find it. Seeds are the
     // exact query anchors only; fuzzy seeds would start paths elsewhere.
-    let mut path_starts: Vec<i64> = query_alias_entities.iter().copied().collect();
-    path_starts.sort_unstable();
+    let mut path_starts: Vec<i64> = anchors.all();
     path_starts.truncate(4);
+    let blocking: Vec<i64> = path_starts
+        .iter()
+        .copied()
+        .filter(|id| anchors.block.contains(id))
+        .collect();
     // "What did X drink *before* Y" asks for the older state; a path from the
     // query anchors lands on the current one and buries the answer.
     // The semantic beam only walks facts the question recognises, so it can
@@ -743,7 +755,8 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                 &query_text,
                 &query_vec,
                 &sem_starts,
-                &path_starts,
+                &blocking,
+                anchors.prose,
                 &nearest_memories,
                 vis,
                 engine.cfg.hop_scorer == "on",

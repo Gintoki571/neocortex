@@ -554,6 +554,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "causal_extract",
     "w_retention",
     "access_keep",
+    "anchor_tiers",
 ];
 
 fn boolean(key: &str, value: &str) -> Result<bool> {
@@ -581,6 +582,15 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "w_temporal" => cfg.w_temporal = number(key, value)?,
         "w_sempath" => cfg.w_sempath = number(key, value)?,
         "hop_scorer" => cfg.hop_scorer = value.to_string(),
+        "anchor_tiers" => {
+            // "0" alone = exact aliases only (a sweep list cannot hold "").
+            if !value.chars().all(|c| "0w12bxp".contains(c)) {
+                return Err(crate::err!(
+                    "anchor_tiers takes letters from '0w12bxp', got '{value}'"
+                ));
+            }
+            cfg.anchor_tiers = value.to_string()
+        }
         "rrf_k" => cfg.rrf_k = number(key, value)?,
         "alpha" => cfg.alpha = number(key, value)?,
         "entity_seed" => cfg.entity_seed = number(key, value)? as f32,
