@@ -1517,14 +1517,14 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     } else if top_chains.is_empty() {
         facts
     } else {
-        let prose_fact =
-            paths::prose_terminal_fact(&engine.db, &sem_hits, engine.cfg.prose_margin, cutoff)?
-                .filter(|fact| {
-                    rows.get(&fact.id).is_some_and(|row| {
-                        eligible(row, as_of, history, input, since, until, now, planned_ok)
-                    })
-                });
-        let mut merged: Vec<FactHit> = prose_fact.into_iter().collect();
+        let prose = paths::prose_facts(&engine.db, &sem_hits, engine.cfg.prose_margin, cutoff)?
+            .into_iter()
+            .filter(|fact| {
+                rows.get(&fact.id).is_some_and(|row| {
+                    eligible(row, as_of, history, input, since, until, now, planned_ok)
+                })
+            });
+        let mut merged: Vec<FactHit> = prose.collect();
         merged.extend(paths::facts(&engine.db, &top_chains, cutoff, 6)?);
         for fact in facts {
             if !merged.iter().any(|x| x.id == fact.id && !x.memory) {

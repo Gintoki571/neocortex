@@ -1015,26 +1015,26 @@ fn terminal(hit: &PathHit) -> Option<(bool, i64)> {
         .map(|s| (s.memory.is_some(), s.memory.unwrap_or(s.relation_id)))
 }
 
-/// B4: when the best chain (`hits` sorted best first) ends in a prose memory
-/// and beats the best chain with another terminal by `margin`, that memory is
-/// the answer's only carrier; render it as a fact line (`memory` = true).
-pub(crate) fn prose_terminal_fact(
+/// Prose steps rendered per query at most.
+const PROSE_FACTS: usize = 2;
+
+/// B4: when the best chain (`hits` sorted best first) uses prose memories and
+/// beats the best chain with another terminal by `margin`, those memories carry
+/// the answer (a relation-less hop is never rendered by `facts`); render them
+/// as fact lines (`memory` = true), destination first.
+pub(crate) fn prose_facts(
     db: &Db,
     hits: &[PathHit],
     margin: f64,
     cutoff: i64,
-) -> Result<Option<FactHit>> {
+) -> Result<Vec<FactHit>> {
     let Some(best) = hits.first() else {
-        return Ok(None);
-    };
-    let Some(step) = best.steps.last().filter(|s| s.memory.is_some()) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let rival = hits.iter().find(|h| terminal(h) != terminal(best));
     if rival.is_some_and(|r| best.score - r.score < margin) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let id = step.memory.unwrap_or_default();
     let name = |entity: i64| -> Result<String> {
         Ok(db
             .sql()
@@ -1044,42 +1044,48 @@ pub(crate) fn prose_terminal_fact(
             .optional()?
             .unwrap_or_default())
     };
-    let Some((valid_from, valid_to, expired)) = db
-        .sql()
-        .query_row(
-            "SELECT valid_from,valid_to,expired_at FROM memories WHERE id=?1",
-            [id],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Option<i64>>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                ))
-            },
-        )
-        .optional()?
-    else {
-        return Ok(None);
-    };
-    if valid_from > cutoff {
-        return Ok(None);
+    let mut out = Vec::new();
+    for step in best.steps.iter().rev().filter(|s| s.memory.is_some()) {
+        let id = step.memory.unwrap_or_default();
+        let Some((valid_from, valid_to, expired)) = db
+            .sql()
+            .query_row(
+                "SELECT valid_from,valid_to,expired_at FROM memories WHERE id=?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .filter(|(from, _, _)| *from <= cutoff)
+        else {
+            continue;
+        };
+        out.push(FactHit {
+            id,
+            source: name(step.src)?,
+            predicate: String::new(),
+            target: name(step.dst)?,
+            fact: step.fact.chars().take(200).collect(),
+            valid_from,
+            valid_to,
+            ended: expired.is_some() || valid_to.is_some_and(|v| v <= cutoff),
+            retracted: expired.is_some() && valid_to.is_none(),
+            polarity: 1,
+            memory: true,
+            current_values: None,
+            replaced_by: None,
+            duration: None,
+        });
+        if out.len() >= PROSE_FACTS {
+            break;
+        }
     }
-    Ok(Some(FactHit {
-        id,
-        source: name(step.src)?,
-        predicate: String::new(),
-        target: name(step.dst)?,
-        fact: step.fact.chars().take(200).collect(),
-        valid_from,
-        valid_to,
-        ended: expired.is_some() || valid_to.is_some_and(|v| v <= cutoff),
-        retracted: expired.is_some() && valid_to.is_none(),
-        polarity: 1,
-        memory: true,
-        current_values: None,
-        replaced_by: None,
-        duration: None,
-    }))
+    Ok(out)
 }
 
 // ------------------------------------------------------------------- tools
