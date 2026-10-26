@@ -2496,6 +2496,7 @@ mod hint_tests {
             polarity: 1,
             current_values: None,
             replaced_by: None,
+            duration: None,
         };
         assert!(hint(&f, &[&chain], &[], &[fact], &[], 0.40).is_empty());
         let memory = MemoryHit {
@@ -2509,6 +2510,7 @@ mod hint_tests {
             tags: Vec::new(),
             score: 1.0,
             reasons: Vec::new(),
+            duration: None,
         };
         assert!(hint(&f, &[&chain], &[], &[], &[memory], 0.40).is_empty());
     }
