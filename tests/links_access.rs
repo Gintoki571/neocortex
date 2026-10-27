@@ -171,6 +171,40 @@ fn a_v4_database_gains_the_additive_tables_on_open() {
     drop(e);
 }
 
+#[test]
+fn a_v4_database_gains_the_subject_index_and_the_planner_uses_it() {
+    let dir = TempDir::new("subj-index");
+    let path = dir.join("subj.db");
+    {
+        let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        e.db.sql()
+            .execute_batch("DROP INDEX idx_rel_subj;")
+            .unwrap();
+    }
+    let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    // The facts_for_view count and the write-path exclusivity lookup.
+    for sql in [
+        "SELECT count(*) FROM relations WHERE subj=1 AND predicate_id IN
+           (SELECT id FROM predicates WHERE group_id=2) AND polarity=1
+           AND expired_at IS NULL AND valid_from<=3 AND (valid_to IS NULL OR valid_to>3)",
+        "SELECT r.id FROM relations r JOIN predicates p ON p.id=r.predicate_id
+           WHERE r.subj=1 AND COALESCE(NULLIF(p.group_id,0),p.id)=2
+           AND r.polarity=1 AND r.expired_at IS NULL",
+    ] {
+        let plan: String =
+            e.db.sql()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|d| d.unwrap())
+                .collect::<Vec<_>>()
+                .join("; ");
+        assert!(plan.contains("idx_rel_subj"), "no subj index in: {plan}");
+    }
+    drop(e);
+}
+
 // ------------------------------------------------------------------- E4b
 
 #[test]

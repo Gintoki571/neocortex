@@ -114,6 +114,9 @@ CREATE TABLE IF NOT EXISTS relations (
 );
 CREATE INDEX IF NOT EXISTS idx_rel_src ON relations(src, predicate_id);
 CREATE INDEX IF NOT EXISTS idx_rel_dst ON relations(dst);
+-- Semantic-subject lookups: the exclusivity checks at write time and the
+-- current-value count in recall.
+CREATE INDEX IF NOT EXISTS idx_rel_subj ON relations(subj, predicate_id);
 CREATE TABLE IF NOT EXISTS relation_evidence (
   relation_id INTEGER NOT NULL REFERENCES relations(id) ON DELETE CASCADE,
   memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,

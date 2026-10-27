@@ -151,12 +151,35 @@ Both memory scans (`remember::knn_memory`, and the `k=10` block that runs when a
 
 Real-model ingest rate fell from 11.5/s (3.3k) to 8.0/s (10.8k) to 7.5/s (32.6k) even though the model forward dominates; a 100k real-model ingest would run at roughly 3-4/s by the same trend (8 h), not measured.
 
-## 5. Recommendations (nothing implemented in this lane)
+## 5. Recommendations (nc-scale proposed; items 1 and 2 implemented in nc-perf, see below)
 
 1. Add `CREATE INDEX idx_rel_subj ON relations(subj, predicate_id)` as an additive schema step, and compute `current_values` after `.take(limit)` in `facts_for_view`. Measured on the 108k DB: p50 681 -> 435 ms, p95 2,355 -> 484 ms, identical results. Also speeds up `remember` on relation writes.
 2. Make the write-time memory scans cheaper than O(N): `knn_memory` (k=1) and the `k=10` related block each scan all of `memories_vec`. Candidates: run one k=10 scan and derive the k=1 hit from it; or skip the related scan when the near-dup scan found nothing above the update threshold.
 3. Recall at 100k then costs ~435 ms (f32) / ~315 ms (int8) on one core for the hash embedder, before the query embedding. The remaining linear terms are the three vec0 brute-force scans (memories, relations twice); int8 helps, a coarse pre-filter (entity-restricted KNN) would be the next lever.
 4. Multi-hop at 32k: three-hop acc@10 fell to 0.897 from path-beam misses at hop 3. Test `agent_sim` / `follow` on world-3000 before changing retrieval.
+
+## After nc-perf
+
+Implemented from section 5: (1) `idx_rel_subj ON relations(subj, predicate_id)` in `schema.sql` and in `Db::ensure_additive_tables` (every v4 open; no version bump), and `facts_for_view` counts `current_values` only for the rows that survive `.take(limit)`; (2) `remember` runs one `memories_vec` scan: k=10 when the input has no relations (else k=1), the nearest row is the near-duplicate check and, for a stored memory, the first nine rows are the `related` candidates (the old second scan ran after the memory was inserted, so it was its own nearest row).
+
+`EXPLAIN QUERY PLAN`, before -> after (world-300 DB, index added by hand for "after"):
+
+| query | before | after |
+|---|---|---|
+| `current_values` count (recall) | `SCAN relations` | `SEARCH relations USING INDEX idx_rel_subj (subj=? AND predicate_id=?)` |
+| write path, exclusive-ending (`remember.rs`) | `SCAN r` | `SEARCH r USING INDEX idx_rel_subj (subj=?)` |
+| write path, conflict candidates (`remember.rs`) | `SCAN r` | `SEARCH r USING INDEX idx_rel_subj (subj=?)` |
+
+Measured on this host, `taskset -c 0`, interleaved main/branch runs, both binaries on a copy of the same main-built DB (the branch adds the index on open):
+
+| set | metric | main | nc-perf |
+|---|---|---|---|
+| world-300, real model, 5 paired runs | recall p50 (median) | 183.13 ms | 177.63 ms |
+| world-3000 (hash embedder, 32,567 memories), 3 paired runs | recall p50 / mean / p95 | 204.41 / 211.50 / 271.05 ms (run 1) | 137.83 / 148.21 / 153.29 ms (run 1) |
+| world-3000 (hash), ingest (both ingests ran concurrently on separate cores) | 32,567 memories | 2,517.7 s (12.9/s) | 2,015.8 s (16.2/s) |
+| world-300, real model, ingest | 3,264 memories | 466.3 s | 461.9 s |
+
+The world-300 p50 gain is small because that graph has only 1,283 relations; the effect grows with hub fan-in and graph size (world-3000: recall p50 -33%, p95 -44%; ingest -20%). Results are identical: acc@10 / recall / MRR and every per-category row match main on world-300 (0.992 / 0.965 / 0.881) and world-3000 (0.898 / 0.837 / 0.603), and the ingested DBs match table by table (`memories`, `entities`, `relations`, `mentions`, `memory_links`, `relation_evidence` row hashes equal on both worlds). Not re-measured at 108k (the DB from nc-scale was a scratch build).
 
 ## Reproduce
 

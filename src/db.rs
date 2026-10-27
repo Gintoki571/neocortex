@@ -287,7 +287,8 @@ impl Db {
                PRIMARY KEY (a, b),
                CHECK (a < b)
              );
-             CREATE INDEX IF NOT EXISTS idx_name_part_b ON name_part(b);",
+             CREATE INDEX IF NOT EXISTS idx_name_part_b ON name_part(b);
+             CREATE INDEX IF NOT EXISTS idx_rel_subj ON relations(subj, predicate_id);",
         )?;
         // B5 name tokens are derived from entities.norm; a database written
         // before the table existed is backfilled once (the empty-table probe

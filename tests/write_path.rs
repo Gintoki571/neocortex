@@ -2071,6 +2071,7 @@ fn a_baseline_v3_database_with_three_column_predicates_opens() {
              );
              INSERT INTO predicates(canonical,exclusive) VALUES ('work at',1);
              UPDATE relations SET predicate_id=1, predicate_text='', subj=0;
+             DROP INDEX idx_rel_subj;
              ALTER TABLE relations DROP COLUMN predicate_text;
              ALTER TABLE relations DROP COLUMN subj;
              UPDATE schema_meta SET version=3;",
