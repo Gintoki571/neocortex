@@ -1,4 +1,4 @@
-# Lane results ledger (2026-10-25 to 2026-10-27)
+# Lane results ledger (from 2026-10-25)
 
 One row per lane: what it tried, the deciding numbers (real UltraBERT-Embed-150M unless noted), and the
 outcome. Process: `lanes/AGENTS.md` in the workspace (outside this repo). "Blind" = multihop-holdout2
@@ -27,6 +27,8 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | nc-contain | connector spans (B5), EX-05 with common-noun guard, possessive ends spans, name-containment links | heuristic entity F1 0.675 -> 0.762; accepted exception blind 0.830 -> 0.810 (0.820 after histprose), private 0.875 -> 0.867, each lost query traced to rank noise from removed junk entities | f95327e |
 | nc-scale | measurement at 11k / 33k / 109k memories | see `scale.md` | dfe7e79 |
 | nc-perf | `idx_rel_subj`, deferred `current_values`, one `memories_vec` scan per remember | 33k: recall p50 -33%, p95 -44%, ingest -20%, results byte-identical | 5e3e082 |
+| nc-hunt2 (qoder) | dogfood bug hunt: 8 fictional agent scenarios, 178 probes, real model | 20 findings (8 wrong fact, 8 missing, 4 noise) in workspace `lanes/research/hunt2.md` | (no code) |
+| nc-fix2 (qoder) | negation/retraction scoped to the right subject and clause; first names via supplied entities; "A and B are no longer partners"; "I don't remember" is not negation; future-event questions see planned rows | hunt2 probes fixed; retraction table 27/27; private 0.867 and agent_sim 111/120 unchanged | 1caba99 |
 
 ## Killed (branch kept, not merged)
 
@@ -37,7 +39,7 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | nc-split | B3 two-ended chain scoring | mh1 and blind three-hop -1 each; 1-core p50 +109%; UltraBERT hop cosines flat (0.206 vs 0.211 right/wrong) |
 | nc-chainx | cross-encoder verification of top chains | mh1 +2 (tuning set), blind and world-300 unchanged; p50 +51%, RSS +228 MB |
 
-## Where main stands (5e3e082)
+## Where main stands (1caba99)
 
 | measure | value |
 |---|---|
