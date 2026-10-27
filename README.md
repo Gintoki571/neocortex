@@ -271,20 +271,29 @@ Relation writes use tri-state `exclusive`: `true` ends competing values,
 predicate policy or returns candidates. `false` can clear a sticky exclusive
 flag, but never on the seeded predicate ontology. Negative assertions are
 stored with polarity and end matching positive validity without deleting
-history. A retraction sentence with no relations ("Ivan left Acme; he no
-longer works there") ends the one live relation of that kind it names at the
-memory's `valid_from` and reports it in `invalidated`; when several relations
-match it reports `conflicts` and ends nothing. A live fact recorded at ingest
-time is retired even when the sentence dates the retraction earlier ("Maria
-divorced Tom in 2024"). The name must be the whole object of the cue: "left
-the Acme office", "left Acme's parking lot" and "left Acme a voicemail" end
-nothing, while "left his job at Acme" ends the work fact; a hedge ("almost
-quit", "thinks Bob left") only reports a conflict candidate.
+history. Retraction sentences are applied to earlier facts even on a write that
+supplies its own relations (the relations it just wrote are never retracted by
+its prose): "Ivan left Acme; he no longer works there" ends the one live
+relation of that kind it names at the memory's `valid_from` and reports it in
+`invalidated`; when several relations match it reports `conflicts` and ends
+nothing. First names resolve through the write's entities and stored people
+("Maria divorced Tom" with Maria Duarte and Tom Duarte supplied), and a first
+name shared by several people only reports a conflict. A coordinated pair
+before the cue ("Acme and Northwind are no longer partners") ends the pair's
+relation. A live fact recorded at ingest time is retired even when the sentence
+dates the retraction earlier ("Maria divorced Tom in 2024"). The name must be
+the whole object of the cue: "left the Acme office", "left Acme's parking lot"
+and "left Acme a voicemail" end nothing, while "left his job at Acme" ends the
+work fact; a determiner that belongs to the object phrase ("the core team") is
+fine, an earlier one is not, and a hedge ("almost quit", "thinks Bob left")
+only reports a conflict candidate.
 
 Plans and routines are recognised from the text: "we will move next spring"
 gets a future `valid_from` (or the tag `planned` when no date resolves) and is
 not treated as current, so "where does X live" is not answered with a move that
-has not happened; "standup every Monday" keeps its rule text and gets the tag
+has not happened; a question about the event itself ("when does the deploy
+freeze start", "is the v1 API deprecated") still sees the matching planned
+memory. "standup every Monday" keeps its rule text and gets the tag
 `recurring`. Ordering questions ("what happened first") sort memories and facts
 by `valid_from`, and duration questions ("how long did Alice work at Acme")
 also render the interval with a computed duration ("3 years 2 months",
@@ -304,6 +313,9 @@ also render the interval with a computed duration ("3 years 2 months",
   ("Bergen Airport"/"Bergen Airport South", "Novak Group North", "Jan
   Nováček"), label pairs ("Apt 3B"/"Apt 3C"), and other hard negatives
   ("Alex"/"Alexis", "Room 101"/"Room 102", "Teresa Mota"/"Teresa Moura").
+  A write with no description and no agreeing memory context cannot separate a
+  one-edit short surname from a typo ("Jonas Webber"/"Jonas Weber"): supply
+  descriptions, or pass `distinct_from` when they are different people.
 - Same name + conflicting description: the match keeps `ambiguous` status with
   a ranked candidate; neocortex never pastes one description over the other.
 - Same name among homonyms: a typed mention of a single match is a normal

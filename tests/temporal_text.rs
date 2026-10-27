@@ -558,6 +558,272 @@ fn tm10c_left_a_possession_at_a_place_is_not_a_retraction() {
     }
 }
 
+// ---------------------------------------------------------------- nc-fix2
+
+fn project(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("project".into()),
+        ..Default::default()
+    }
+}
+
+fn polarity(e: &Engine, rid: i64) -> i64 {
+    e.db.sql()
+        .query_row("SELECT polarity FROM relations WHERE id=?1", [rid], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+/// A live marriage between two named people.
+fn married(e: &Engine, a: &str, b: &str) -> i64 {
+    e.remember(RememberInput {
+        content: format!("{a} is married to {b}."),
+        valid_from: Some("2019-06-01".into()),
+        entities: vec![person(a), person(b)],
+        relations: vec![rel(a, "married to", b, true)],
+        ..Default::default()
+    })
+    .unwrap()
+    .relations[0]
+        .id
+}
+
+/// H2-04: "Alice no longer leads X; Bob took over" must not flip the supplied
+/// Bob relation to NOT, and the text retraction must still end Alice's fact.
+#[test]
+fn h2_04_a_cue_about_another_subject_does_not_flip_the_supplied_relation() {
+    let e = engine();
+    let alice = e
+        .remember(RememberInput {
+            content: "Alice leads the core team.".into(),
+            valid_from: Some("2026-01-01".into()),
+            entities: vec![person("Alice"), project("core team")],
+            relations: vec![rel("Alice", "leads", "core team", true)],
+            ..Default::default()
+        })
+        .unwrap()
+        .relations[0]
+        .id;
+    let out = e
+        .remember(RememberInput {
+            content: "Alice no longer leads the core team as of 2026-10-01; Bob took over.".into(),
+            valid_from: Some("2026-10-01".into()),
+            entities: vec![person("Bob"), project("core team")],
+            relations: vec![rel("Bob", "leads", "core team", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let bob = &out.relations[0];
+    assert!(
+        !bob.fact.contains("NOT"),
+        "supplied relation was flipped to a negation: {bob:?}"
+    );
+    assert_eq!(polarity(&e, bob.id), 1, "Bob's relation must be positive");
+    assert_ended(&out, alice);
+    assert_eq!(
+        relation_end(&e, alice),
+        Some(day(2026, 10, 1)),
+        "Alice's fact ends where the text says"
+    );
+}
+
+#[test]
+fn h2_04_a_negated_supplied_relation_still_ends_the_positive_fact() {
+    let e = engine();
+    let alice = e
+        .remember(RememberInput {
+            content: "Alice leads the core team.".into(),
+            valid_from: Some("2026-01-01".into()),
+            entities: vec![person("Alice"), project("core team")],
+            relations: vec![rel("Alice", "leads", "core team", true)],
+            ..Default::default()
+        })
+        .unwrap()
+        .relations[0]
+        .id;
+    let out = e
+        .remember(RememberInput {
+            content: "Alice no longer leads the core team as of 2026-10-01.".into(),
+            valid_from: Some("2026-10-01".into()),
+            entities: vec![person("Alice"), project("core team")],
+            relations: vec![rel("Alice", "leads", "core team", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(polarity(&e, out.relations[0].id), 0);
+    assert_ended(&out, alice);
+    assert_eq!(relation_end(&e, alice), Some(day(2026, 10, 1)));
+}
+
+/// H2-05: a first-name retraction resolves through the supplied entities.
+#[test]
+fn h2_05_first_names_resolve_through_the_supplied_entities() {
+    let e = engine();
+    let marriage = married(&e, "Maria Duarte", "Tom Duarte");
+    let out = e
+        .remember(RememberInput {
+            content: "Maria divorced Tom in 2024.".into(),
+            kind: Some("event".into()),
+            valid_from: Some("2024-06-01".into()),
+            entities: vec![person("Maria Duarte"), person("Tom Duarte")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_ended(&out, marriage);
+    assert_eq!(relation_end(&e, marriage), Some(day(2024, 6, 1)));
+}
+
+/// H2-05: two known Marias make the mention ambiguous, so nothing ends and the
+/// live fact is offered as a conflict candidate.
+#[test]
+fn h2_05_two_known_marias_give_a_conflict_not_an_ending() {
+    let e = engine();
+    let marriage = married(&e, "Maria Duarte", "Tom Duarte");
+    e.remember(RememberInput {
+        content: "Maria Silva runs the analytics pipeline.".into(),
+        entities: vec![person("Maria Silva")],
+        ..Default::default()
+    })
+    .unwrap();
+    let out = e
+        .remember(RememberInput {
+            content: "Maria divorced Tom in 2024.".into(),
+            kind: Some("event".into()),
+            valid_from: Some("2024-06-01".into()),
+            entities: vec![person("Maria Duarte"), person("Tom Duarte")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_kept(&e, &out, marriage);
+    assert!(
+        out.conflicts.iter().any(|c| c.relation_id == marriage),
+        "ambiguous first name must report the live fact: {out:?}"
+    );
+}
+
+/// H2-06: "A and B are no longer partners" ends the live pair relation.
+#[test]
+fn h2_06_coordinated_subjects_end_the_partner_fact() {
+    let e = engine();
+    let partners = e
+        .remember(RememberInput {
+            content: "Acme Corp and Northwind are partners since 2023.".into(),
+            valid_from: Some("2023-02-01".into()),
+            entities: vec![org("Acme Corp"), org("Northwind")],
+            relations: vec![rel("Acme Corp", "partners with", "Northwind", true)],
+            ..Default::default()
+        })
+        .unwrap()
+        .relations[0]
+        .id;
+    let out = e
+        .remember(RememberInput {
+            content: "Acme Corp and Northwind are no longer partners as of 2026-10-10.".into(),
+            kind: Some("event".into()),
+            valid_from: Some("2026-10-10".into()),
+            entities: vec![org("Acme Corp"), org("Northwind")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_ended(&out, partners);
+    assert_eq!(relation_end(&e, partners), Some(day(2026, 10, 10)));
+}
+
+#[test]
+fn h2_06_a_hedged_pair_retraction_is_only_a_candidate() {
+    let e = engine();
+    let partners = e
+        .remember(RememberInput {
+            content: "Acme Corp and Northwind are partners since 2023.".into(),
+            valid_from: Some("2023-02-01".into()),
+            entities: vec![org("Acme Corp"), org("Northwind")],
+            relations: vec![rel("Acme Corp", "partners with", "Northwind", true)],
+            ..Default::default()
+        })
+        .unwrap()
+        .relations[0]
+        .id;
+    let out = plain(&e, "Acme Corp and Northwind may no longer be partners.");
+    assert_kept(&e, &out, partners);
+    assert!(
+        out.conflicts.iter().any(|c| c.relation_id == partners),
+        "hedged pair retraction must report the fact: {out:?}"
+    );
+}
+
+/// H2-07: a question about a future event's date or state sees the planned row.
+#[test]
+fn h2_07_future_event_questions_see_planned_rows() {
+    let e = engine();
+    let freeze = e
+        .remember(RememberInput {
+            content: "Deploy freeze starts on 2026-12-20 and runs until 2027-01-03.".into(),
+            kind: Some("event".into()),
+            valid_from: Some("2026-12-20".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    let shutdown = e
+        .remember(RememberInput {
+            content: "The Christmas shutdown starts on 2026-12-24.".into(),
+            kind: Some("event".into()),
+            valid_from: Some("2026-12-24".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    let deprecated = e
+        .remember(RememberInput {
+            content: "The v1 API will be deprecated on 2027-03-01; v2 is already live.".into(),
+            kind: Some("decision".into()),
+            valid_from: Some("2027-03-01".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    for (query, want) in [
+        ("when does the deploy freeze start", freeze),
+        ("when does the christmas shutdown start", shutdown),
+        ("is the v1 api deprecated", deprecated),
+    ] {
+        let out = recall(&e, query);
+        assert!(
+            out.memories.iter().any(|m| m.id == want),
+            "{query} missed m{want}: {:?}",
+            out.memories
+        );
+    }
+}
+
+#[test]
+fn h2_07_ordinary_current_questions_still_hide_plans() {
+    let e = engine();
+    let plan = e
+        .remember(RememberInput {
+            content: "We will move the office to Porto in 2027.".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    let current = e
+        .remember(RememberInput {
+            content: "The office is in Lisbon on Rua do Alecrim.".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    let out = recall(&e, "where is the office");
+    assert!(
+        !out.memories.iter().any(|m| m.id == plan),
+        "a plan leaked into a current question: {:?}",
+        out.memories
+    );
+    assert!(out.memories.iter().any(|m| m.id == current), "{out:?}");
+}
+
 // ---------------------------------------------------------------- TM-11
 
 #[test]

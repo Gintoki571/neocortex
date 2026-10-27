@@ -259,6 +259,7 @@ fn time_tail(words: &[(usize, usize, &str)], i: usize) -> bool {
         "in" | "on" => {
             next.is_some_and(|n| TIME_WORDS.contains(&n) || n.chars().all(|c| c.is_ascii_digit()))
         }
+        "as" => next == Some("of"),
         "at" => next.is_some_and(|n| {
             n.chars().any(|c| c.is_ascii_digit())
                 || matches!(
@@ -286,11 +287,12 @@ fn words_of(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Conservative negation cue for one relation: `text` must name the target
-/// within 3 tokens after the predicate verb, and a cue may only be separated
-/// from that verb by an auxiliary/adverb. Retraction phrasings are matched
-/// separately and only for their predicate group.
-fn infer_negated(text: &str, predicate: &str, group: &str, target: &str) -> bool {
+/// Conservative negation cue for one relation: the clause must name the
+/// relation's own source, `text` must name the target within 3 tokens after
+/// the predicate verb, and a cue may only be separated from that verb by an
+/// auxiliary/adverb. Retraction phrasings are matched separately and only for
+/// their predicate group.
+fn infer_negated(text: &str, predicate: &str, group: &str, target: &str, source: &str) -> bool {
     let target_words = words_of(target);
     if target_words.is_empty() {
         return false;
@@ -306,6 +308,11 @@ fn infer_negated(text: &str, predicate: &str, group: &str, target: &str) -> bool
         })
         .unwrap_or(text);
     let words = words_of(clause);
+    // A cue about another subject must not negate this relation ("Alice no
+    // longer leads the core team" says nothing about Bob's relation).
+    if !names_source(&words, source) {
+        return false;
+    }
     let Some(target_pos) = (0..words.len()).find(|&i| words[i..].starts_with(&target_words)) else {
         return false;
     };
@@ -360,6 +367,20 @@ fn infer_negated(text: &str, predicate: &str, group: &str, target: &str) -> bool
     false
 }
 
+/// True when the clause names the relation's own source. A multi-word source
+/// also matches its head word, because running text shortens names ("Bob" for
+/// "Bob Okafor").
+fn names_source(words: &[String], source: &str) -> bool {
+    let src = words_of(source);
+    let Some(head) = src.first() else {
+        return false;
+    };
+    if src.len() == 1 {
+        return words.iter().any(|w| w == head);
+    }
+    words.windows(src.len()).any(|x| x == src.as_slice()) || words.iter().any(|w| w == head)
+}
+
 /// End index (exclusive) of the nearest cue that ends at or before `verb_pos`.
 fn cue_before(words: &[String], verb_pos: usize) -> Option<usize> {
     for start in (0..verb_pos).rev() {
@@ -393,8 +414,11 @@ struct TextRetraction {
     subject: String,
     object: String,
     group: &'static str,
-    /// The sentence hedges or reports the event: offer the relation as a
-    /// conflict candidate, never end it.
+    /// The relation noun the sentence names ("no longer partners"); when set,
+    /// only relations whose fact uses that noun match.
+    noun: Option<&'static str>,
+    /// The sentence hedges or reports the event, or a name it uses is
+    /// ambiguous: offer the relation as a conflict candidate, never end it.
     candidate: bool,
 }
 
@@ -434,14 +458,27 @@ fn name_spans(
     spans
 }
 
+/// Name spans found in the text plus the first-name mentions that are too
+/// ambiguous to act on.
+struct RetractionSpans {
+    spans: Vec<(usize, usize, String)>,
+    /// A first name shared by several known people ("Maria" with two stored
+    /// Marias): a retraction on it is reported as a conflict, never ended.
+    ambiguous: HashSet<(usize, usize)>,
+}
+
+/// What a text retraction may end and what it must leave alone: `exclude` is
+/// the relation ids this memory just wrote as its own assertion.
+struct RetractionSink<'a> {
+    exclude: &'a [i64],
+    invalidated: &'a mut Vec<i64>,
+    conflicts: &'a mut Vec<crate::engine::Conflict>,
+}
+
 /// Every name span in the text that names a known entity: this memory's
 /// entities, the heuristic proper-noun spans (so a sentence-initial name is
 /// not lost), and alias n-grams already in the gazetteer.
-fn retraction_spans(
-    db: &Db,
-    content: &str,
-    entities: &[EntityIn],
-) -> Result<Vec<(usize, usize, String)>> {
+fn retraction_spans(db: &Db, content: &str, entities: &[EntityIn]) -> Result<RetractionSpans> {
     let mut names: Vec<String> = entities.iter().map(|e| e.name.clone()).collect();
     names.extend(
         extract::heuristic_entities(content)
@@ -462,10 +499,96 @@ fn retraction_spans(
             spans.push((start, end, norm));
         }
     }
+    let extra = first_name_spans(db, content, entities, &spans)?;
+    // A resolved first-name span replaces the bare heuristic span for the same
+    // surface ("Tom" -> "tom duarte"), so the retraction can match the card.
+    spans.retain(|(s, e, _)| !extra.spans.iter().any(|(xs, xe, _)| *xs <= *s && *xe >= *e));
+    spans.extend(extra.spans);
+    let ambiguous = extra.ambiguous;
     // Longest span first at the same start, so "New York City" beats "New".
     spans.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     spans.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
-    Ok(spans)
+    Ok(RetractionSpans { spans, ambiguous })
+}
+
+/// Spans for first names the text uses on their own ("Maria divorced Tom"):
+/// a first name that belongs to exactly one known person resolves to that
+/// person's canonical norm, so the retraction can match the stored relation.
+/// A first name shared by several people stays ambiguous.
+fn first_name_spans(
+    db: &Db,
+    content: &str,
+    entities: &[EntityIn],
+    spans: &[(usize, usize, String)],
+) -> Result<RetractionSpans> {
+    let lower = content.to_lowercase();
+    let mut st = db
+        .sql()
+        .prepare("SELECT norm FROM entities WHERE type='person'")?;
+    let norms: Vec<String> = st
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut by_first: HashMap<String, Vec<String>> = HashMap::new();
+    for norm in norms {
+        let mut parts = norm.split_whitespace();
+        let Some(first) = parts.next() else { continue };
+        if first.chars().count() < 3 || parts.next().is_none() {
+            continue;
+        }
+        by_first.entry(first.to_string()).or_default().push(norm);
+    }
+    let supplied: HashSet<String> = entities.iter().map(|e| text::norm_name(&e.name)).collect();
+    let mut extra = Vec::new();
+    let mut ambiguous = HashSet::new();
+    for (first, mut candidates) in by_first {
+        candidates.sort();
+        candidates.dedup();
+        for (start, end) in word_occurrences(&lower, &first) {
+            // The full name already covers this mention ("Maria Duarte").
+            let covered = spans
+                .iter()
+                .any(|(s, e, _)| *s <= start && *e >= end && *e - *s > end - start);
+            if covered {
+                continue;
+            }
+            // Prefer the person this write supplied when the name is shared.
+            let norm = candidates
+                .iter()
+                .find(|n| supplied.contains(n.as_str()))
+                .unwrap_or(&candidates[0])
+                .clone();
+            if candidates.len() > 1 {
+                ambiguous.insert((start, end));
+            }
+            extra.push((start, end, norm));
+        }
+    }
+    Ok(RetractionSpans {
+        spans: extra,
+        ambiguous,
+    })
+}
+
+fn word_occurrences(lower: &str, needle: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before = lower[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let after = lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if before && after {
+            out.push((start, end));
+        }
+        from = end;
+    }
+    out
 }
 
 /// Retractions stated by a text-only memory. The object is the first named
@@ -473,7 +596,7 @@ fn retraction_spans(
 /// nearest named entity before it, falling back to the subject of an earlier
 /// clause whose object it was ("Alice moved out of Austin and broke up with
 /// Bob" shares Alice).
-fn text_retractions(content: &str, spans: &[(usize, usize, String)]) -> Vec<TextRetraction> {
+fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetraction> {
     let lower = content.to_lowercase();
     let words: Vec<(usize, usize, &str)> = {
         let mut out = Vec::new();
@@ -508,12 +631,14 @@ fn text_retractions(content: &str, spans: &[(usize, usize, String)]) -> Vec<Text
             let phrase_end = words[p + plen - 1].1;
             let max_end = words.get(p + plen + 2).map(|w| w.1).unwrap_or(usize::MAX);
             let mut object_span = spans
+                .spans
                 .iter()
                 .find(|(s, _, _)| *s >= phrase_end && *s <= max_end)
                 .cloned();
             if object_span.is_none() && words.iter().skip(p + plen).take(4).any(|w| w.2 == "there")
             {
                 object_span = spans
+                    .spans
                     .iter()
                     .rev()
                     .find(|(_, e, _)| *e <= phrase_start)
@@ -522,7 +647,7 @@ fn text_retractions(content: &str, spans: &[(usize, usize, String)]) -> Vec<Text
             let Some((object_start, object_end, object)) = object_span else {
                 continue;
             };
-            let mut candidate = false;
+            let mut candidate = spans.ambiguous.contains(&(object_start, object_end));
             if object_start >= phrase_end {
                 // A span may start before the name it normalises to ("the
                 // Acme" from the alias n-grams), so the gap and the tail are
@@ -530,18 +655,20 @@ fn text_retractions(content: &str, spans: &[(usize, usize, String)]) -> Vec<Text
                 let gap_end = words.partition_point(|w| w.0 < object_start);
                 let next_word = words.partition_point(|w| w.0 < object_end);
                 // Rule 1: a determiner between the cue and the name means the
-                // name is inside a longer noun phrase, not the object.
-                if words[p + plen..gap_end]
-                    .iter()
-                    .any(|w| OBJECT_DETERMINERS.contains(&w.2))
-                {
+                // name is inside a longer noun phrase, not the object. The
+                // determiner that immediately precedes the name belongs to the
+                // object phrase itself ("the core team"), so only an earlier
+                // one rejects the match.
+                let gap = &words[p + plen..gap_end];
+                let earlier = gap.split_last().map_or(gap, |(_, rest)| rest);
+                if earlier.iter().any(|w| OBJECT_DETERMINERS.contains(&w.2)) {
                     continue;
                 }
                 // Rules 1+2: the object must be the whole object. A bare
                 // "left" also means "departed from" or "left behind", so it
                 // ends nothing unless a clause boundary, a time expression or
                 // an employment tail follows (rule 4).
-                if object_tail(&lower, object_end, &words, next_word, group, spans)
+                if object_tail(&lower, object_end, &words, next_word, group, &spans.spans)
                     == ObjectTail::Noun
                 {
                     continue;
@@ -555,28 +682,32 @@ fn text_retractions(content: &str, spans: &[(usize, usize, String)]) -> Vec<Text
                     .map(|(i, c)| i + c.len_utf8())
                     .unwrap_or(0);
                 let from = words.partition_point(|w| w.0 < clause);
-                candidate = hedged(&words, from, p);
+                candidate |= hedged(&words, from, p);
             }
             let min_start = words.get(p.saturating_sub(10)).map(|w| w.0).unwrap_or(0);
-            let Some(subject) = spans
+            let Some((subject_start, subject_end, subject)) = spans
+                .spans
                 .iter()
                 .rev()
                 .find(|(s, e, name)| *e <= phrase_start && *s >= min_start && *name != object)
-                .map(|(_, _, name)| name.clone())
+                .cloned()
             else {
                 continue;
             };
+            candidate |= spans.ambiguous.contains(&(subject_start, subject_end));
             found.push((
                 phrase_start,
                 TextRetraction {
                     subject,
                     object,
                     group,
+                    noun: None,
                     candidate,
                 },
             ));
         }
     }
+    found.extend(pair_retractions(&lower, &words, spans));
     found.sort_by_key(|(pos, _)| *pos);
     let mut out: Vec<TextRetraction> = Vec::new();
     let mut subject_of_object: HashMap<String, String> = HashMap::new();
@@ -606,17 +737,118 @@ fn text_retractions(content: &str, spans: &[(usize, usize, String)]) -> Vec<Text
     out
 }
 
-/// End the one live relation a text-only retraction names. Exactly one match
-/// ends; several matches are reported as conflict candidates and nothing is
-/// ended.
+/// Relation nouns a coordinated pair can be retracted by ("A and B are no
+/// longer partners"), with the predicate group each names ("" = any group,
+/// narrowed by the noun in the fact).
+const PAIR_NOUNS: &[(&str, &str)] = &[
+    ("partners", ""),
+    ("partner", ""),
+    ("married", "married to"),
+    ("friends", "friend with"),
+    ("friend", "friend with"),
+];
+
+/// "A and B are no longer <relation noun>": the pair before the cue is the
+/// subject and the object, so the retraction needs no object after the cue.
+fn pair_retractions(
+    lower: &str,
+    words: &[(usize, usize, &str)],
+    spans: &RetractionSpans,
+) -> Vec<(usize, TextRetraction)> {
+    const CUES: &[&[&str]] = &[
+        &["is", "no", "longer"],
+        &["are", "no", "longer"],
+        &["was", "no", "longer"],
+        &["were", "no", "longer"],
+        &["no", "longer"],
+    ];
+    let mut out = Vec::new();
+    for cue in CUES {
+        if words.len() < cue.len() {
+            continue;
+        }
+        for p in 0..=words.len() - cue.len() {
+            if !words[p..p + cue.len()]
+                .iter()
+                .map(|w| w.2)
+                .eq(cue.iter().copied())
+            {
+                continue;
+            }
+            let phrase_start = words[p].0;
+            let mut q = p + cue.len();
+            while q < words.len()
+                && matches!(
+                    words[q].2,
+                    "be" | "been" | "being" | "still" | "a" | "an" | "the"
+                )
+            {
+                q += 1;
+            }
+            let Some(&(_, _, seen)) = words.get(q) else {
+                continue;
+            };
+            let Some(&(noun, group)) = PAIR_NOUNS.iter().find(|(n, _)| *n == seen) else {
+                continue;
+            };
+            // The two nearest name spans before the cue, joined by "and".
+            let before: Vec<&(usize, usize, String)> = spans
+                .spans
+                .iter()
+                .filter(|(_, e, _)| *e <= phrase_start)
+                .collect();
+            let (Some(a), Some(b)) = (before.iter().rev().nth(1).copied(), before.last().copied())
+            else {
+                continue;
+            };
+            if a.1 > b.0
+                || !words
+                    .iter()
+                    .any(|w| w.2 == "and" && w.0 >= a.1 && w.1 <= b.0)
+            {
+                continue;
+            }
+            // The pair must be the clause's subject: only a short run of
+            // auxiliaries/modal words may separate it from the cue.
+            if words.partition_point(|w| w.0 < b.1) + 4 < p {
+                continue;
+            }
+            let clause = lower[..phrase_start]
+                .char_indices()
+                .rev()
+                .find(|(_, c)| matches!(c, '.' | ';' | '!' | '?' | '\n'))
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            let from = words.partition_point(|w| w.0 < clause);
+            let mut candidate = hedged(words, from, p);
+            candidate |= spans.ambiguous.contains(&(a.0, a.1));
+            candidate |= spans.ambiguous.contains(&(b.0, b.1));
+            if a.2 == b.2 {
+                continue;
+            }
+            out.push((
+                phrase_start,
+                TextRetraction {
+                    subject: a.2.clone(),
+                    object: b.2.clone(),
+                    group,
+                    // Only the generic group needs the fact-noun filter.
+                    noun: group.is_empty().then_some(noun),
+                    candidate,
+                },
+            ));
+        }
+    }
+    out
+}
+
 fn end_text_retractions(
     db: &Db,
     content: &str,
     entities: &[EntityIn],
     at: i64,
     now: i64,
-    invalidated: &mut Vec<i64>,
-    conflicts: &mut Vec<crate::engine::Conflict>,
+    sink: &mut RetractionSink<'_>,
 ) -> Result<()> {
     // Most text-only memories state nothing retracted; skip the alias scan.
     let words = words_of(content);
@@ -668,6 +900,17 @@ fn end_text_retractions(
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?
             .collect::<rusqlite::Result<_>>()?;
+        let rows: Vec<(i64, String, i64)> = rows
+            .into_iter()
+            .filter(|(rid, _, _)| !sink.exclude.contains(rid))
+            .filter(|(_, fact, _)| {
+                retraction.noun.is_none_or(|noun| {
+                    words_of(fact)
+                        .iter()
+                        .any(|w| w == noun || text::singularize(w) == noun)
+                })
+            })
+            .collect();
         match rows.as_slice() {
             [(rid, _, old_from)] if !retraction.candidate => {
                 if *old_from >= at {
@@ -684,15 +927,15 @@ fn end_text_retractions(
                         params![at, rid],
                     )?;
                 }
-                if !invalidated.contains(rid) {
-                    invalidated.push(*rid);
+                if !sink.invalidated.contains(rid) {
+                    sink.invalidated.push(*rid);
                 }
             }
             [] => {}
             rows => {
                 for (rid, fact, valid_from) in rows {
-                    if !conflicts.iter().any(|c| c.relation_id == *rid) {
-                        conflicts.push(crate::engine::Conflict {
+                    if !sink.conflicts.iter().any(|c| c.relation_id == *rid) {
+                        sink.conflicts.push(crate::engine::Conflict {
                             relation_id: *rid,
                             fact: fact.clone(),
                             valid_from: *valid_from,
@@ -1390,6 +1633,7 @@ fn write_prepared(
                 &resolved.canonical,
                 &resolved.group,
                 &relation.target,
+                &relation.source,
             )
         }) {
             0
@@ -1640,19 +1884,19 @@ fn write_prepared(
             },
         });
     }
-    // Text-only memories can still retract a fact ("Ivan left Acme") when the
-    // agent supplied no relations: end the one live relation the sentence
-    // names, or report candidates when the pair is ambiguous.
-    if relations.is_empty() && duplicate_of.is_none() {
-        end_text_retractions(
-            db,
-            &content,
-            &entities,
-            valid_from,
-            now,
-            &mut invalidated,
-            &mut conflicts,
-        )?;
+    // Text can still retract a different fact ("Alice no longer leads the
+    // team") when the agent supplied relations of its own: end the one live
+    // relation the sentence names, or report candidates when the pair is
+    // ambiguous. The relations this memory just evidenced are its own
+    // assertion and are never retracted by its prose.
+    if duplicate_of.is_none() {
+        let own: Vec<i64> = rel_results.iter().map(|r: &RelationResult| r.id).collect();
+        let mut sink = RetractionSink {
+            exclude: &own,
+            invalidated: &mut invalidated,
+            conflicts: &mut conflicts,
+        };
+        end_text_retractions(db, &content, &entities, valid_from, now, &mut sink)?;
     }
     // A memory with an end (--until) ends the relations only it keeps current.
     if let (None, Some(to)) = (duplicate_of, valid_to) {
@@ -2000,16 +2244,38 @@ mod negation_tests {
 
     #[test]
     fn negation_cues_are_anchored_on_the_target() {
-        // (text, predicate canonical, predicate group, target, negated?)
+        // (text, predicate canonical, predicate group, target, source, negated?)
         let cases = [
-            ("Alice no longer likes jazz.", "like", "like", "jazz", true),
-            ("Alice doesn't like jazz", "like", "like", "jazz", true),
-            ("Alice does not like jazz", "like", "like", "jazz", true),
+            (
+                "Alice no longer likes jazz.",
+                "like",
+                "like",
+                "jazz",
+                "Alice",
+                true,
+            ),
+            (
+                "Alice doesn't like jazz",
+                "like",
+                "like",
+                "jazz",
+                "Alice",
+                true,
+            ),
+            (
+                "Alice does not like jazz",
+                "like",
+                "like",
+                "jazz",
+                "Alice",
+                true,
+            ),
             (
                 "Bob never worked at Acme",
                 "work at",
                 "work at",
                 "Acme",
+                "Bob",
                 true,
             ),
             (
@@ -2017,6 +2283,7 @@ mod negation_tests {
                 "work at",
                 "work at",
                 "Acme",
+                "Bob",
                 true,
             ),
             (
@@ -2024,14 +2291,16 @@ mod negation_tests {
                 "live in",
                 "live in",
                 "Pune",
+                "Carol",
                 true,
             ),
-            ("Alice likes jazz.", "like", "like", "jazz", false),
+            ("Alice likes jazz.", "like", "like", "jazz", "Alice", false),
             (
                 "Bob works at Acme, not Globex.",
                 "work at",
                 "work at",
                 "Acme",
+                "Bob",
                 false,
             ),
             (
@@ -2039,6 +2308,7 @@ mod negation_tests {
                 "live in",
                 "live in",
                 "Denver",
+                "Alice",
                 false,
             ),
             (
@@ -2046,6 +2316,7 @@ mod negation_tests {
                 "live in",
                 "live in",
                 "Austin",
+                "Alice",
                 true,
             ),
             (
@@ -2053,23 +2324,33 @@ mod negation_tests {
                 "like",
                 "like",
                 "jazz",
+                "Alice",
                 false,
             ),
-            ("Alice left for Paris", "live in", "live in", "Paris", false),
+            (
+                "Alice left for Paris",
+                "live in",
+                "live in",
+                "Paris",
+                "Alice",
+                false,
+            ),
             (
                 "I have no doubt Alice likes jazz",
                 "like",
                 "like",
                 "jazz",
+                "Alice",
                 false,
             ),
-            ("Jazz is great", "like", "like", "jazz", false),
+            ("Jazz is great", "like", "like", "jazz", "Jazz", false),
             // ER-03 A: the cue belongs to the contrastive subject, not the verb.
             (
                 "Alice, not Bob, lives in Denver.",
                 "live in",
                 "live in",
                 "Denver",
+                "Alice",
                 false,
             ),
             // ER-03 B: the negated clause is the earlier target; Denver stays
@@ -2079,6 +2360,7 @@ mod negation_tests {
                 "live in",
                 "live in",
                 "Denver",
+                "Alice",
                 false,
             ),
             (
@@ -2086,6 +2368,7 @@ mod negation_tests {
                 "live in",
                 "live in",
                 "Austin",
+                "Alice",
                 true,
             ),
             // ER-07: retraction phrasings, matched per predicate group.
@@ -2094,6 +2377,7 @@ mod negation_tests {
                 "work at",
                 "work at",
                 "Acme",
+                "Bob",
                 true,
             ),
             (
@@ -2101,14 +2385,16 @@ mod negation_tests {
                 "work at",
                 "work at",
                 "Acme",
+                "Bob",
                 true,
             ),
-            ("Bob quit Acme.", "work at", "work at", "Acme", true),
+            ("Bob quit Acme.", "work at", "work at", "Acme", "Bob", true),
             (
                 "Bob left the job at Acme.",
                 "work at",
                 "work at",
                 "Acme",
+                "Bob",
                 true,
             ),
             (
@@ -2116,6 +2402,7 @@ mod negation_tests {
                 "live in",
                 "live in",
                 "Austin",
+                "Alice",
                 true,
             ),
             (
@@ -2123,6 +2410,7 @@ mod negation_tests {
                 "married to",
                 "married to",
                 "Bob",
+                "Alice",
                 true,
             ),
             (
@@ -2130,17 +2418,19 @@ mod negation_tests {
                 "married to",
                 "married to",
                 "Bob",
+                "Alice",
                 true,
             ),
-            ("Alice sold the boat.", "own", "own", "boat", true),
-            ("Bob stopped using Vim.", "use", "use", "Vim", true),
-            ("Bob gave up Vim.", "use", "use", "Vim", true),
+            ("Alice sold the boat.", "own", "own", "boat", "Alice", true),
+            ("Bob stopped using Vim.", "use", "use", "Vim", "Bob", true),
+            ("Bob gave up Vim.", "use", "use", "Vim", "Bob", true),
             // A retraction only retracts its own group.
             (
                 "Bob resigned from Acme.",
                 "live in",
                 "live in",
                 "Acme",
+                "Bob",
                 false,
             ),
             (
@@ -2148,6 +2438,7 @@ mod negation_tests {
                 "work at",
                 "work at",
                 "Acme",
+                "Bob",
                 true,
             ),
             // ER-14: Spanish "ya no".
@@ -2156,6 +2447,7 @@ mod negation_tests {
                 "vive en",
                 "vive en",
                 "Madrid",
+                "Alicia",
                 true,
             ),
             // Double negatives stay positive.
@@ -2164,14 +2456,32 @@ mod negation_tests {
                 "like",
                 "like",
                 "jazz",
+                "Alice",
                 false,
             ),
+            // H2-04: a cue about another subject never negates this relation.
+            (
+                "Alice no longer leads the core team; Bob took over.",
+                "lead",
+                "lead",
+                "core team",
+                "Bob",
+                false,
+            ),
+            (
+                "Alice no longer leads the core team; Bob took over.",
+                "lead",
+                "lead",
+                "core team",
+                "Alice",
+                true,
+            ),
         ];
-        for (text, predicate, group, target, want) in cases {
+        for (text, predicate, group, target, source, want) in cases {
             assert_eq!(
-                infer_negated(text, predicate, group, target),
+                infer_negated(text, predicate, group, target, source),
                 want,
-                "{text} / {target}"
+                "{text} / {target} / {source}"
             );
         }
     }

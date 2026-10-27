@@ -456,6 +456,68 @@ fn negation_question_keeps_negative_relations_without_a_cue_word() {
     assert!(out.facts.iter().all(|f| f.polarity == 0), "{:?}", out.facts);
 }
 
+// ---------------------------------------------------------------- nc-fix2 H2-01
+
+#[test]
+fn meta_memory_questions_are_not_negation_queries() {
+    let e = engine(Arc::new(HashEmbedder));
+    let lumen = remember(&e, "Lumen uses SQLite.", |i| {
+        i.entities = vec![entity("Lumen")];
+        i.relations = vec![relation("Lumen", "uses", "SQLite", "Lumen uses SQLite")];
+    });
+    remember(&e, "Lumen used Postgres before the switch.", |i| {
+        i.entities = vec![entity("Lumen")];
+        i.relations = vec![RelationIn {
+            valid_from: Some("2026-01-01".into()),
+            valid_to: Some("2026-09-29".into()),
+            ..relation("Lumen", "used", "Postgres", "Lumen used Postgres")
+        }];
+    });
+    for query in [
+        "what database does lumen use",
+        "I don't remember what database lumen uses",
+        "I cannot remember what database lumen uses",
+        "I can't remember what database lumen uses",
+        "I forgot what database lumen uses",
+        "can you remind me what database lumen uses",
+        "remind me what database lumen uses",
+    ] {
+        let out = e
+            .recall(&RecallInput {
+                query: query.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            ids(&out).contains(&lumen),
+            "{query:?} lost the positive fact: {:?}",
+            out.memories
+        );
+    }
+}
+
+#[test]
+fn negation_intent_ignores_negation_of_the_speakers_memory_verb() {
+    for query in [
+        "I don't remember what database lumen uses",
+        "I cannot remember what database lumen uses",
+        "I can't remember what database lumen uses",
+        "I forgot what database lumen uses",
+        "can you remind me what database lumen uses",
+        "remind me what database lumen uses",
+    ] {
+        assert!(!paths::negation_intent(query), "{query:?}");
+    }
+    for query in [
+        "who does not like jazz",
+        "which service is not in rust",
+        "what database does lumen not use",
+        "what no longer works",
+    ] {
+        assert!(paths::negation_intent(query), "{query:?}");
+    }
+}
+
 #[test]
 fn a_chain_link_stated_only_in_prose_is_followed() {
     let e = engine(Arc::new(HashEmbedder));

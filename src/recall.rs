@@ -183,6 +183,25 @@ fn is_ended(row: &MemoryRow, cutoff: i64) -> bool {
     row.10.is_some_and(|x| x <= cutoff) || row.11.is_some()
 }
 
+/// A planned row is shown for a future-event question only when it is about
+/// the same thing: at least two non-stopword query tokens (3+ chars) appear in
+/// its text.
+fn planned_matches_query(content: &str, query: &str) -> bool {
+    let want: Vec<String> = text::tokens(query)
+        .into_iter()
+        .filter(|t| t.chars().count() >= 3 && !text::is_stopword(t))
+        .map(|t| text::singularize(&t))
+        .collect();
+    if want.is_empty() {
+        return false;
+    }
+    let have: HashSet<String> = text::tokens(content)
+        .into_iter()
+        .map(|t| text::singularize(&t))
+        .collect();
+    want.iter().filter(|t| have.contains(*t)).count() >= 2
+}
+
 #[allow(clippy::too_many_arguments)]
 fn eligible(
     row: &MemoryRow,
@@ -203,12 +222,14 @@ fn eligible(
         return false;
     }
     // A plan or a future-dated memory has not happened yet: it is not current
-    // truth unless the question asks about plans or takes an as-of snapshot.
+    // truth unless the question asks about plans, takes an as-of snapshot, or
+    // asks about that specific future event's date or state.
     if as_of.is_none() && !planned_ok {
-        if *from > now {
-            return false;
-        }
-        if tags.split_whitespace().any(|tag| tag == "planned") {
+        let future = *from > now || tags.split_whitespace().any(|tag| tag == "planned");
+        if future
+            && !(temporal::future_event_intent(&input.query)
+                && planned_matches_query(&row.1, &input.query))
+        {
             return false;
         }
     }

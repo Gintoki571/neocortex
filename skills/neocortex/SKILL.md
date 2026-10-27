@@ -75,19 +75,28 @@ Store something when it will still matter next week:
   `—NOT→` and ends the matching positive interval.
 - **Text-only retraction**: a sentence with no relation ("Ivan left Acme; he no
   longer works there") ends the one live fact it names, at `valid_from`, and
-  reports it as `invalidated`. Cues that end a relation: "left his job at X",
-  "left X" (work at), "quit X", "resigned from X", "moved out of X" (lives in),
-  "divorced" / "broke up with" (married to), "sold X" (own), "stopped using X",
-  "gave up X", "no longer ..." (any predicate). The name must be the whole
-  object of the cue: "left the Acme office", "left Acme a voicemail" and
-  "Acme's parking lot" end nothing. A hedge or report ("almost quit", "might
-  have left", "thinks Bob left") returns a `conflicts` candidate and ends
-  nothing. If several live facts match, the result is `conflicts` and nothing
-  ends, so say which one you mean. A live fact recorded now is retired even
-  when the retraction is dated earlier ("Maria divorced Tom in 2024").
+  reports it as `invalidated`. It also runs on a write that supplies its own
+  relations, for a *different* fact the prose names ("Alice no longer leads the
+  core team; Bob took over" with only Bob's relation): what you just supplied
+  is never retracted by the same sentence. Cues that end a relation: "left his
+  job at X", "left X" (work at), "quit X", "resigned from X", "moved out of X"
+  (lives in), "divorced" / "broke up with" (married to), "sold X" (own),
+  "stopped using X", "gave up X", "no longer ..." (any predicate). A first name
+  resolves through the entities you supplied and the stored people ("Maria
+  divorced Tom" with Maria Duarte and Tom Duarte), and a first name shared by
+  several people only returns a conflict. A pair before the cue ("Acme and
+  Northwind are no longer partners") ends the pair's relation. The name must be
+  the whole object of the cue: "left the Acme office", "left Acme a voicemail"
+  and "Acme's parking lot" end nothing. A hedge or report ("almost quit",
+  "might have left", "thinks Bob left") returns a `conflicts` candidate and
+  ends nothing. If several live facts match, the result is `conflicts` and
+  nothing ends, so say which one you mean. A live fact recorded now is retired
+  even when the retraction is dated earlier ("Maria divorced Tom in 2024").
 - **Plans and routines** come from the text: "we will move next spring" gets a
   future `valid_from` (or tag `planned` when no date resolves) and is not a
-  current fact. "standup every Monday" keeps the rule and gets tag `recurring`.
+  current fact. A question about the planned event itself ("when does the
+  deploy freeze start", "is the v1 API deprecated") still finds it.
+  "standup every Monday" keeps the rule and gets tag `recurring`.
 - **Correct, don't contradict**: use `supersedes: ["m12"]` for a newer memory
   that replaces an older one, or `invalidate m<id>` when a fact stopped being
   true. Never write two live facts that disagree. When `remember` returns
@@ -119,7 +128,11 @@ and `next:` when present.
   fact. A range with `ended` is **history**: true then, not now. `retracted`
   means the source was forgotten, not that the fact stopped being true.
 - Planned and future-dated memories are left out unless the question asks about
-  plans ("upcoming", "planned", "scheduled") or names a future window.
+  plans ("upcoming", "planned", "scheduled"), names a future window, or asks
+  about that event ("when does the deploy freeze start", "is the v1 API
+  deprecated").
+- A memory-lapse phrasing ("I don't remember ...", "I forgot ...", "remind me
+  ...") is a request, not a negation: pass the question itself to recall.
 - History is automatic for past-tense wording ("used to", "before",
   "previously", "changed", "did ... use", "no longer"), so ended facts appear
   without `include_history`. Use `as_of` for "what was true then".
