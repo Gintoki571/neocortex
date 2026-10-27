@@ -303,6 +303,49 @@ pub fn wants_plans(text: &str) -> bool {
     .any(|word| has_phrase(&lower, word))
 }
 
+/// True when the question asks about a future event's date or state ("when
+/// does the deploy freeze start", "is the v1 API deprecated"). Recall then
+/// keeps planned rows whose content matches the question, instead of dropping
+/// every plan as not-yet-current.
+pub fn future_event_intent(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let trimmed = lower.trim_start();
+    if [
+        "when ",
+        "when's ",
+        "what date",
+        "what day",
+        "what time",
+        "which date",
+    ]
+    .iter()
+    .any(|start| trimmed.starts_with(start))
+        || lower.contains("how soon")
+    {
+        return true;
+    }
+    const CUES: &[&str] = &[
+        "deprecat",
+        "shutdown",
+        "shut down",
+        "freeze",
+        "launch",
+        "go live",
+        "release date",
+        "deadline",
+        "kickoff",
+        "kick-off",
+        "scheduled",
+        "schedule",
+        "upcoming",
+        "postpone",
+        "cancel",
+        "start date",
+        "end date",
+    ];
+    CUES.iter().any(|cue| lower.contains(cue))
+}
+
 /// True when the question asks about order in time ("first", "before",
 /// "after", "earlier", "later", "which came first").
 pub fn ordering_intent(text: &str) -> bool {

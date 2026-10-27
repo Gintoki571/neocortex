@@ -83,8 +83,40 @@ pub fn has_negation_cue(value: &str) -> bool {
 }
 
 /// True when the question asks for what is not the case.
+///
+/// Negation that scopes the speaker's own memory verb ("I don't remember
+/// what database Lumen uses") is a request, not a question about what is not
+/// the case, so that cue is screened out first.
 pub fn negation_intent(query: &str) -> bool {
-    has_negation_cue(query)
+    let folded = text::fold(query);
+    let words: Vec<&str> = folded.split_whitespace().collect();
+    let kept: Vec<&str> = {
+        let mut kept = Vec::with_capacity(words.len());
+        let mut i = 0;
+        while i < words.len() {
+            if memory_verb_negation(&words, i) {
+                i += 2;
+                continue;
+            }
+            kept.push(words[i]);
+            i += 1;
+        }
+        kept
+    };
+    has_negation_cue(&kept.join(" "))
+}
+
+fn bare_word(word: &str) -> String {
+    word.chars().filter(|c| *c != '\'' && *c != '’').collect()
+}
+
+/// True when `words[i]` is a negation cue that negates a memory verb at
+/// `words[i + 1]` ("don't remember", "cannot recall", "can't recollect").
+fn memory_verb_negation(words: &[&str], i: usize) -> bool {
+    if i + 1 >= words.len() || !NEGATION_WORDS.contains(&bare_word(words[i]).as_str()) {
+        return false;
+    }
+    matches!(words[i + 1], "remember" | "recall" | "recollect")
 }
 
 /// True when the question asks for a cause ("why did X happen", "what caused

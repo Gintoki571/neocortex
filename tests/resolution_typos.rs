@@ -360,6 +360,56 @@ fn er07_real_model_near_names_keep_their_names() {
     assert_eq!(res.status, "near");
 }
 
+// H2-12 investigation: the write path has no email/company field, so the only
+// non-name identity evidence is the entity description (folded into the card
+// vector) and the memory context. When descriptions are supplied the existing
+// `entity_conflict` veto keeps a near surname pair apart (measured card 0.639,
+// context 0.597, both below 0.73); with no descriptions the card vector is the
+// bare name again and the pair merges on the name layer alone - the documented
+// limitation, not pinned here.
+#[test]
+fn h2_12_supplied_descriptions_keep_a_near_surname_pair_apart() {
+    let Some(e) = real_model_engine() else {
+        eprintln!("skipping: UltraBERT model directory absent");
+        return;
+    };
+    let described = |name: &str, description: &str| EntityIn {
+        name: name.into(),
+        kind: Some("person".into()),
+        description: Some(description.into()),
+        ..Default::default()
+    };
+    let first = remember_named(
+        &e,
+        "Jonas Webber interviewed with us on 2026-09-30 but withdrew.",
+        vec![described(
+            "Jonas Webber",
+            "interviewed with us on 2026-09-30 but withdrew",
+        )],
+        vec![],
+    );
+    let webber_id = first.entities[0].id;
+    let second = remember_named(
+        &e,
+        "Jonas Weber joined as frontend engineer on 2026-10-05.",
+        vec![described(
+            "Jonas Weber",
+            "joined as frontend engineer on 2026-10-05",
+        )],
+        vec![],
+    );
+    let res = resolution(&second, "Jonas Weber");
+    assert_ne!(
+        res.id, webber_id,
+        "different people must not merge: {res:?}"
+    );
+    assert!(
+        res.status == "new" || res.status == "ambiguous",
+        "expected new or ambiguous, got {:?}",
+        res.status
+    );
+}
+
 // ------------------------------------------------------------------- Q-08
 
 #[test]
