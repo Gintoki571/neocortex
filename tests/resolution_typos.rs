@@ -130,17 +130,19 @@ pub fn remember_named(
 #[test]
 fn er07_typo_becomes_the_same_entity() {
     let e = engine();
+    // ER-08: the typo pair also names the same employer, the corroborating
+    // evidence an automatic near-name merge needs.
     let first = remember_named(
         &e,
-        "Jonathan Smith called about the servers.",
-        vec![person("Jonathan Smith")],
+        "Jonathan Smith called Acme about the servers.",
+        vec![person("Jonathan Smith"), org("Acme")],
         vec![],
     );
     let smith_id = resolution(&first, "Jonathan Smith").id;
     let second = remember_named(
         &e,
-        "Jonathon Smith called about the servers.",
-        vec![person("Jonathon Smith")],
+        "Jonathon Smith called Acme about the servers.",
+        vec![person("Jonathon Smith"), org("Acme")],
         vec![],
     );
     let res = resolution(&second, "Jonathon Smith");
@@ -341,18 +343,19 @@ fn er07_real_model_near_names_keep_their_names() {
         );
     }
 
-    // Row 5: a typo-sized edit still merges.
+    // Row 5: a typo-sized edit still merges when the writes corroborate it
+    // (both name the same employer; ER-08).
     let out = remember_named(
         &e,
-        "Jonathan Smith called about the servers.",
-        vec![person("Jonathan Smith")],
+        "Jonathan Smith called Acme about the servers.",
+        vec![person("Jonathan Smith"), org("Acme")],
         vec![],
     );
     let smith_id = out.entities[0].id;
     let out = remember_named(
         &e,
-        "Jonathon Smith called about the servers again.",
-        vec![person("Jonathon Smith")],
+        "Jonathon Smith called Acme about the servers again.",
+        vec![person("Jonathon Smith"), org("Acme")],
         vec![],
     );
     let res = resolution(&out, "Jonathon Smith");
@@ -408,6 +411,117 @@ fn h2_12_supplied_descriptions_keep_a_near_surname_pair_apart() {
         "expected new or ambiguous, got {:?}",
         res.status
     );
+}
+
+// ER-08: a typo-sized near-name merge needs corroborating evidence. Two
+// different people one Damerau-Levenshtein edit apart, each with their own
+// residence, must stay two entities with both facts live; the second mention
+// is reported as ambiguous with the candidate instead of silently merging.
+#[test]
+fn er08_different_people_one_edit_apart_stay_separate() {
+    let e = engine();
+    let first = remember_named(
+        &e,
+        "Anouk Kridhar lives in Pune.",
+        vec![person("Anouk Kridhar"), place("Pune")],
+        vec![rel("Anouk Kridhar", "lives in", "Pune", true)],
+    );
+    let kridhar_id = resolution(&first, "Anouk Kridhar").id;
+    let second = remember_named(
+        &e,
+        "Anouk Tridhar lives in Hyderabad.",
+        vec![person("Anouk Tridhar"), place("Hyderabad")],
+        vec![rel("Anouk Tridhar", "lives in", "Hyderabad", true)],
+    );
+    let res = resolution(&second, "Anouk Tridhar");
+    assert_ne!(
+        res.id, kridhar_id,
+        "different people must not merge: {res:?}"
+    );
+    assert_eq!(res.status, "ambiguous", "the candidate is reported");
+    assert!(res.candidates.iter().any(|c| c.id == kridhar_id), "{res:?}");
+    assert!(
+        second.invalidated_relations.is_empty(),
+        "person B's write must not end person A's fact: {:?}",
+        second.invalidated_relations
+    );
+
+    // Alternating writes: each person keeps their own entity and fact.
+    let third = remember_named(
+        &e,
+        "Anouk Kridhar still lives in Pune.",
+        vec![person("Anouk Kridhar"), place("Pune")],
+        vec![rel("Anouk Kridhar", "lives in", "Pune", true)],
+    );
+    assert_eq!(resolution(&third, "Anouk Kridhar").id, kridhar_id);
+    let fourth = remember_named(
+        &e,
+        "Anouk Tridhar still lives in Hyderabad.",
+        vec![person("Anouk Tridhar"), place("Hyderabad")],
+        vec![rel("Anouk Tridhar", "lives in", "Hyderabad", true)],
+    );
+    assert_eq!(resolution(&fourth, "Anouk Tridhar").id, res.id);
+    assert!(third.invalidated_relations.is_empty());
+    assert!(fourth.invalidated_relations.is_empty());
+
+    for rid in [first.relations[0].id, second.relations[0].id] {
+        let live = sql_i64(
+            &e,
+            &format!("SELECT EXISTS(SELECT 1 FROM relations WHERE id={rid} AND valid_to IS NULL AND expired_at IS NULL)"),
+        );
+        assert_eq!(live, Some(1), "relation {rid} must stay live");
+    }
+}
+
+// A shared place is not identity evidence: two people with alike surnames in
+// the same city are still two people.
+#[test]
+fn er08_shared_city_alone_does_not_merge() {
+    let e = engine();
+    let first = remember_named(
+        &e,
+        "Anouk Kridhar lives in Pune.",
+        vec![person("Anouk Kridhar"), place("Pune")],
+        vec![rel("Anouk Kridhar", "lives in", "Pune", true)],
+    );
+    let kridhar_id = resolution(&first, "Anouk Kridhar").id;
+    let second = remember_named(
+        &e,
+        "Anouk Tridhar lives in Pune too.",
+        vec![person("Anouk Tridhar"), place("Pune")],
+        vec![rel("Anouk Tridhar", "lives in", "Pune", true)],
+    );
+    let res = resolution(&second, "Anouk Tridhar");
+    assert_ne!(res.id, kridhar_id, "a shared city is no identity: {res:?}");
+    assert_eq!(res.status, "ambiguous");
+    assert!(
+        second.invalidated_relations.is_empty(),
+        "{:?}",
+        second.invalidated_relations
+    );
+}
+
+// A typo-sized near-name merge stays automatic when the write shares a
+// non-place neighbour (the employer) with the candidate's stored memories.
+#[test]
+fn er08_corroborated_typo_still_merges() {
+    let e = engine();
+    let first = remember_named(
+        &e,
+        "Jonathan Smith called Acme about the servers.",
+        vec![person("Jonathan Smith"), org("Acme")],
+        vec![],
+    );
+    let smith_id = resolution(&first, "Jonathan Smith").id;
+    let second = remember_named(
+        &e,
+        "Jonathon Smith called Acme about the servers again.",
+        vec![person("Jonathon Smith"), org("Acme")],
+        vec![],
+    );
+    let res = resolution(&second, "Jonathon Smith");
+    assert_eq!(res.id, smith_id, "shared employer corroborates: {res:?}");
+    assert_eq!(res.status, "near");
 }
 
 // ------------------------------------------------------------------- Q-08

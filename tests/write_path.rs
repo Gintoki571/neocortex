@@ -2418,16 +2418,29 @@ fn merge_reconciles_exclusive_facts_without_zero_length_intervals() {
         false,
     )
     .unwrap();
-    let (to2, expired2): (Option<i64>, Option<i64>) =
+    // Which equal-start fact loses is an implementation detail (the earliest
+    // row wins); what must hold is that exactly one is system-retired and
+    // neither records a zero-length world interval.
+    let fact_state = |id: i64| -> (Option<i64>, Option<i64>) {
         e.db.sql()
             .query_row(
                 "SELECT valid_to,expired_at FROM relations WHERE id=?1",
-                [a2.relations[0].id],
+                [id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .unwrap();
-    assert!(to2.is_none(), "no zero-length interval ({to2:?})");
-    assert!(expired2.is_some(), "equal-start loser is system-retired");
+            .unwrap()
+    };
+    let (to_a, expired_a) = fact_state(a2.relations[0].id);
+    let (to_d, expired_d) = fact_state(d2.relations[0].id);
+    assert!(
+        to_a.is_none() && to_d.is_none(),
+        "no zero-length interval ({to_a:?}, {to_d:?})"
+    );
+    assert_eq!(
+        usize::from(expired_a.is_some()) + usize::from(expired_d.is_some()),
+        1,
+        "exactly one equal-start fact is system-retired (a={expired_a:?}, d={expired_d:?})"
+    );
 }
 
 /// rel.md ER-10 / rel.md ER-12: an inverse or symmetric write is stored once

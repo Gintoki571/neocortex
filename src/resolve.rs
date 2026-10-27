@@ -406,7 +406,10 @@ fn candidates(db: &Db, norm: &str, embedding: &[f32]) -> Result<Candidates> {
 /// Verdict of a near-name comparison between a mention norm and a stored
 /// entity (Graphify layered dedup, ER-07).
 pub(crate) enum Verdict {
-    /// JW >= name_merge, typo-sized edit, no blocker, entity cosine agrees.
+    /// JW >= name_merge, typo-sized edit, no blocker and (for a semantic
+    /// embedder) agreeing entity cosine. The write path still needs
+    /// independent evidence for this name-layer pass (ER-08), except for
+    /// transliteration-key-equal pairs.
     Merge,
     /// name_near <= JW < name_merge with no blocker, or a pass-everything
     /// pair whose differing tokens sit over the typo-edit allowance: near,
@@ -450,7 +453,8 @@ pub(crate) struct NearJudge<'a> {
 /// then (for a semantic embedder) the F2 entity_conflict cosine as a veto
 /// against the candidate card, falling back to the memory-context cosine of
 /// the candidate's own memories. A hash embedder cannot judge identity, so
-/// the name layer alone decides "Merge".
+/// the name layer alone decides "Merge"; `near_corroborated` still gates that
+/// verdict on the write path (ER-08).
 pub(crate) fn near_name(
     db: &Db,
     a_norm: &str,
@@ -490,6 +494,81 @@ pub(crate) fn near_name(
     }
 }
 
+/// ER-08: a name-layer `Merge` between typo-sized names is automatic only for
+/// transliteration-key-equal spellings ("Müller"/"Mueller"), where the pair is
+/// one name in two orthographies. Everything else needs independent evidence:
+/// a non-place entity named in the same write that the candidate's own
+/// memories also mention. Without it the mention gets its own entity and an
+/// `ambiguous` report - a duplicate is cheap, a silent wrong merge ends the
+/// other person's exclusive facts. An agreeing description is not evidence:
+/// generic role descriptions agree across different people, and a
+/// description-less card embeds as the bare name (the name layer again).
+fn near_corroborated(
+    db: &Db,
+    a_norm: &str,
+    b_norm: &str,
+    entity_id: i64,
+    write_names: &[String],
+) -> Result<bool> {
+    if text::translit_norm(a_norm) == text::translit_norm(b_norm) {
+        return Ok(true);
+    }
+    shared_neighbour(db, a_norm, entity_id, write_names)
+}
+
+/// Types that corroborate identity when shared between a mention and a stored
+/// entity: people and organisations. Places are hubs (two different people in
+/// one city are ordinary); tools and an untyped entity say nothing about who
+/// the mention is.
+fn corroborating_types_sql() -> String {
+    PERSON_TYPES
+        .iter()
+        .chain(ORG_TYPES.iter())
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// True when the candidate entity and the current write share a non-place
+/// neighbour: some entity named in this write (other than the mention itself)
+/// is typed person/org and is mentioned by a stored memory that also mentions
+/// the candidate.
+fn shared_neighbour(
+    db: &Db,
+    own_norm: &str,
+    entity_id: i64,
+    write_names: &[String],
+) -> Result<bool> {
+    let norms: Vec<&String> = write_names
+        .iter()
+        .filter(|norm| !norm.is_empty() && *norm != own_norm)
+        .collect();
+    if norms.is_empty() {
+        return Ok(false);
+    }
+    let marks = vec!["?"; norms.len()].join(",");
+    let sql = format!(
+        "SELECT EXISTS(
+           SELECT 1 FROM mentions own
+           JOIN mentions other ON other.memory_id = own.memory_id
+           JOIN entities e ON e.id = other.entity_id
+           JOIN entity_aliases a ON a.entity_id = other.entity_id
+           WHERE own.entity_id = ?1
+             AND other.entity_id <> ?1
+             AND a.alias_norm IN ({marks})
+             AND e.type IN ({})
+         )",
+        corroborating_types_sql()
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + norms.len());
+    params.push(&entity_id);
+    for norm in &norms {
+        params.push(norm);
+    }
+    Ok(db.sql().query_row(&sql, params.as_slice(), |r| r.get(0))?)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_entity(
     db: &Db,
     item: &EntityIn,
@@ -498,6 +577,7 @@ pub fn resolve_entity(
     now: i64,
     cfg: &Config,
     semantic: bool,
+    write_names: &[String],
 ) -> Result<Resolved> {
     let norm = text::norm_name(&item.name);
     if norm.is_empty() {
@@ -653,9 +733,12 @@ pub fn resolve_entity(
     }
 
     // ER-07 layered dedup inside the candidate pool: a near-name pair merges
-    // only when JW passes, no blocker fires, the change is typo-sized and the
-    // entity cosine agrees. Near/Blocked/Unsure pairs surface as ambiguous
-    // candidates instead of a silent `new` (never silent).
+    // only when JW passes, no blocker fires, the change is typo-sized, the
+    // entity cosine agrees (semantic embedder) and the write carries
+    // independent evidence (ER-08: transliteration-key equality, or a shared
+    // person/org neighbour named in the same write). Near/Blocked/Unsure pairs
+    // and uncorroborated merges surface as ambiguous candidates instead of a
+    // silent `new` (never silent).
     let mut merged: Option<(i64, f64)> = None;
     let mut flagged: Vec<i64> = Vec::new();
     let judge = NearJudge {
@@ -666,6 +749,16 @@ pub fn resolve_entity(
     };
     for (id, entity_norm, _, _) in &details {
         let verdict = near_name(db, &norm, entity_norm, *id, &judge);
+        if matches!(verdict, Verdict::Merge)
+            && !near_corroborated(db, &norm, entity_norm, *id, write_names)?
+        {
+            // Name layer passed, but nothing independent says it is the same
+            // entity: report the candidate instead of merging (ER-08).
+            if flagged.len() < 5 && !flagged.contains(id) {
+                flagged.push(*id);
+            }
+            continue;
+        }
         match verdict {
             Verdict::Merge => {
                 merged.get_or_insert((*id, 1.0));
@@ -1548,6 +1641,7 @@ mod tests {
             100,
             &cfg,
             true,
+            &[],
         )
         .unwrap();
         assert_eq!(r1.similar.len(), 0);
@@ -1567,6 +1661,7 @@ mod tests {
             100,
             &cfg,
             true,
+            &[],
         )
         .unwrap();
         // Should NOT create a similar edge to "7"
@@ -1593,6 +1688,7 @@ mod tests {
             100,
             &cfg,
             true,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1618,6 +1714,7 @@ mod tests {
             100,
             &cfg,
             true,
+            &[],
         )
         .unwrap();
         let r5 = resolve_entity(
@@ -1640,6 +1737,7 @@ mod tests {
             100,
             &cfg,
             true,
+            &[],
         )
         .unwrap();
         assert_eq!(

@@ -304,18 +304,22 @@ also render the interval with a computed duration ("3 years 2 months",
 - Same name, different type: two entity rows (casing folds), one per type.
 - Typos, diacritic spellings and other scripts: names are compared on a
   transliteration key that is never stored ("Мюллер", "Müller", "Mueller" key
-  to the same string). A near name that passes the hard blockers, is a
-  typo-sized edit on the differing tokens (1 Damerau-Levenshtein edit up to 8
-  chars, 2 beyond), and agrees with the entity cosine joins the existing card
-  with `near` status ("Bergn" for "Bergen"). A lookalike that hits a blocker
-  or is more than a typo away stays a separate card and is reported as
-  `ambiguous` with the candidate, never silently merged: sibling names
-  ("Bergen Airport"/"Bergen Airport South", "Novak Group North", "Jan
-  Nováček"), label pairs ("Apt 3B"/"Apt 3C"), and other hard negatives
-  ("Alex"/"Alexis", "Room 101"/"Room 102", "Teresa Mota"/"Teresa Moura").
-  A write with no description and no agreeing memory context cannot separate a
-  one-edit short surname from a typo ("Jonas Webber"/"Jonas Weber"): supply
-  descriptions, or pass `distinct_from` when they are different people.
+  to the same string). A spelling variant with the same key joins the existing
+  card with `near` status. A typo-sized edit (1 Damerau-Levenshtein edit on the
+  differing tokens up to 8 chars, 2 beyond) that also clears the hard blockers
+  merges only with corroboration: the same write must name a person or
+  organisation that the candidate's stored memories also mention. A shared
+  place, a shared tool or a similar description is not identity evidence, so
+  two different people one edit apart stay two cards (`ambiguous` with the
+  candidate); confirm with `same_as` when it is the same person. A lookalike
+  that hits a blocker or is more than a typo away stays separate and is
+  reported the same way: sibling names ("Bergen Airport"/"Bergen Airport
+  South", "Novak Group North", "Jan Nováček"), label pairs ("Apt 3B"/"Apt
+  3C"), and other hard negatives ("Alex"/"Alexis", "Room 101"/"Room 102",
+  "Teresa Mota"/"Teresa Moura").
+  A one-edit short surname with no corroborating neighbour ("Jonas
+  Webber"/"Jonas Weber") is reported as `ambiguous` too; pass `distinct_from`
+  when they are different people, or `same_as` when it is one person's typo.
 - Same name + conflicting description: the match keeps `ambiguous` status with
   a ranked candidate; neocortex never pastes one description over the other.
 - Same name among homonyms: a typed mention of a single match is a normal

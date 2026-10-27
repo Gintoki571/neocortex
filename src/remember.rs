@@ -1382,6 +1382,19 @@ fn write_prepared(
         pred_base,
         pred_index,
     } = p;
+    // Every entity name this write supplies, entity cards and relation
+    // endpoints alike: the neighbour evidence a near-name merge needs (ER-08).
+    let mut write_names: Vec<String> = Vec::new();
+    for name in entities
+        .iter()
+        .map(|e| &e.name)
+        .chain(relations.iter().flat_map(|r| [&r.source, &r.target]))
+    {
+        let norm = text::norm_name(name);
+        if !norm.is_empty() && !write_names.contains(&norm) {
+            write_names.push(norm);
+        }
+    }
     let endpoint_vector = |name: &str| -> &[f32] {
         let norm = text::norm_name(name);
         if let Some(pos) = entities
@@ -1475,6 +1488,7 @@ fn write_prepared(
             now,
             cfg,
             semantic,
+            &write_names,
         )?;
         let eid = resolved.id;
         ids.insert(text::norm_name(&entity.name), eid);
@@ -1585,6 +1599,7 @@ fn write_prepared(
             cfg,
             endpoint_vector(src_name),
             semantic,
+            &write_names,
         )?;
         let mut dst = resolve_endpoint(
             db,
@@ -1595,6 +1610,7 @@ fn write_prepared(
             cfg,
             endpoint_vector(dst_name),
             semantic,
+            &write_names,
         )?;
         if pred.symmetric && src > dst {
             std::mem::swap(&mut src, &mut dst);
@@ -2116,6 +2132,7 @@ fn resolve_endpoint(
     cfg: &Config,
     embedding: &[f32],
     semantic: bool,
+    write_names: &[String],
 ) -> Result<i64> {
     let norm = text::norm_name(name);
     if let Some(id) = ids.get(&norm) {
@@ -2133,6 +2150,7 @@ fn resolve_endpoint(
         now,
         cfg,
         semantic,
+        write_names,
     )?;
     ids.insert(norm, resolved.id);
     kg::project_entity_from_db(db, resolved.id)?;
