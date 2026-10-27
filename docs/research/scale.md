@@ -181,6 +181,34 @@ Measured on this host, `taskset -c 0`, interleaved main/branch runs, both binari
 
 The world-300 p50 gain is small because that graph has only 1,283 relations; the effect grows with hub fan-in and graph size (world-3000: recall p50 -33%, p95 -44%; ingest -20%). Results are identical: acc@10 / recall / MRR and every per-category row match main on world-300 (0.992 / 0.965 / 0.881) and world-3000 (0.898 / 0.837 / 0.603), and the ingested DBs match table by table (`memories`, `entities`, `relations`, `mentions`, `memory_links`, `relation_evidence` row hashes equal on both worlds). Not re-measured at 108k (the DB from nc-scale was a scratch build).
 
+## After nc-hop3: the third hop is ended by a false entity merge
+
+The world-3000 three-hop misses are not a fan-out or depth limit. Every one of the 8 replicated misses (6 unique
+queries; the real-model world-3000 DB, `NEOCORTEX_DEBUG_HOPS` dump) has the same shape: hop 1 (the sibling) is a
+live fact and is found at rank 0-1, and the next hop is **ended**, so `paths::incident` drops it (`vis.shows`),
+the walk takes the *other* live fact on the same entity, and hop 3 is never reached.
+
+| query (answer) | hop 1 | hop 2 | hop 3 | chain the beams take |
+|---|---|---|---|---|
+| Joanna Sheprasad's sister (Sofia) | r4265 live, hit #0 | r1452 "Anouk Kridhar's manager is Jason Darani" **ended** | r4302 unreachable | "Anouk Tridhar's manager is Max Dalgan" -> Aurangabad |
+| Daria Varani's brother (Accra) | r5820 live, hit #0 | r1923 "Rajesh Kohvari's manager is Maja Deshsri" **ended** | r5396 unreachable | "Rajesh Mohvari's manager is Atul Sahrao" -> San Francisco |
+| Krish Shedhar's brother (Hyderabad) | r7668 live, hit #0 | r3262 live | r7247 "Pedro Tamzadeh lives in Hyderabad" **ended** | "Pedro Samzadeh lives in Thessaloniki" |
+| David Chauchand's sister (Kuwait City) | r4398 live, hit #0 | r1631 "Fiona Chazada's manager is Ravi Dharzada" **ended** | r5287 unreachable | "Fiona Chauzada's manager is Jason Raovari" -> Doha |
+| Jaya Sinraj's brother (Dakar) | r3871 live, hit #0 | r2938 live | r5428 "Sara Banwani lives in Dakar" **ended** | "Sara Banani lives in Thiruvananthapuram" |
+| Noel Sinwani's brother (Nagoya) | r6569 live, hit #0 | r4110 "Deepak Wagrao's manager is Adam Zainath" **ended** | r7376 unreachable | "Deepak Ragrao's manager is Lucia Charani" -> Delhi |
+
+Each pair is two different people whose names the ER-07 near-name layer merges (same first name, surnames one
+Damerau-Levenshtein edit apart, Jaro-Winkler >= `name_merge` 0.92, no blocker): Anouk Kridhar/Anouk Tridhar,
+Rajesh Kohvari/Rajesh Mohvari, Pedro Tamzadeh/Pedro Samzadeh, Fiona Chazada/Fiona Chauzada, Sara Banwani/Sara
+Banani, Deepak Wagrao/Deepak Ragrao. The merged entity has one `manager` and one `live in` slot, so the second
+person's exclusive fact ends the first person's (`remember`'s exclusive ending). Re-ingesting only the 52
+world-3000 memories that name Pedro Tamzadeh or Pedro Samzadeh with the real model reproduces it: one entity
+"Pedro Samzadeh" (`mention_count` 28) and `Pedro Tamzadeh lives in Hyderabad` with `valid_to` set. The ending is
+a write-path artifact of the merge, not a fixture fact: the memory "Pedro Tamzadeh relocated to Hyderabad." has
+no `valid_to`.
+
+Resolution: fixed at the write side by nc-er08 (main bf73846; a typo-sized near-name merge needs corroboration). Re-ingested world-3000 with the real model: acc@10 0.997, three-hop 1.000, two-hop 0.983, false merges 26 -> 0. nc-hop3's read-side knobs stay on branch `lane-nc-hop3` (cd957ea), not merged: `hop_ended` is no longer needed; `hop_last_open` (the hop-3 fact is outside the question's 100 nearest relations for 78 of 78 world-300 three-hop chains; opening low-degree entities lifts world-300 three-hop recall 0.761 -> 0.812, acc@10 unchanged) is an open item.
+
 ## Reproduce
 
 ```bash

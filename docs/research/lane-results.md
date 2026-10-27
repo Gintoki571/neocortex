@@ -29,6 +29,7 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | nc-perf | `idx_rel_subj`, deferred `current_values`, one `memories_vec` scan per remember | 33k: recall p50 -33%, p95 -44%, ingest -20%, results byte-identical | 5e3e082 |
 | nc-hunt2 (qoder) | dogfood bug hunt: 8 fictional agent scenarios, 178 probes, real model | 20 findings (8 wrong fact, 8 missing, 4 noise) in workspace `lanes/research/hunt2.md` | (no code) |
 | nc-fix2 (qoder) | negation/retraction scoped to the right subject and clause; first names via supplied entities; "A and B are no longer partners"; "I don't remember" is not negation; future-event questions see planned rows | hunt2 probes fixed; retraction table 27/27; private 0.867 and agent_sim 111/120 unchanged | 1caba99 |
+| nc-er08 (qoder) | ER-08: a typo-sized near-name merge needs transliteration-key equality or a person/org named in the same write that the candidate's memories also mention; otherwise a new entity reported `ambiguous` (root cause found by nc-hop3 (codebuddy): different people one surname edit apart merged, one person's write ended the other's exclusive facts) | world-3000 false merges 26 -> 0 (`examples/merge_audit.rs`), three-hop acc@10 0.897 -> 1.000; name_eval 0.964 unchanged; gates and private 0.867 / agent_sim 111/120 unchanged; real-model table: typed shared-org typo still merges, text-only typos now `ambiguous` | bf73846 |
 
 ## Killed (branch kept, not merged)
 
@@ -38,8 +39,9 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | nc-context | B8 context-inherited membership | inherited-mention precision 0.023 on world-300; aggregation gain 0; holdout breaks |
 | nc-split | B3 two-ended chain scoring | mh1 and blind three-hop -1 each; 1-core p50 +109%; UltraBERT hop cosines flat (0.206 vs 0.211 right/wrong) |
 | nc-chainx | cross-encoder verification of top chains | mh1 +2 (tuning set), blind and world-300 unchanged; p50 +51%, RSS +228 MB |
+| nc-hop3 | read-side `hop_ended` knob for three-hop misses at world-3000 | 0.897 -> 0.974, but the misses were ER-08 false merges; fixed at the write side by nc-er08 (1.000), knob not needed |
 
-## Where main stands (1caba99)
+## Where main stands (bf73846)
 
 | measure | value |
 |---|---|
@@ -47,8 +49,9 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | holdout recall / MRR | 0.914 / 0.795 |
 | multihop-holdout / blind / private acc@10 (one recall) | 0.825 / 0.820 / 0.867 |
 | agent_sim --hints (recall + follow, ~1.3 calls/query) | 0.863 / 0.910 / 0.925 |
-| world-300 / world-1000 / world-3000 acc@10 | 0.992 / 0.992 / 0.982 (three-hop 1.000 / 1.000 / 0.897) |
-| cold-recall peak RSS | 612-618 MiB f32 model, ~237 MiB q8, flat in DB size |
+| world-300 / world-1000 / world-3000 acc@10 | 0.992 / 0.992 / 0.997 (three-hop 1.000 / 1.000 / 1.000) |
+| world-10000 (108,667 memories, int8 DB, build 5e3e082) acc@10 | 0.977 (two-hop 0.892, three-hop 0.987); see `scale.md` |
+| cold-recall peak RSS | 612-633 MiB f32 model, ~237 MiB q8, flat in DB size up to 108k memories |
 | DB bytes per memory | ~5,950 f32 vectors, ~2,250 int8 |
 
 ## Lessons
@@ -61,4 +64,6 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
   a real-model check table.
 - Lanes based on an old main merge cleanly but break semantically: `cargo check --all-targets` after every
   merge.
+- A silent wrong entity merge corrupts facts (exclusive slots end the other person's facts); a duplicate
+  entity reported `ambiguous` is cheap. Name similarity alone is never identity evidence.
 - At 33k memories, 9 of 11 misses are retrieval misses (answer outside the top 50), not ranking.
