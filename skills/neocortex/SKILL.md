@@ -52,9 +52,11 @@ Store something when it will still matter next week:
   entity; it splits off a new card). Real different people with the same name
   and type are separate entities: do not `merge_entities` them without
   checking the facts on both cards.
-- Status `near` (typo or transliteration joined the right card) needs nothing.
-  `ambiguous` (homonym or sibling name, e.g. "Bergen Airport South" vs "Bergen
-  Airport") is never auto-merged: confirm with `same_as` or `distinct_from`.
+- Status `near` (a transliteration variant, or a typo with a corroborating
+  shared person/org in the same write) needs nothing. `ambiguous` (homonym,
+  sibling name, or a typo-sized near name without corroboration) is never
+  auto-merged: confirm with `same_as` when it is the same person, or
+  `distinct_from` when it is not.
 - **Structured when known**: pass `entities` and `relations`. Mark single-valued
   relations (`lives in`, `works at`, `is married to`, `has phone number`)
   `exclusive: true` so the previous value is ended and kept as history.

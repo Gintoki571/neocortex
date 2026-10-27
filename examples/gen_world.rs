@@ -2,7 +2,12 @@
 //!
 //! ```text
 //! cargo run --release --example gen_world -- --people 300 --seed 7 --out eval/world-300.json
+//! cargo run --release --example gen_world -- --people 3000 --seed 3001 \
+//!     --out /tmp/world-3000.json --roster /tmp/world-3000.roster.json
 //! ```
+//!
+//! `--roster` writes the ground-truth people list (`{"people": [...]}`) for
+//! `examples/merge_audit.rs`; it does not change `--out` bytes.
 //!
 //! Produces an eval fixture (`now`, `memories`, `queries`) in the format
 //! `neocortex eval` reads: a year of memories about `--people` people with
@@ -2205,7 +2210,7 @@ fn aggregation_query(
 // ------------------------------------------------------------------ main
 
 fn usage() -> String {
-    "usage: gen_world --people N [--seed S] [--queries Q] --out FILE".into()
+    "usage: gen_world --people N [--seed S] [--queries Q] --out FILE [--roster FILE]".into()
 }
 
 fn run() -> Result<(), String> {
@@ -2214,6 +2219,7 @@ fn run() -> Result<(), String> {
     let mut seed = 7u64;
     let mut query_count = 600usize;
     let mut out: Option<PathBuf> = None;
+    let mut roster: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         let take = |i: &mut usize| -> Result<String, String> {
@@ -2237,6 +2243,7 @@ fn run() -> Result<(), String> {
                     .map_err(|_| "--queries needs a number".to_string())?
             }
             "--out" => out = Some(PathBuf::from(take(&mut i)?)),
+            "--roster" => roster = Some(PathBuf::from(take(&mut i)?)),
             other => return Err(format!("unknown argument '{other}'\n{}", usage())),
         }
         i += 1;
@@ -2275,6 +2282,14 @@ fn run() -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     std::fs::write(&out, text.as_bytes()).map_err(|e| e.to_string())?;
+    if let Some(path) = roster {
+        let names: Vec<&str> = world.people.iter().map(|p| p.name.as_str()).collect();
+        let text = serde_json::to_string(&json!({ "people": names })).map_err(|e| e.to_string())?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, text.as_bytes()).map_err(|e| e.to_string())?;
+    }
 
     let structured = ordered
         .iter()
