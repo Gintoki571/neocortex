@@ -1904,6 +1904,8 @@ fn facts_for_view(
         } else {
             0.0
         };
+        // The count is only needed for the rows that survive the limit below.
+        let counted = polarity == 1 && expired.is_none() && vt.is_none_or(|v| v > cutoff);
         out.push((
             ppr.map_or(0.0, |scores| {
                 scores.get(&src).copied().unwrap_or(0.0) + scores.get(&dst).copied().unwrap_or(0.0)
@@ -1920,26 +1922,30 @@ fn facts_for_view(
                 retracted: expired.is_some() && vt.is_none(),
                 polarity,
                 memory: false,
-                current_values: if polarity == 1 && expired.is_none() && vt.is_none_or(|v| v > cutoff)
-                {
-                    let n: i64 = engine.db.sql().query_row(
-                        "SELECT count(*) FROM relations WHERE subj=?1 AND predicate_id IN
-                             (SELECT id FROM predicates WHERE group_id=?2) AND polarity=1
-                         AND expired_at IS NULL AND valid_from<=?3 AND (valid_to IS NULL OR valid_to>?3)",
-                        params![if subj == 0 { src } else { subj }, group, cutoff],
-                        |r| r.get(0),
-                    )?;
-                    (n >= 2).then_some(n as usize)
-                } else {
-                    None
-                },
+                current_values: None,
                 replaced_by: ended_by.zip(by_fact),
                 duration: None,
             },
+            counted.then_some((if subj == 0 { src } else { subj }, group)),
         ));
     }
     out.sort_by(|a, b| b.0.total_cmp(&a.0));
-    Ok(out.into_iter().take(limit).map(|(_, fact)| fact).collect())
+    out.truncate(limit);
+    out.into_iter()
+        .map(|(_, mut fact, key)| {
+            if let Some((subj, group)) = key {
+                let n: i64 = engine.db.sql().query_row(
+                    "SELECT count(*) FROM relations WHERE subj=?1 AND predicate_id IN
+                         (SELECT id FROM predicates WHERE group_id=?2) AND polarity=1
+                     AND expired_at IS NULL AND valid_from<=?3 AND (valid_to IS NULL OR valid_to>?3)",
+                    params![subj, group, cutoff],
+                    |r| r.get(0),
+                )?;
+                fact.current_values = (n >= 2).then_some(n as usize);
+            }
+            Ok(fact)
+        })
+        .collect()
 }
 
 /// Resolve `e<id>`, an exact alias, or (as a last resort) the nearest entity

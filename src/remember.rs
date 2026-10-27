@@ -1153,7 +1153,14 @@ fn write_prepared(
     };
     // Both checks read the database, so they belong after the earlier items of
     // this chunk were written: a later input must see them.
-    let near = knn_memory(db, &vectors[0], cfg.near_dup)?;
+    // One scan serves the near-duplicate check (nearest) and, for a
+    // relation-less write, the related block below (top 10 once this memory
+    // is stored, so nine neighbours of the pre-insert list).
+    let neighbours = knn_memory(db, &vectors[0], if relations.is_empty() { 10 } else { 1 })?;
+    let near = neighbours
+        .first()
+        .copied()
+        .filter(|(_, s)| *s >= cfg.near_dup);
     for id in &supersedes {
         let exists: bool = db.sql().query_row(
             "SELECT EXISTS(SELECT 1 FROM memories WHERE id=?1 AND expired_at IS NULL)",
@@ -1273,15 +1280,9 @@ fn write_prepared(
     let mut related = Vec::new();
     if relations.is_empty() && !ids.is_empty() {
         let entity_ids: Vec<i64> = ids.values().copied().collect();
-        let mut st = db.sql().prepare(&format!(
-            "SELECT rowid,1-distance FROM memories_vec
-             WHERE embedding MATCH {} AND k=10 AND live=1 ORDER BY distance",
-            db.vec_sql("?1")
-        ))?;
-        for row in st.query_map([db.vec_blob(&vectors[0])], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, f32>(1)?))
-        })? {
-            let (mid, cosine) = row?;
+        // A stored memory is its own nearest row; a duplicate stored nothing.
+        let keep = if duplicate_of.is_some() { 10 } else { 9 };
+        for &(mid, cosine) in neighbours.iter().take(keep) {
             if cosine < cfg.update_candidate || cosine >= cfg.near_dup || mid == id {
                 continue;
             }
@@ -1983,19 +1984,14 @@ pub fn retract_relations(db: &Db, ids: &[i64], now: i64) -> Result<()> {
     Ok(())
 }
 
-fn knn_memory(db: &Db, v: &[f32], threshold: f32) -> Result<Option<(i64, f32)>> {
-    let row: Option<(i64, f32)> = db
-        .sql()
-        .query_row(
-            &format!(
-                "SELECT rowid,1-distance FROM memories_vec WHERE embedding MATCH {} AND k=1 AND live=1 ORDER BY distance",
-                db.vec_sql("?1")
-            ),
-            [db.vec_blob(v)],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(row.filter(|(_, s)| *s >= threshold))
+/// The `k` nearest live memories, nearest first, as (id, cosine).
+fn knn_memory(db: &Db, v: &[f32], k: usize) -> Result<Vec<(i64, f32)>> {
+    let mut st = db.sql().prepare(&format!(
+        "SELECT rowid,1-distance FROM memories_vec WHERE embedding MATCH {} AND k={k} AND live=1 ORDER BY distance",
+        db.vec_sql("?1")
+    ))?;
+    let rows = st.query_map([db.vec_blob(v)], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 #[cfg(test)]
