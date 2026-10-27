@@ -157,6 +157,7 @@ Design (binding): `docs/superpowers/specs/2026-10-22-neocortex-design.md`. Plan:
 - `scripts/train_hop_scorer.py` - offline numpy logistic regression for the hop scorer. Inputs per source: an eval JSON, its `NEOCORTEX_DUMP_HOPS` dump (from `neocortex eval <set> --save-db <db>`) and `<db>.keys.json`; label = an evidence memory is an expected memory of the query. Splits by query (20% validation), picks L2 by validation log-loss, prints the Rust consts for `src/paths.rs`. Train only on fixtures and generated worlds (`gen_world` seeds other than 7); never on `eval/holdout.json`, `eval/multihop-holdout*.json` or `eval/world-300.json` (gates).
 - `docs/research/multihop.md` - measured multi-hop/aggregation/negation/abstention results: path-channel ablations, fixtures/holdout gate, latency, agent simulation, recommendation.
 - `docs/research/footprint.md` - measured footprint baseline at 6a97e00 (peak/steady RSS, cold start, 1/2-core latency, memory caps, DB bytes per memory, vector share, old-x86 portability scan) for the low-resource target.
+- `docs/research/scale.md` - measured scale behaviour at 3k/11k/33k real-model memories and 108k hash-embedder memories (2026-10-27, nc-scale): per-category accuracy vs world-300, 1/2-core latency, RSS and DB size for f32/int8/q8, recall stage timers, the `facts_for_view` bottleneck (unindexed `relations.subj`), write-path scaling, miss analysis, regeneration steps.
 - `docs/research/agent-memory/` - research program output (2026-10-25/26, machine-written, draft): `failure-analysis.md` (64 classified failures on mh1/mh2/holdout at 367b9a9, read-time vs write-time), `ideas.md` (merged and new ideas with hypothesis, mechanism, experiment and kill criterion; §D ranks them and holds lane briefs), `literature-map.md` + `papers/` (46 paper mechanism cards), `repos/` (hindsight, agentmemory, graphify, lightrag, ReMem cards). Paths inside cite `lanes/` worktrees and line numbers of their commit; re-check against current code before acting.
 - `skills/neocortex/SKILL.md` - agent-facing usage protocol; `README.md` - user docs.
 
@@ -184,6 +185,17 @@ Embedder footprint (nc-lite, 2026-10-26, i7-9750H shared with other lanes at loa
 | parity vs f32 on 927 eval texts (min / mean) | - | - | 0.99836 / 0.99959 | 0.929 / 0.953 |
 
 q8 meets the 512 MiB working budget (237 MiB cold-recall peak) at +15-45% warm CPU per query; f32 does not (612 MiB) and cannot with candle's owning tensors. q8 gates (merged on main 8af053c): fixtures 0.951 / 0.895, holdout 0.913 / 0.793, multihop-holdout acc@10 0.825, multihop-holdout2 0.830, world-300 acc@10 0.992 (recall 0.965, MRR 0.880); the same fixtures eval over an f32-built DB with q8 query vectors gives 0.951 / 0.895. Re-measure with `neocortex quantize-model` + `NEOCORTEX_EMBED_DTYPE=q8` on any change to `ultrabert.rs`.
+
+Scale (nc-scale, 2026-10-27, `docs/research/scale.md`; real model unless noted; 600-query worlds from `gen_world` seeds 1001/3001/10001; eval `--load-db`, latency includes the query embedding):
+
+| memories in DB | acc@10 / recall / MRR | recall p50, 1 core / 2 cores (f32 DB, f32 model) | DB bytes per memory f32 / int8 | peak RSS cold recall f32 / q8 |
+|---|---|---|---|---|
+| 3,264 (world-300) | 0.992 / 0.965 / 0.881 | 165.6 / 105.7 ms | 6,551 / - | 612 / - MiB |
+| 10,833 (world-1000) | 0.992 / 0.956 / 0.852 | 268.8 / 200.7 ms | 6,071 / 2,306 | 612-613 / 236 MiB |
+| 32,567 (world-3000) | 0.982 / 0.959 / 0.855 | 345.3 / 274.8 ms | 5,943 / 2,248 | 618 / 237 MiB |
+| 108,667 (hash embedder, accuracy meaningless) | - | 694.3 / 629.6 ms (435 with an index on `relations(subj, predicate_id)`, 315 with int8 too; first 120 queries) | 5,973 / 2,298 | 32.6 MiB (no model) |
+
+World-3000 three-hop acc@10 is 0.897 (1.000 at 300/1000): 9 of the 11 misses are hop-3 retrieval misses (not in the top 50). At 108k the dominant recall stage is `recall::facts_for_view`: a per-row `SELECT count(*) FROM relations WHERE subj=...` scans `relations` (no `subj` index), 58% of mean latency; the write path has the same scan, and two O(N) `memories_vec` scans per `remember` (`knn_memory`, the k=10 related block) dominate ingest above ~10k memories. Ingest at world-3000 is 7.5 memories/s with the real model.
 
 ```bash
 cargo fmt --check
