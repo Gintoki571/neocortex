@@ -313,6 +313,16 @@ impl Db {
         if anchored == 0 {
             self.seed_predicates()?;
         }
+        // A database built while `mentored by` was seeded exclusive carries the
+        // wrong policy: a mentee can have several mentors. The seed value owns
+        // seeded exclusivity (it is not agent-settable), so every open corrects
+        // stale rows this cheaply and idempotently (no row is touched once the
+        // value is right).
+        self.sql().execute(
+            "UPDATE predicates SET exclusive=0
+             WHERE canonical='mentored by' AND seeded=1 AND exclusive=1",
+            [],
+        )?;
         Ok(())
     }
 
@@ -570,6 +580,8 @@ impl Db {
             },
             // E4b-pattern pair: `mentor` is the canonical direction (mentor ->
             // mentee), `mentored by` the same relation from the mentee side.
+            // Both are non-exclusive: a mentee can have several mentors
+            // ("reports to" is the exclusive one, like employment).
             Seed {
                 canonical: "mentor",
                 display: "mentors",
@@ -583,7 +595,7 @@ impl Db {
                 canonical: "mentored by",
                 display: "mentored by",
                 aliases: &["mentored by", "is mentored by"],
-                exclusive: true,
+                exclusive: false,
                 symmetric: false,
                 group: "mentor",
                 inverse: Some("mentor"),

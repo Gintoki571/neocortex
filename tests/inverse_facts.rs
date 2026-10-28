@@ -9,6 +9,10 @@ use neocortex::engine::{
 };
 use std::sync::Arc;
 
+mod common;
+
+use common::TempDir;
+
 fn remember(
     engine: &Engine,
     content: &str,
@@ -209,4 +213,123 @@ fn accountable_to_is_a_direction_safe_write_alias() {
         "the manager is the canonical source"
     );
     assert_eq!(reporter, "mira shah");
+}
+
+/// A person can have several mentors: the seeded `mentored by` write alias must
+/// not end the previous mentor's fact ("Rui Costa is mentored by Marta Lima"
+/// then "Rui Costa is mentored by Ken Ito" keeps both), the way "reports to"
+/// behaves like the exclusive one and mentors do not.
+#[test]
+fn a_second_mentored_by_write_keeps_the_first_mentors_fact() {
+    let engine = Engine::open_in_memory(Arc::new(HashEmbedder)).unwrap();
+    let people = &[
+        ("Rui Costa", "person"),
+        ("Marta Lima", "person"),
+        ("Ken Ito", "person"),
+    ];
+    let first = engine
+        .remember(RememberInput {
+            content: "Rui Costa is mentored by Marta Lima.".into(),
+            entities: people
+                .iter()
+                .map(|(name, kind)| EntityIn {
+                    name: (*name).into(),
+                    kind: Some((*kind).into()),
+                    ..Default::default()
+                })
+                .collect(),
+            relations: vec![relation(
+                "Rui Costa",
+                "mentored by",
+                "Marta Lima",
+                "Rui Costa is mentored by Marta Lima.",
+            )],
+            ..Default::default()
+        })
+        .unwrap();
+    let second = engine
+        .remember(RememberInput {
+            content: "Rui Costa is mentored by Ken Ito.".into(),
+            entities: people
+                .iter()
+                .map(|(name, kind)| EntityIn {
+                    name: (*name).into(),
+                    kind: Some((*kind).into()),
+                    ..Default::default()
+                })
+                .collect(),
+            relations: vec![relation(
+                "Rui Costa",
+                "mentored by",
+                "Ken Ito",
+                "Rui Costa is mentored by Ken Ito.",
+            )],
+            ..Default::default()
+        })
+        .unwrap();
+    // Inverse writes store the canonical `mentor` direction (mentor -> mentee),
+    // so both live facts have Rui as the canonical end.
+    let mentees_of: Vec<String> = engine
+        .db
+        .sql()
+        .prepare(
+            "SELECT e.norm FROM relations r
+             JOIN predicates p ON p.id=r.predicate_id
+             JOIN entities e ON e.id=r.src
+             WHERE p.canonical='mentor' AND r.expired_at IS NULL
+             ORDER BY r.id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap();
+    assert_eq!(
+        mentees_of,
+        vec!["marta lima", "ken ito"],
+        "both mentors must stay live"
+    );
+    assert!(first.invalidated_relations.is_empty());
+    assert_eq!(
+        second.invalidated_relations.len(),
+        0,
+        "no mentor fact ends: {:?} (conflicts {:?})",
+        second.invalidated_relations,
+        second.conflicts
+    );
+}
+
+/// A database opened by the previous build carries `mentored by` seeded
+/// exclusive: 1. The seed re-applies its policy on every open, so the next
+/// open must correct it back to non-exclusive.
+#[test]
+fn reopening_a_previous_build_database_fixes_the_seeded_mentored_by_exclusivity() {
+    let dir = TempDir::new("inverse-mentor-seed");
+    let path = dir.join("mem.db");
+    {
+        let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        // Simulate the previous build: the seed wrote exclusive = 1.
+        engine
+            .db
+            .sql()
+            .execute(
+                "UPDATE predicates SET exclusive=1 WHERE canonical='mentored by'",
+                [],
+            )
+            .unwrap();
+    }
+    let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    let exclusive: i64 = engine
+        .db
+        .sql()
+        .query_row(
+            "SELECT exclusive FROM predicates WHERE canonical='mentored by'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        exclusive, 0,
+        "an old database must be corrected to the non-exclusive seed on open"
+    );
 }
