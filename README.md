@@ -90,7 +90,7 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 |---|---|
 | `remember <content...>` | store a memory; flags below |
 | `recall <query...>` | retrieve memories, facts and entities |
-| `entity <name\|eID>` | profile (with its community), current/past facts and timeline of one entity |
+| `entity <name\|eID>` | profile (with its community), current/past facts and timeline of one entity; a first name several people share also lists the others as `candidates` |
 | `invalidate <mID\|rID>` | end a memory or relation at a time, keeping it as history |
 | `forget <mID>` | retire a memory; its sole-evidence relations are retracted (`--hard` deletes it with vectors and mentions) |
 | `merge <keep> <merge>` | merge one entity into another (`--force` crosses types) |

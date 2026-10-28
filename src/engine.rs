@@ -562,6 +562,10 @@ pub struct EntityOutput {
     pub current_facts: Vec<FactHit>,
     pub past_facts: Vec<FactHit>,
     pub similar: Vec<(i64, String, f32)>,
+    /// Other entities the looked-up name could mean: a bare first name or a
+    /// name prefix that is not the exact alias of one entity (H2-13).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<EntityCandidate>,
     /// Newest first.
     pub timeline: Vec<MemoryHit>,
 }
