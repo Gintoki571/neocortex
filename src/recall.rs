@@ -1574,6 +1574,40 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         merged.truncate(8);
         merged
     };
+    // H2-14: the asked family adds (or re-renders in place) the rows the
+    // question is phrased from, so an inverse question never loses the fact to
+    // a canonical rendering. A negation question is left alone.
+    if !negated {
+        let asked = asked_family_facts(
+            engine,
+            &query_text,
+            &query_vec,
+            &query_alias_entities,
+            history,
+            cutoff,
+            (since, until),
+            2,
+        )?;
+        let mut fresh = Vec::new();
+        for fact in asked {
+            match facts.iter().position(|f| f.id == fact.id && !f.memory) {
+                // Keep the position and the counted fields; only the side of
+                // the sentence changes.
+                Some(pos) => {
+                    facts[pos].source = fact.source;
+                    facts[pos].predicate = fact.predicate;
+                    facts[pos].target = fact.target;
+                }
+                None if !facts.iter().any(|f| f.id == fact.id && f.memory) => fresh.push(fact),
+                None => {}
+            }
+        }
+        if !fresh.is_empty() {
+            fresh.extend(facts);
+            fresh.truncate(8);
+            facts = fresh;
+        }
+    }
     // Ordering and duration questions want the intervals themselves, oldest
     // first, with the elapsed time spelled out. Other queries keep relevance
     // order.
@@ -1967,6 +2001,535 @@ fn facts_for_view(
             Ok(fact)
         })
         .collect()
+}
+
+// ------------------------------------------------------- asked predicate
+//
+// The seed channels above never consult `predicate_aliases`, so a question
+// phrased from the inverse side of a stored row ("who does Mira report to",
+// "who is Mira's manager") surfaced no fact when the only row was "Noah
+// manages Mira" (H2-14). This channel reads the asked family from the
+// question and renders its live rows from the named person's side.
+
+/// Seeded predicate groups a question can ask about by role or by phrasing.
+const ASKED_GROUPS: &[&str] = &["manage", "mentor", "work at"];
+
+/// Single-word role nouns and the seeded group they ask about; the `bool` is
+/// true when that role is the canonically stored source ("manager" is stored
+/// as `manager manages report`). Read-side only: a bare role noun is
+/// write-direction-ambiguous ("Liam is Maria's manager" vs "Noah's manager is
+/// Mira"), so it never joins `predicate_aliases`.
+const ROLE_SURFACES: &[(&str, &str, bool)] = &[
+    ("manager", "manage", true),
+    ("boss", "manage", true),
+    ("supervisor", "manage", true),
+    ("mentor", "mentor", true),
+    ("mentee", "mentor", false),
+];
+
+/// A question's asked family: which predicate group, which phrase named it and
+/// how that phrase states the relation.
+struct AskedRelation {
+    group: i64,
+    /// Byte span of the phrase that named the family.
+    surface: (usize, usize),
+    /// The phrase's grammatical subject is the canonical src (`manages`) rather
+    /// than the canonical dst (`reports to`, `mentored by`).
+    active: bool,
+    /// A role noun: the canonical side of the role itself (the answer side).
+    role: Option<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum NamedSide {
+    Src,
+    Dst,
+}
+
+fn query_word_spans(query: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in query.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                out.push((s, i));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, query.len()));
+    }
+    out
+}
+
+/// The folded word before `start`, skipping punctuation-only gaps.
+fn preceding_word(query: &str, start: usize) -> Option<String> {
+    let head = query[..start].trim_end();
+    let word = head
+        .rsplit(|c: char| c.is_whitespace() || matches!(c, '?' | '!' | ',' | '.' | ';' | ':'))
+        .find(|w| !w.is_empty())?;
+    Some(text::fold(word))
+}
+
+/// Folded word prefixes that can name an asked family: the role nouns plus
+/// every seeded verb surface of `manage`, `mentor` and `work at`. A question
+/// without one cannot match, so it costs no SQL at all.
+const ASKED_CUE_PREFIXES: &[&str] = &[
+    "manage",
+    "boss",
+    "supervis",
+    "report",
+    "accountab",
+    "mentor",
+    "mentee",
+    "work",
+    "employ",
+];
+
+fn has_asked_cue(query: &str) -> bool {
+    text::tokens(query)
+        .iter()
+        .any(|word| ASKED_CUE_PREFIXES.iter().any(|cue| word.starts_with(cue)))
+}
+
+fn asked_relation(engine: &Engine, query: &str) -> Result<Option<AskedRelation>> {
+    if !has_asked_cue(query) {
+        return Ok(None);
+    }
+    let words = query_word_spans(query);
+    if words.is_empty() {
+        return Ok(None);
+    }
+    // A role noun is checked first: "Rui's mentor" also matches the `mentor`
+    // verb alias, and only the role reading makes the named person the mentee.
+    for (s, e) in &words {
+        let Some(word) = text::tokens(&query[*s..*e]).into_iter().next() else {
+            continue;
+        };
+        let word = text::singularize(&word);
+        let Some(&(_, group_name, answer_src)) =
+            ROLE_SURFACES.iter().find(|(role, _, _)| *role == word)
+        else {
+            continue;
+        };
+        let group: Option<i64> = engine
+            .db
+            .sql()
+            .prepare_cached("SELECT id FROM predicates WHERE canonical=?1")?
+            .query_row([group_name], |r| r.get(0))
+            .optional()?;
+        if let Some(group) = group {
+            return Ok(Some(AskedRelation {
+                group,
+                surface: (*s, *e),
+                active: true,
+                role: Some(answer_src),
+            }));
+        }
+    }
+    // Then a seeded predicate phrase: "report(s) to", "accountable to",
+    // "works at", "mentored by". Every 1-4-word window goes into one lookup,
+    // longest first so "accountable to" beats a bare "to".
+    let mut windows: Vec<((usize, usize), String)> = Vec::new();
+    for n in (1..=4.min(words.len())).rev() {
+        for w in 0..=words.len() - n {
+            let span = (words[w].0, words[w + n - 1].1);
+            let norm = text::norm_predicate(&query[span.0..span.1]);
+            if !norm.is_empty() {
+                windows.push((span, norm));
+            }
+        }
+    }
+    if windows.is_empty() {
+        return Ok(None);
+    }
+    let mut norms: Vec<&str> = windows.iter().map(|(_, norm)| norm.as_str()).collect();
+    norms.sort_unstable();
+    norms.dedup();
+    let marks = std::iter::repeat_n("?", norms.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT a.alias_norm, COALESCE(NULLIF(p.group_id,0),p.id),
+                COALESCE(g.canonical,p.canonical), p.inverse_of, p.id
+         FROM predicate_aliases a
+         JOIN predicates p ON p.id=a.predicate_id
+         LEFT JOIN predicates g ON g.id=p.group_id
+         WHERE a.alias_norm IN ({marks}) AND p.seeded=1"
+    );
+    let mut st = engine.db.sql().prepare_cached(&sql)?;
+    let mut seeded: HashMap<String, (i64, String, Option<i64>, i64)> = HashMap::new();
+    for row in st.query_map(params_from_iter(norms.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })? {
+        let (norm, group, group_name, inverse, id) = row?;
+        seeded.insert(norm, (group, group_name, inverse, id));
+    }
+    for (span, norm) in windows {
+        let Some((group, group_name, inverse, id)) = seeded.get(&norm) else {
+            continue;
+        };
+        if !ASKED_GROUPS.contains(&group_name.as_str()) {
+            continue;
+        }
+        // A write of this phrase is stored with its source as dst when the
+        // inverse row has the lower id; then the phrase's grammatical subject
+        // is the canonical dst.
+        let active = inverse.is_none_or(|inverse| inverse > *id);
+        return Ok(Some(AskedRelation {
+            group: *group,
+            surface: span,
+            active,
+            role: None,
+        }));
+    }
+    Ok(None)
+}
+
+/// The query entities named by an exact alias, with the longest mention's byte
+/// span. A role anchor resolved through a relation (`anchor_tiers` "2") is not
+/// named in the text and is dropped here.
+fn anchor_mentions(
+    engine: &Engine,
+    query: &str,
+    anchors: &HashSet<i64>,
+) -> Result<Vec<(i64, usize, usize)>> {
+    if anchors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<i64> = anchors.iter().copied().take(64).collect();
+    let marks = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut st = engine.db.sql().prepare(&format!(
+        "SELECT alias_norm,entity_id FROM entity_aliases WHERE entity_id IN ({marks})"
+    ))?;
+    let mut by_name: HashMap<String, Vec<i64>> = HashMap::new();
+    for row in st.query_map(params_from_iter(ids.iter()), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })? {
+        let (name, id) = row?;
+        by_name.entry(name).or_default().push(id);
+    }
+    let mut best: HashMap<i64, (usize, usize)> = HashMap::new();
+    for (norm, start, end) in extract::ngrams(query, 4) {
+        let Some(found) = by_name.get(&norm) else {
+            continue;
+        };
+        for id in found {
+            let better = match best.get(id) {
+                Some(&(bs, be)) => {
+                    (end - start) > (be - bs) || ((end - start) == (be - bs) && start < bs)
+                }
+                None => true,
+            };
+            if better {
+                best.insert(*id, (start, end));
+            }
+        }
+    }
+    let mut out: Vec<(i64, usize, usize)> = best
+        .into_iter()
+        .map(|(id, (start, end))| (id, start, end))
+        .collect();
+    out.sort_by_key(|(id, start, end)| (*start, *end, *id));
+    Ok(out)
+}
+
+/// The person a bare or possessive first name names ("Mira's manager") when
+/// no exact alias matched: the one multi-word entity a single token names
+/// (the anchor-tier 1 rule). Bounded to words next to the asked phrase.
+fn asked_mention_fallback(
+    engine: &Engine,
+    query: &str,
+    asked: &AskedRelation,
+) -> Result<Option<(i64, usize, usize)>> {
+    let words = query_word_spans(query);
+    let Some(at) = words
+        .iter()
+        .position(|(start, end)| *start <= asked.surface.0 && asked.surface.0 < *end)
+    else {
+        return Ok(None);
+    };
+    let end_at = words
+        .iter()
+        .position(|(start, end)| *start < asked.surface.1 && asked.surface.1 <= *end)
+        .unwrap_or(at);
+    for distance in 1..=3 {
+        let mut candidates = Vec::new();
+        if at >= distance {
+            candidates.push(at - distance);
+        }
+        if end_at + distance < words.len() {
+            candidates.push(end_at + distance);
+        }
+        for index in candidates {
+            let (start, end) = words[index];
+            let token = text::norm_name(&query[start..end]);
+            if token.chars().count() < 3 || text::is_stopword(&token) || filler(&token) {
+                continue;
+            }
+            if let Some(id) = crate::anchor::unique_name_token(&engine.db, &token)? {
+                return Ok(Some((id, start, end)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Words that may sit between a person and the role word that belongs to them
+/// ("Mira's manager", "the mentor of Mira") without breaking the phrase.
+fn filler(word: &str) -> bool {
+    matches!(
+        word,
+        "of" | "the"
+            | "a"
+            | "an"
+            | "is"
+            | "was"
+            | "are"
+            | "were"
+            | "and"
+            | "&"
+            | "to"
+            | "for"
+            | "at"
+            | "by"
+            | "with"
+            | "my"
+            | "his"
+            | "her"
+            | "their"
+            | "our"
+            | "your"
+            | "its"
+    )
+}
+
+/// Which canonical side of the asked family a mention sits on, and whether the
+/// fact should be rendered from the mention's side (`before`: the mention is
+/// the phrase's subject, so it leads the sentence).
+fn named_side(
+    asked: &AskedRelation,
+    query: &str,
+    start: usize,
+    end: usize,
+) -> Option<(NamedSide, bool)> {
+    let before = end <= asked.surface.0;
+    let after = start >= asked.surface.1;
+    if let Some(answer_src) = asked.role {
+        // Only the mention the role word belongs to ("Rui's mentor", "the
+        // mentor of Rui"); a role word in another clause is not this question.
+        let gap = if before {
+            &query[end..asked.surface.0]
+        } else if after {
+            &query[asked.surface.1..start]
+        } else {
+            return None;
+        };
+        if text::tokens(gap).iter().any(|word| !filler(word)) {
+            return None;
+        }
+        // A bare role word is a verb when an auxiliary makes the named person
+        // its subject ("who does Marta mentor").
+        let aux = preceding_word(query, start)
+            .is_some_and(|word| matches!(word.as_str(), "do" | "does" | "did"));
+        let side = if aux == answer_src {
+            NamedSide::Src
+        } else {
+            NamedSide::Dst
+        };
+        return Some((side, before));
+    }
+    if !(before || after) {
+        return None;
+    }
+    let side = match (asked.active, before) {
+        (true, true) | (false, false) => NamedSide::Src,
+        (true, false) | (false, true) => NamedSide::Dst,
+    };
+    Some((side, before))
+}
+
+/// Live rows of the asked family touching a named entity on the side the
+/// question asks about, rendered from that entity's side. At most `limit`.
+#[allow(clippy::too_many_arguments)]
+fn asked_family_facts(
+    engine: &Engine,
+    query: &str,
+    query_vec: &[f32],
+    anchors: &HashSet<i64>,
+    history: bool,
+    cutoff: i64,
+    (since, until): (Option<i64>, Option<i64>),
+    limit: usize,
+) -> Result<Vec<FactHit>> {
+    let Some(asked) = asked_relation(engine, query)? else {
+        return Ok(Vec::new());
+    };
+    let mut mentions = anchor_mentions(engine, query, anchors)?;
+    // A bare or possessive first name ("Mira's manager") is not an exact alias,
+    // so the single-entity token rule adds it; another anchor elsewhere in the
+    // question must not hide it. Rendering still needs the mention to sit on
+    // the asked side of a live row, so an extra mention cannot invent a fact.
+    if let Some((id, start, end)) = asked_mention_fallback(engine, query, &asked)? {
+        if !mentions.iter().any(|(known, _, _)| *known == id) {
+            mentions.push((id, start, end));
+        }
+    }
+    if mentions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids: Vec<i64> = mentions.iter().map(|(id, _, _)| *id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let marks = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT r.id,r.src,r.dst,
+            COALESCE(NULLIF(r.predicate_text,''),NULLIF(p.display,''),p.canonical),
+            (SELECT COALESCE(NULLIF(ip.display,''),ip.canonical)
+             FROM predicates ip WHERE ip.id=p.inverse_of),
+            p.symmetric,r.fact,r.valid_from,r.valid_to,r.expired_at,e.name,d.name,
+            r.polarity,r.ended_by,
+            (SELECT nb.fact FROM relations nb WHERE nb.id=r.ended_by)
+         FROM relations r JOIN predicates p ON p.id=r.predicate_id
+         JOIN entities e ON e.id=r.src JOIN entities d ON d.id=r.dst
+         WHERE COALESCE(NULLIF(p.group_id,0),p.id)=?1 AND r.polarity=1
+           AND (r.src IN ({marks}) OR r.dst IN ({marks}))"
+    );
+    let mut st = engine.db.sql().prepare(&sql)?;
+    let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(asked.group)];
+    for id in ids.iter().chain(ids.iter()) {
+        sql_params.push(Box::new(*id));
+    }
+    let mut candidates = Vec::new();
+    for row in st.query_map(
+        rusqlite::params_from_iter(sql_params.iter().map(|x| x.as_ref())),
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<i64>>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, String>(11)?,
+                r.get::<_, i64>(12)?,
+                r.get::<_, Option<i64>>(13)?,
+                r.get::<_, Option<String>>(14)?,
+            ))
+        },
+    )? {
+        candidates.push(row?);
+    }
+    let mut ranked: Vec<(f64, FactHit)> = Vec::new();
+    for (
+        id,
+        src,
+        dst,
+        pred,
+        inverse_pred,
+        symmetric,
+        fact,
+        vf,
+        vt,
+        expired,
+        source,
+        target,
+        polarity,
+        ended_by,
+        by_fact,
+    ) in candidates
+    {
+        if vf > cutoff {
+            continue;
+        }
+        if !history && (expired.is_some() || vt.is_some_and(|v| cutoff >= v)) {
+            continue;
+        }
+        if until.is_some_and(|u| vf >= u) || since.is_some_and(|s| vt.is_some_and(|t| t <= s)) {
+            continue;
+        }
+        // Prefer the mention that is the phrase's subject (it leads the
+        // rendered sentence); any on-side mention will do otherwise.
+        let mut viewer: Option<i64> = None;
+        let mut viewer_before = false;
+        for (anchor, start, end) in &mentions {
+            let Some((side, before)) = named_side(&asked, query, *start, *end) else {
+                continue;
+            };
+            let on_side = match side {
+                NamedSide::Src => src == *anchor,
+                NamedSide::Dst => dst == *anchor,
+            };
+            if on_side && (viewer.is_none() || (before && !viewer_before)) {
+                viewer = Some(*anchor);
+                viewer_before = before;
+            }
+        }
+        let Some(viewer) = viewer else {
+            continue;
+        };
+        let cosine = engine
+            .db
+            .sql()
+            .query_row(
+                "SELECT embedding FROM relations_vec WHERE rowid=?1",
+                [id],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .and_then(|blob| engine.db.blob_to_vec(&blob))
+            .map(|v| f64::from(rank::cosine(query_vec, &v)))
+            .unwrap_or(0.0);
+        // From the other side only when the named person leads the sentence;
+        // "who manages Mira" keeps the canonical "Noah manages Mira".
+        let other_side =
+            viewer_before && viewer == dst && (inverse_pred.is_some() || symmetric != 0);
+        let (source, target, predicate) = if other_side {
+            (
+                target.clone(),
+                source.clone(),
+                inverse_pred.clone().unwrap_or(pred.clone()),
+            )
+        } else {
+            (source.clone(), target.clone(), pred.clone())
+        };
+        let hit = FactHit {
+            id,
+            source,
+            predicate,
+            target,
+            fact,
+            valid_from: vf,
+            valid_to: vt,
+            ended: expired.is_some() || vt.is_some_and(|v| v <= cutoff),
+            retracted: expired.is_some() && vt.is_none(),
+            polarity,
+            memory: false,
+            current_values: None,
+            replaced_by: ended_by.zip(by_fact),
+            duration: None,
+        };
+        ranked.push((cosine, hit));
+    }
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.id.cmp(&a.1.id)));
+    Ok(ranked.into_iter().take(limit).map(|(_, hit)| hit).collect())
 }
 
 /// Resolve `e<id>`, an exact alias, or (as a last resort) the nearest entity

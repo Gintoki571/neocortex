@@ -330,7 +330,11 @@ also render the interval with a computed duration ("3 years 2 months",
   converges them again.
 - Inverse and symmetric phrases: "X reports to Y" is stored once as "Y manages
   X" (or, for "married to", with both ends in storage order) and every side
-  renders its own view: `entity` shows the phrase that starts with the profile.
+  renders its own view: `entity` shows the phrase that starts with the profile,
+  and `recall` answers a question phrased from either side — "who does Mira
+  report to", "who is Mira's manager" and "who is Mira accountable to" all
+  return the stored "Noah manages Mira" as "Mira reports to Noah", while "who
+  does Mira manage" stays "Noah manages Mira".
 - Names in running text: a lower-case connector stays inside a name ("Rua do
   Instituto Bacteriológico", "Universidade da Beira Interior", "Bank of
   America"), so the generic head ("Rua", "Universidade") is never stored as an

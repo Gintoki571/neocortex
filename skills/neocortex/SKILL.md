@@ -66,7 +66,12 @@ Store something when it will still matter next week:
   `depends on`) exclusive. `exclusive: false` can clear a sticky flag you set
   earlier; it never changes the built-in policy of seeded predicates.
 - Predicates come in families: "resides in" or "based in" count as "lives in";
-  "reports to" and "manage" both work and render from the subject's side.
+  "reports to", "accountable to" and "manage" both work and render from the
+  subject's side. Ask either way: "who does Mira report to" and "who is Mira's
+  manager" both find the stored "Noah manages Mira" and render it from Mira's
+  side ("Mira reports to Noah"), while "who does Mira manage" still answers the
+  other direction. Role nouns (manager, boss, supervisor, mentor, mentee) are
+  read-side only; they are not write predicates.
 - **Causes are relations too**: `{"source": "disk full", "predicate": "caused",
   "target": "deploy failed"}`. `causes`, `led to`, `resulted in`, `caused by`
   and `because of` share one seeded family, and the inverse is stored from the

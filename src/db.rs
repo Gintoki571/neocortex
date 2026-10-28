@@ -555,11 +555,38 @@ impl Db {
             Seed {
                 canonical: "report to",
                 display: "reports to",
-                aliases: &["reports to", "report to", "reported to"],
+                aliases: &[
+                    "reports to",
+                    "report to",
+                    "reported to",
+                    "reporting to",
+                    "accountable to",
+                    "is accountable to",
+                ],
                 exclusive: true,
                 symmetric: false,
                 group: "manage",
                 inverse: Some("manage"),
+            },
+            // E4b-pattern pair: `mentor` is the canonical direction (mentor ->
+            // mentee), `mentored by` the same relation from the mentee side.
+            Seed {
+                canonical: "mentor",
+                display: "mentors",
+                aliases: &["mentors", "mentor", "mentored", "mentoring"],
+                exclusive: false,
+                symmetric: false,
+                group: "mentor",
+                inverse: Some("mentored by"),
+            },
+            Seed {
+                canonical: "mentored by",
+                display: "mentored by",
+                aliases: &["mentored by", "is mentored by"],
+                exclusive: true,
+                symmetric: false,
+                group: "mentor",
+                inverse: Some("mentor"),
             },
             Seed {
                 canonical: "parent of",
