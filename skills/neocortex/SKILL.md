@@ -20,8 +20,11 @@ Store something when it will still matter next week:
 - mistakes and the fix that worked, so they are not repeated
 - procedures that worked (build steps, deploy order, gotchas)
 - outcomes: what shipped, what failed, what was measured
-- dates of events and when a fact became true (`--when`; if omitted, one
-  explicit date in the text such as "March 5, 2025" is used, and the output says so)
+- dates of events and when a fact became true (`--when`; if omitted, the date
+  written in the text is used and the output says so: "March 5, 2025",
+  "last Tuesday", "two weeks ago", "last month", "this morning", or a written
+  range "from 2026-07-06 to 2026-08-14" / "between March 1 and March 5" /
+  "until 2026-10-15", which sets both ends. `--when`/`--until` always win)
 
 ## When NOT to remember
 
@@ -34,8 +37,11 @@ Store something when it will still matter next week:
 
 - **Atomic**: one fact per memory. "Deploy moved to Friday" and "Friday deploy
   needs sign-off" are two memories.
-- **Self-contained**: no "it", "this", "yesterday". Name the subject and use
-  absolute dates ("2026-09-14", not "last week").
+- **Self-contained**: no "it" or "this". Name the subject. Absolute dates
+  ("2026-09-14") stay readable forever and are preferred; a relative date
+  ("last week", "two weeks ago", "last Tuesday") is resolved against the write
+  clock and stored as a date, so it is safe when you do not know today's date,
+  but the text will still say "last week" to a reader.
 - **Consistent names**: always "Mom", never "mother" in one memory and "Mom" in
   the next. Aliases belong in `entities`.
 - **Always pass relations for facts**: you are the extractor. Text alone never
@@ -140,7 +146,8 @@ and `next:` when present.
   without `include_history`. Use `as_of` for "what was true then".
 - Ordering questions ("what happened first", "in order") return items sorted by
   start date. Duration questions ("how long did Alice work at Acme") add the
-  computed span: "3 years 2 months" or "ongoing since 2023-04-01".
+  computed span from the stored interval: "3 years 2 months", "3 days", or
+  "ongoing since 2023-04-01"; the memory that answers the question stays first.
 - `(bm25#2 vec#1 graph#1)` lists the matching channels; more agreeing channels
   means a stronger hit.
 - "no memories matched" means broaden the query or drop filters, not that the

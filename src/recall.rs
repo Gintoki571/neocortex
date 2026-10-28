@@ -1592,7 +1592,11 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             };
         }
     }
-    if ordered {
+    // An ordering question wants the intervals themselves, oldest first.
+    // A duration question asks about one interval ("how long was the offsite"),
+    // so it keeps relevance order: sorting it by date put unrelated older
+    // memories above the answer.
+    if ordering {
         memories.sort_by_key(|m| (m.valid_from, m.id));
         facts.sort_by_key(|f| (f.valid_from, f.id));
     }
