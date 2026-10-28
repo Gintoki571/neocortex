@@ -1032,6 +1032,7 @@ pub fn remember_batch(
     }
     let mut base = 0;
     for chunk in inputs.chunks(BATCH_SIZE) {
+        let prepare_start = std::time::Instant::now();
         let mut prepared: Vec<(usize, Prepared)> = Vec::with_capacity(chunk.len());
         for (offset, inp) in chunk.iter().enumerate() {
             match prepare(db, cfg, clock, inp.clone()) {
@@ -1043,29 +1044,40 @@ pub fn remember_batch(
         if prepared.is_empty() {
             continue;
         }
+        let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1e3;
         let indices: Vec<usize> = prepared.iter().map(|(i, _)| *i).collect();
         let mut items: Vec<Prepared> = prepared.into_iter().map(|(_, p)| p).collect();
+        let embed_start = std::time::Instant::now();
         if let Err(e) = embed_prepared(emb, &mut items) {
             for i in indices {
                 slots[i] = Some(Err(crate::err!("{e}")));
             }
             continue;
         }
+        let embed_ms = embed_start.elapsed().as_secs_f64() * 1e3;
         let mut written: Vec<(usize, Result<RememberOutput>)> = Vec::with_capacity(items.len());
+        let items_len = items.len();
+        let write_start = std::time::Instant::now();
+        let mut savepoint_us = 0f64;
+        let mut savepoint_begin_us = 0f64;
         let transaction = db.write(|db| {
             for (i, item) in indices.iter().zip(items) {
+                let sp = std::time::Instant::now();
                 db.sql().execute_batch("SAVEPOINT remember_item")?;
-                match write_prepared(db, cfg, clock, emb.name(), item) {
+                savepoint_begin_us += sp.elapsed().as_secs_f64() * 1e6;
+                let result = match write_prepared(db, cfg, clock, emb.name(), item) {
                     Ok(out) => {
                         db.sql().execute_batch("RELEASE remember_item")?;
-                        written.push((*i, Ok(out)));
+                        Ok(out)
                     }
                     Err(e) => {
                         db.sql()
                             .execute_batch("ROLLBACK TO remember_item; RELEASE remember_item")?;
-                        written.push((*i, Err(e)));
+                        Err(e)
                     }
-                }
+                };
+                savepoint_us += sp.elapsed().as_secs_f64() * 1e6;
+                written.push((*i, result));
             }
             Ok(())
         });
@@ -1081,6 +1093,14 @@ pub fn remember_batch(
                 }
             }
         }
+        crate::wtiming::chunk(
+            items_len,
+            prepare_ms,
+            embed_ms,
+            write_start.elapsed().as_secs_f64() * 1e3,
+            savepoint_us / 1e3,
+            savepoint_begin_us / 1e3,
+        );
     }
     slots
         .into_iter()
@@ -1395,6 +1415,7 @@ fn write_prepared(
             write_names.push(norm);
         }
     }
+    crate::wtiming::begin_item();
     let endpoint_vector = |name: &str| -> &[f32] {
         let norm = text::norm_name(name);
         if let Some(pos) = entities
@@ -1412,7 +1433,9 @@ fn write_prepared(
     // One scan serves the near-duplicate check (nearest) and, for a
     // relation-less write, the related block below (top 10 once this memory
     // is stored, so nine neighbours of the pre-insert list).
+    crate::wtiming::begin(crate::wtiming::KNN);
     let neighbours = knn_memory(db, &vectors[0], if relations.is_empty() { 10 } else { 1 })?;
+    crate::wtiming::end(crate::wtiming::KNN);
     let near = neighbours
         .first()
         .copied()
@@ -1449,10 +1472,13 @@ fn write_prepared(
         touch_memory(db, id, now)?;
         id
     } else {
+        crate::wtiming::begin(crate::wtiming::MEM_INSERT);
         let inserted = db.sql().execute("INSERT INTO memories(content,kind,tags,importance,scope,source,session,created_at,valid_from,valid_to,content_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![content,kind,tags,importance,scope,source,session,now,valid_from,valid_to,stored_hash]);
+        crate::wtiming::end(crate::wtiming::MEM_INSERT);
         match inserted {
             Ok(_) => {
                 let id = db.sql().last_insert_rowid();
+                crate::wtiming::begin(crate::wtiming::VEC_INSERT);
                 db.sql().execute(
                     &format!(
                         "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,{},1)",
@@ -1460,7 +1486,10 @@ fn write_prepared(
                     ),
                     params![id, db.vec_blob(&vectors[0])],
                 )?;
+                crate::wtiming::end(crate::wtiming::VEC_INSERT);
+                crate::wtiming::begin(crate::wtiming::GRAPH);
                 kg::project_memory(db, id, &kind, &content)?;
+                crate::wtiming::end(crate::wtiming::GRAPH);
                 id
             }
             Err(e) if crate::db::is_unique_violation(&e) => {
@@ -1480,6 +1509,7 @@ fn write_prepared(
     let mut resolutions = Vec::new();
     let mut ids: HashMap<String, i64> = HashMap::new();
     for (i, entity) in entities.iter().enumerate() {
+        crate::wtiming::begin(crate::wtiming::ENTITIES);
         let resolved = resolve::resolve_entity(
             db,
             entity,
@@ -1490,10 +1520,13 @@ fn write_prepared(
             semantic,
             &write_names,
         )?;
+        crate::wtiming::end(crate::wtiming::ENTITIES);
         let eid = resolved.id;
         ids.insert(text::norm_name(&entity.name), eid);
+        crate::wtiming::begin(crate::wtiming::GRAPH);
         kg::project_entity_from_db(db, eid)?;
         kg::project_name_parts(db, eid)?;
+        crate::wtiming::end(crate::wtiming::GRAPH);
         add_mention(db, id, eid, now)?;
         for (other, _name, score) in &resolved.similar {
             write_similar(db, eid, *other, *score)?;
@@ -1509,6 +1542,7 @@ fn write_prepared(
     // Gazetteer: link known aliases that appear as whole-word n-grams in
     // the content (never agent-supplied entities, which are already in).
     let mut seen: HashSet<String> = HashSet::new();
+    crate::wtiming::begin(crate::wtiming::GAZETTEER);
     for (norm, _, _) in extract::ngrams(&content, 4) {
         if norm.chars().count() < 3 || !seen.insert(norm.clone()) {
             continue;
@@ -1525,11 +1559,14 @@ fn write_prepared(
             add_mention(db, id, eid, now)?;
         }
     }
+    crate::wtiming::end(crate::wtiming::GAZETTEER);
     // E4a: memories that share an entity and sit close in world time are
     // neighbours ("what else happened around the move"). The fan-out cap is
     // enforced on both endpoints, so no memory can become a hub.
     if duplicate_of.is_none() {
+        crate::wtiming::begin(crate::wtiming::TLINKS);
         write_temporal_links(db, id, valid_from, cfg)?;
+        crate::wtiming::end(crate::wtiming::TLINKS);
     }
     let mut rel_results = Vec::new();
     let mut invalidated = Vec::new();
@@ -1566,6 +1603,7 @@ fn write_prepared(
         }
     }
     for (ri, relation) in relations.iter().enumerate() {
+        crate::wtiming::begin(crate::wtiming::RELATIONS);
         let pred_norm = text::norm_predicate(&relation.predicate);
         let phrase_vector = &vectors[pred_base + pred_index[&pred_norm]];
         let resolved = resolve::resolve_predicate(
@@ -1889,7 +1927,9 @@ fn write_prepared(
             )?;
         }
         invalidated.extend(ended_here);
+        crate::wtiming::begin(crate::wtiming::GRAPH);
         kg::project_relation(db, rid, src, dst, &predicate_text)?;
+        crate::wtiming::end(crate::wtiming::GRAPH);
         rel_results.push(RelationResult {
             id: rid,
             fact,
@@ -1899,6 +1939,7 @@ fn write_prepared(
                 "new".into()
             },
         });
+        crate::wtiming::end(crate::wtiming::RELATIONS);
     }
     // Text can still retract a different fact ("Alice no longer leads the
     // team") when the agent supplied relations of its own: end the one live
@@ -1906,6 +1947,7 @@ fn write_prepared(
     // ambiguous. The relations this memory just evidenced are its own
     // assertion and are never retracted by its prose.
     if duplicate_of.is_none() {
+        crate::wtiming::begin(crate::wtiming::RETRACTIONS);
         let own: Vec<i64> = rel_results.iter().map(|r: &RelationResult| r.id).collect();
         let mut sink = RetractionSink {
             exclude: &own,
@@ -1913,6 +1955,7 @@ fn write_prepared(
             conflicts: &mut conflicts,
         };
         end_text_retractions(db, &content, &entities, valid_from, now, &mut sink)?;
+        crate::wtiming::end(crate::wtiming::RETRACTIONS);
     }
     // A memory with an end (--until) ends the relations only it keeps current.
     if let (None, Some(to)) = (duplicate_of, valid_to) {
@@ -1933,8 +1976,10 @@ fn write_prepared(
         .copied()
         .chain(rel_results.iter().map(|r| r.id))
         .collect();
+    crate::wtiming::begin(crate::wtiming::FINALIZE);
     end_memories_of_ended_facts(db, &touched)?;
     kg::bump_gen(db)?;
+    crate::wtiming::end(crate::wtiming::FINALIZE);
     let mut hints = if content.len() > 2000 {
         vec!["long content: consider splitting into atomic memories".into()]
     } else {
@@ -1958,6 +2003,7 @@ fn write_prepared(
                 .into(),
         );
     }
+    crate::wtiming::end_item(id);
     Ok(RememberOutput {
         id,
         duplicate_of,
@@ -1974,6 +2020,7 @@ fn write_prepared(
 }
 
 fn add_mention(db: &Db, memory: i64, entity: i64, now: i64) -> Result<bool> {
+    crate::wtiming::begin(crate::wtiming::MENTIONS);
     let inserted = db.sql().execute(
         "INSERT OR IGNORE INTO mentions(memory_id,entity_id) VALUES (?1,?2)",
         params![memory, entity],
@@ -1983,7 +2030,12 @@ fn add_mention(db: &Db, memory: i64, entity: i64, now: i64) -> Result<bool> {
             "UPDATE entities SET mention_count=mention_count+1, updated_at=?1 WHERE id=?2",
             params![now, entity],
         )?;
+        crate::wtiming::end(crate::wtiming::MENTIONS);
+        crate::wtiming::begin(crate::wtiming::GRAPH);
         kg::project_mention(db, memory, entity)?;
+        crate::wtiming::end(crate::wtiming::GRAPH);
+    } else {
+        crate::wtiming::end(crate::wtiming::MENTIONS);
     }
     Ok(inserted)
 }
