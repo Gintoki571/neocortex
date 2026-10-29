@@ -2257,7 +2257,7 @@ fn a_baseline_v3_database_with_three_column_predicates_opens() {
             &engine,
             "SELECT count(*) FROM predicates WHERE display!='' AND group_id!=0"
         ),
-        21,
+        23,
         "the full ontology is re-seeded on the extended table"
     );
     // The causal family is part of the current seed set (E4b).

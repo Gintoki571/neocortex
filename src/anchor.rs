@@ -166,7 +166,7 @@ fn weak_alias(alias: &str, entity_norm: &str, entities: usize) -> bool {
 }
 
 /// The single multi-word entity whose name starts or ends with `token`.
-fn unique_name_token(db: &Db, token: &str) -> crate::Result<Option<i64>> {
+pub(crate) fn unique_name_token(db: &Db, token: &str) -> crate::Result<Option<i64>> {
     let clean: String = token.chars().filter(|c| c.is_alphanumeric()).collect();
     if clean.is_empty() {
         return Ok(None);

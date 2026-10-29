@@ -330,7 +330,11 @@ also render the interval with a computed duration ("3 years 2 months",
   converges them again.
 - Inverse and symmetric phrases: "X reports to Y" is stored once as "Y manages
   X" (or, for "married to", with both ends in storage order) and every side
-  renders its own view: `entity` shows the phrase that starts with the profile.
+  renders its own view: `entity` shows the phrase that starts with the profile,
+  and `recall` answers a question phrased from either side — "who does Mira
+  report to", "who is Mira's manager" and "who is Mira accountable to" all
+  return the stored "Noah manages Mira" as "Mira reports to Noah", while "who
+  does Mira manage" stays "Noah manages Mira".
 - Names in running text: a lower-case connector stays inside a name ("Rua do
   Instituto Bacteriológico", "Universidade da Beira Interior", "Bank of
   America"), so the generic head ("Rua", "Universidade") is never stored as an
@@ -348,7 +352,14 @@ also render the interval with a computed duration ("3 years 2 months",
   brand new phrase joins a family when its vector is close enough. The seeded
   `cause` family (`causes`, `led to`, `resulted in`, with `caused by` and
   `because of` as inverses) makes why-questions follow causal evidence first
-  when `w_causal` is on.
+  when `w_causal` is on, and `mentor`/`mentored by` lets a mentee keep several
+  mentors. The hand-written seed set is reconciled on every open, so a database
+  written by an older build gains predicates and aliases added since (the
+  `mentor` pair, `accountable to`) without a re-import; a predicate or alias
+  the agent created itself is never taken over. The reconcile writes only when
+  something is missing, so a database another process is writing, or one opened
+  read-only, still opens (`stats`, `recall`, `validate` only read) and is
+  repaired on the next writable open.
 
 ## Quality
 
