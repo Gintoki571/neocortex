@@ -21,6 +21,22 @@ const EXCLUSION_WEIGHT: f64 = 2.5;
 /// Score multiplier for memories of the typed items that do have the
 /// excluded property: they are the wrong answer to that question.
 const EXCLUSION_PENALTY: f64 = 0.5;
+/// Weight of the status channel: bug reports no later memory fixes answer a
+/// "what is still open" question (H2-15).
+const STATUS_WEIGHT: f64 = 4.0;
+/// Score multiplier for a bug a later memory fixes: still shown, ranked after
+/// the open ones.
+const STATUS_CLOSED_PENALTY: f64 = 0.5;
+/// Score multiplier for a memory that reports no defect at all on a status
+/// question: "Lumen is written in Rust" is not an open bug.
+const STATUS_NEUTRAL_PENALTY: f64 = 0.7;
+/// How many first-pass answers seed the cause follow (H2-16).
+const CAUSE_SEEDS: usize = 2;
+/// Weight of the followed cause memory: it explains the answer, it is not the
+/// answer (the memory that names the fix stays first).
+const CAUSE_WEIGHT: f64 = 1.5;
+/// Most "is a later memory a fix" lookups one status question may run.
+const STATUS_LOOKUPS: usize = 20;
 /// Top dense-retrieval cosine below which a query with no lexical or entity
 /// support is treated as "nothing relevant is stored".
 const ABSTAIN_COSINE: f64 = 0.18;
@@ -225,6 +241,71 @@ fn top_by_cosine(db: &Db, ids: &[i64], query_vec: &[f32], keep: usize) -> Result
     scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.truncate(keep);
     Ok(scored.into_iter().map(|(_, id)| id).collect())
+}
+
+/// H2-15: the bug reports among the candidates, split into the ones no later
+/// memory fixes (the answer to "what is still open") and the ones a later
+/// memory fixes. A report that carries a fix cue itself is already closed.
+fn status_channels(
+    engine: &Engine,
+    query_vec: &[f32],
+    rows: &HashMap<i64, MemoryRow>,
+    now: i64,
+) -> Result<(Vec<i64>, HashSet<i64>)> {
+    let mut open = Vec::new();
+    let mut closed = HashSet::new();
+    let mut ids: Vec<i64> = rows.keys().copied().collect();
+    ids.sort_unstable();
+    let mut lookups = 0;
+    for id in ids {
+        let Some(row) = rows.get(&id) else { continue };
+        if !paths::is_bug_memory(&row.1) {
+            continue;
+        }
+        if paths::has_fix_cue(&row.1) {
+            closed.insert(id);
+            continue;
+        }
+        if lookups >= STATUS_LOOKUPS {
+            continue;
+        }
+        lookups += 1;
+        if fixed_later(&engine.db, id, &row.1, row.9, now)? {
+            closed.insert(id);
+        } else {
+            open.push(id);
+        }
+    }
+    let open = top_by_cosine(&engine.db, &open, query_vec, 30)?;
+    Ok((open, closed))
+}
+
+/// A memory written at or after `from` and still live at `now` that fixes the
+/// defect `content` reports: it carries a fix cue and shares a date or two
+/// content words.
+fn fixed_later(db: &Db, id: i64, content: &str, from: i64, now: i64) -> Result<bool> {
+    let mut terms: Vec<String> = paths::status_terms(content).into_iter().collect();
+    terms.sort();
+    terms.truncate(12);
+    let Some(q) = text::fts_query(&terms.join(" "), &[]) else {
+        return Ok(false);
+    };
+    let mut st = db.sql().prepare(
+        "SELECT m.id,m.content FROM memories m
+         JOIN memories_fts ON memories_fts.rowid=m.id
+         WHERE memories_fts MATCH ?1 AND m.id<>?2 AND m.valid_from>=?3
+           AND m.expired_at IS NULL AND (m.valid_to IS NULL OR m.valid_to>?4)
+         ORDER BY bm25(memories_fts) LIMIT 30",
+    )?;
+    for row in st.query_map(params![q, id, from, now], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (other, fix) = row?;
+        if other != id && paths::has_fix_cue(&fix) && paths::same_bug(content, &fix) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// World-time end of a memory (valid_to reached) or system retirement.
@@ -880,6 +961,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         paths::exclusion_entities(&engine.db, &input.query, now)?
     };
     let causal_query = paths::causal_intent(&input.query);
+    let status_query = engine.cfg.status_rank && paths::status_intent(&input.query);
     let query_text = input
         .query
         .split_whitespace()
@@ -1340,7 +1422,20 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     });
     excl_ids.truncate(depth);
 
-    let channels = [
+    // ---------------------------------------------------------- status
+    // H2-15: "what is still open" asks for the defects no later memory fixes.
+    // Only the candidate rows are classified; the rule re-ranks, never hides.
+    let (mut status_ids, status_closed) = if status_query {
+        status_channels(engine, &query_vec, &rows, now)?
+    } else {
+        (Vec::new(), HashSet::new())
+    };
+    status_ids.retain(|id| {
+        rows.get(id)
+            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
+    });
+
+    let mut channels = vec![
         rank::Channel {
             name: "bm25",
             weight: engine.cfg.w_bm25,
@@ -1386,7 +1481,41 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             weight: EXCLUSION_WEIGHT,
             ids: &excl_ids,
         },
+        rank::Channel {
+            name: "status",
+            weight: STATUS_WEIGHT,
+            ids: &status_ids,
+        },
     ];
+    // H2-16: a why-question asks for the cause of what answered the first
+    // pass, so the seeds are the first-pass head, not the query.
+    let (mut cause_ids, cause_relations) = if engine.cfg.cause_follow && causal_query {
+        let seeds: Vec<i64> = rank::rrf(&channels, engine.cfg.rrf_k)
+            .into_iter()
+            .take(CAUSE_SEEDS)
+            .map(|f| f.id)
+            .collect();
+        paths::cause_follow(&engine.db, &seeds, vis, 6)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let missing: Vec<i64> = cause_ids
+        .iter()
+        .copied()
+        .filter(|id| !rows.contains_key(id))
+        .collect();
+    rows.extend(fetch_rows(&engine.db, &missing)?);
+    cause_ids.retain(|id| {
+        rows.get(id)
+            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
+    });
+    if !cause_ids.is_empty() {
+        channels.push(rank::Channel {
+            name: "cause",
+            weight: CAUSE_WEIGHT,
+            ids: &cause_ids,
+        });
+    }
     let fused = rank::rrf(&channels, engine.cfg.rrf_k);
     // E5: retention only nudges scores when the knob is on. Reads are batched
     // once for the whole candidate set; a zero weight never queries the table.
@@ -1446,6 +1575,13 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         }
         if blocked_ids.contains(&f.id) {
             score *= EXCLUSION_PENALTY;
+        }
+        if status_query {
+            if !paths::is_bug_memory(&row.1) {
+                score *= STATUS_NEUTRAL_PENALTY;
+            } else if status_closed.contains(&f.id) {
+                score *= STATUS_CLOSED_PENALTY;
+            }
         }
         candidates.push((f.id, score, f.ranks));
     }
@@ -1671,6 +1807,18 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         merged.truncate(8);
         merged
     };
+    // H2-16: the cause the first-pass answer points at leads the facts.
+    if !cause_relations.is_empty() {
+        let mut extra: Vec<FactHit> = paths::facts_by_ids(&engine.db, &cause_relations, cutoff, 2)?
+            .into_iter()
+            .filter(|fact| history || !fact.ended)
+            .collect();
+        if !extra.is_empty() {
+            extra.extend(facts);
+            extra.truncate(8);
+            facts = extra;
+        }
+    }
     // The facts that give the excluded property to a typed item are the wrong
     // answers ("auth-service is written in Rust" for "which service is not in
     // Rust"): keep them, but after the facts that answer the question.

@@ -14,7 +14,7 @@ use crate::db::Db;
 use crate::engine::{Engine, FactHit};
 use crate::text;
 use crate::Result;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, params_from_iter, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -304,6 +304,136 @@ pub fn causal_intent(query: &str) -> bool {
         || q.contains("what led to")
         || q.contains("reason for")
         || q.contains("how come")
+}
+
+/// H2-15: a question that asks which bugs are *unresolved* ("still open",
+/// "not fixed yet"). "open question" is not a bug status.
+pub fn status_intent(query: &str) -> bool {
+    let q = text::fold(query);
+    // An open question is a pending decision, not an open defect: the lexical
+    // "open" must not turn it into a status word.
+    if q.contains("open question") {
+        return false;
+    }
+    const CUES: &[&str] = &[
+        "still open",
+        "still broken",
+        "still failing",
+        "still unresolved",
+        "unresolved",
+        "unfixed",
+        "not fixed",
+        "not yet fixed",
+        "not been fixed",
+        "open bug",
+        "open bugs",
+        "open issue",
+        "open issues",
+        "open defect",
+        "open defects",
+        "open ticket",
+        "open tickets",
+        "outstanding",
+        "left to fix",
+        "remaining bug",
+        "remaining issue",
+    ];
+    CUES.iter().any(|cue| q.contains(cue))
+}
+
+/// Tokens that report a defect ("Bug on ...", "Error on ...", "the sync loop
+/// panicked").
+const BUG_CUES: &[&str] = &[
+    "bug",
+    "bugs",
+    "broken",
+    "regression",
+    "panic",
+    "panicked",
+    "crash",
+    "crashed",
+    "error",
+    "errors",
+    "fail",
+    "failed",
+    "failing",
+    "failure",
+    "defect",
+    "defects",
+];
+
+/// Tokens that say a defect was dealt with ("Fix for ...", "resolved",
+/// "released", "merged"). "merge" is not one: `merge_note_versions` is a
+/// function name.
+const FIX_CUES: &[&str] = &[
+    "fix", "fixed", "fixes", "fixing", "resolved", "resolve", "resolves", "closed", "merged",
+    "patched", "hotfix", "released", "shipped", "bump", "bumped",
+];
+
+/// Generic words that say nothing about *which* bug a memory is about.
+const STATUS_GENERIC: &[&str] = &[
+    "bug", "bugs", "issue", "issues", "error", "errors", "defect", "defects", "fix", "fixed",
+    "fixes", "fixing", "lumen", "project", "reported", "report", "release", "released", "shipped",
+    "still", "open", "question", "closed", "merged", "resolved", "patched",
+];
+
+fn has_cue(text: &str, cues: &[&str]) -> bool {
+    text::tokens(text)
+        .iter()
+        .any(|token| cues.contains(&token.as_str()))
+}
+
+/// A memory that reports a defect, not one that fixes or releases past it.
+pub(crate) fn is_bug_memory(text: &str) -> bool {
+    has_cue(text, BUG_CUES)
+}
+
+pub(crate) fn has_fix_cue(text: &str) -> bool {
+    has_cue(text, FIX_CUES)
+}
+
+/// The words two memories must share to be about the same bug.
+pub(crate) fn status_terms(text: &str) -> HashSet<String> {
+    text::tokens(text)
+        .into_iter()
+        .filter(|token| {
+            token.chars().count() >= 3
+                && !text::is_stopword(token)
+                && !STATUS_GENERIC.contains(&token.as_str())
+        })
+        .collect()
+}
+
+/// `YYYY-MM-DD` literals: the strongest "same bug" signal a report carries.
+fn date_literals(text: &str) -> HashSet<String> {
+    let bytes = text.as_bytes();
+    let mut out = HashSet::new();
+    let mut i = 0;
+    while i + 10 <= bytes.len() {
+        let window = &bytes[i..i + 10];
+        let date = window[4] == b'-'
+            && window[7] == b'-'
+            && window
+                .iter()
+                .enumerate()
+                .all(|(k, b)| k == 4 || k == 7 || b.is_ascii_digit());
+        if date {
+            out.insert(text[i..i + 10].to_string());
+            i += 10;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// True when `fix` is about the same defect as `bug`: a date they share, or
+/// two content words.
+pub(crate) fn same_bug(bug: &str, fix: &str) -> bool {
+    if !date_literals(bug).is_disjoint(&date_literals(fix)) {
+        return true;
+    }
+    status_terms(bug).intersection(&status_terms(fix)).count() >= 2
 }
 
 /// Every surface form a word may take in a stored fact.
@@ -1176,6 +1306,147 @@ pub(crate) fn causal_memories(
     Ok(out)
 }
 
+/// H2-16: the cause of what the first pass answered. A why-question is about
+/// the cause of the memory that answered it, and that memory rarely repeats
+/// the cause relation, so follow the stored causal facts one step out from the
+/// seeds: an evidence memory of a live `cause` relation that mentions one of
+/// their entities (or is a temporal memory link of one) is the cause.
+/// Returns the cause memories and the relations to render, in id order.
+pub(crate) fn cause_follow(
+    db: &Db,
+    seeds: &[i64],
+    vis: Visibility,
+    limit: usize,
+) -> Result<(Vec<i64>, Vec<i64>)> {
+    if seeds.is_empty() || limit == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let group: Option<i64> = db
+        .sql()
+        .query_row(
+            "SELECT COALESCE(NULLIF(group_id,0),id) FROM predicates WHERE canonical='cause'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(group) = group else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let marks = std::iter::repeat_n("?", seeds.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut seed_entities: HashSet<i64> = HashSet::new();
+    let mut st = db.sql().prepare(&format!(
+        "SELECT entity_id FROM mentions WHERE memory_id IN ({marks})"
+    ))?;
+    for id in st.query_map(params_from_iter(seeds.iter()), |r| r.get::<_, i64>(0))? {
+        seed_entities.insert(id?);
+    }
+    if seed_entities.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // Live cause relations and their evidence memories.
+    let mut st = db.sql().prepare(
+        "SELECT r.id,r.valid_from,r.valid_to,r.expired_at,e.memory_id
+         FROM relations r
+         JOIN predicates p ON p.id=r.predicate_id
+         JOIN relation_evidence e ON e.relation_id=r.id
+         WHERE COALESCE(NULLIF(p.group_id,0),p.id)=?1 AND r.polarity=1
+         ORDER BY r.id,e.memory_id",
+    )?;
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    for row in st.query_map([group], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })? {
+        let (relation, from, to, expired, memory) = row?;
+        if vis.shows(from, to, expired) {
+            pairs.push((relation, memory));
+        }
+    }
+    if pairs.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // The seeds stay in: a cause relation the answer itself evidences must
+    // still render, it just does not need a channel entry.
+    let memories: Vec<i64> = pairs.iter().map(|(_, memory)| *memory).collect();
+    let mut mentioned: HashSet<i64> = HashSet::new();
+    let mut linked: HashSet<i64> = HashSet::new();
+    if !memories.is_empty() {
+        let marks = std::iter::repeat_n("?", memories.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut st = db.sql().prepare(&format!(
+            "SELECT DISTINCT memory_id FROM mentions
+             WHERE memory_id IN ({marks}) AND entity_id IN ({})",
+            std::iter::repeat_n("?", seed_entities.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))?;
+        let mut p: Vec<Box<dyn rusqlite::ToSql>> = memories
+            .iter()
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        p.extend(
+            seed_entities
+                .iter()
+                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
+        );
+        for id in st.query_map(
+            rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
+            |r| r.get::<_, i64>(0),
+        )? {
+            mentioned.insert(id?);
+        }
+        // The same expansion E4a writes: a link means the two memories share an
+        // entity and happened within a day of each other.
+        let mut st = db.sql().prepare(&format!(
+            "SELECT a,b FROM memory_links WHERE a IN ({marks}) OR b IN ({marks})"
+        ))?;
+        for row in st.query_map(
+            rusqlite::params_from_iter(
+                memories
+                    .iter()
+                    .chain(memories.iter())
+                    .map(|id| id as &dyn rusqlite::ToSql),
+            ),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )? {
+            let (a, b) = row?;
+            if seeds.contains(&a) {
+                linked.insert(b);
+            }
+            if seeds.contains(&b) {
+                linked.insert(a);
+            }
+        }
+    }
+    let mut out_memories = Vec::new();
+    let mut out_relations = Vec::new();
+    for (relation, memory) in pairs {
+        if !(mentioned.contains(&memory) || linked.contains(&memory)) {
+            continue;
+        }
+        // The relation is rendered even when its evidence memory was already
+        // the answer; only the channel skips the seeds themselves.
+        if !out_relations.contains(&relation) {
+            out_relations.push(relation);
+        }
+        if !seeds.contains(&memory) && !out_memories.contains(&memory) {
+            out_memories.push(memory);
+        }
+        if out_memories.len() >= limit {
+            break;
+        }
+    }
+    Ok((out_memories, out_relations))
+}
+
 /// Evidence memories for ranked paths: the destination first, then the links.
 /// Deeper coverage wins: a three-hop chain that explains the whole question
 /// outranks a two-hop fragment with a slightly better edge score.
@@ -1213,6 +1484,30 @@ pub(crate) fn evidence(db: &Db, hits: &[PathHit]) -> Result<Vec<i64>> {
 /// The relations along the best paths, destination hop first, ready to render
 /// next to the retrieved memories.
 pub(crate) fn facts(db: &Db, hits: &[PathHit], cutoff: i64, limit: usize) -> Result<Vec<FactHit>> {
+    let mut ids = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    for hit in hits {
+        for step in hit.steps.iter().rev() {
+            // Prose and containment hops carry no relation to render.
+            if step.relation_id == 0 {
+                continue;
+            }
+            if seen.insert(step.relation_id) {
+                ids.push(step.relation_id);
+            }
+        }
+    }
+    facts_by_ids(db, &ids, cutoff, limit)
+}
+
+/// The facts of specific relations, in the order given: what a path ends on,
+/// or what a why-question's cause follow found.
+pub(crate) fn facts_by_ids(
+    db: &Db,
+    ids: &[i64],
+    cutoff: i64,
+    limit: usize,
+) -> Result<Vec<FactHit>> {
     let mut st = db.sql().prepare_cached(
         "SELECT p.canonical,r.fact,r.valid_from,r.valid_to,r.expired_at,s.name,d.name,r.polarity
          FROM relations r
@@ -1221,53 +1516,43 @@ pub(crate) fn facts(db: &Db, hits: &[PathHit], cutoff: i64, limit: usize) -> Res
          JOIN entities d ON d.id=r.dst
          WHERE r.id=?1",
     )?;
-    let mut seen: HashSet<i64> = HashSet::new();
     let mut out = Vec::new();
-    for hit in hits {
-        for step in hit.steps.iter().rev() {
-            // Prose and containment hops carry no relation to render.
-            if step.relation_id == 0 {
-                continue;
-            }
-            if !seen.insert(step.relation_id) {
-                continue;
-            }
-            let Ok(mut rows) = st.query(params![step.relation_id]) else {
-                continue;
-            };
-            let Some(row) = rows.next()? else { continue };
-            let (predicate, fact, valid_from, valid_to, expired, source, target, polarity) = (
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, i64>(7)?,
-            );
-            if valid_from > cutoff {
-                continue;
-            }
-            out.push(FactHit {
-                id: step.relation_id,
-                source,
-                predicate,
-                target,
-                fact,
-                valid_from,
-                valid_to,
-                ended: expired.is_some() || valid_to.is_some_and(|v| v <= cutoff),
-                retracted: expired.is_some() && valid_to.is_none(),
-                polarity,
-                memory: false,
-                current_values: None,
-                replaced_by: None,
-                duration: None,
-            });
-            if out.len() >= limit {
-                return Ok(out);
-            }
+    for relation_id in ids {
+        let Ok(mut rows) = st.query(params![relation_id]) else {
+            continue;
+        };
+        let Some(row) = rows.next()? else { continue };
+        let (predicate, fact, valid_from, valid_to, expired, source, target, polarity) = (
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+        );
+        if valid_from > cutoff {
+            continue;
+        }
+        out.push(FactHit {
+            id: *relation_id,
+            source,
+            predicate,
+            target,
+            fact,
+            valid_from,
+            valid_to,
+            ended: expired.is_some() || valid_to.is_some_and(|v| v <= cutoff),
+            retracted: expired.is_some() && valid_to.is_none(),
+            polarity,
+            memory: false,
+            current_values: None,
+            replaced_by: None,
+            duration: None,
+        });
+        if out.len() >= limit {
+            break;
         }
     }
     Ok(out)

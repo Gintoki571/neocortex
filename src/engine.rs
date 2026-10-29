@@ -86,6 +86,13 @@ pub struct Config {
     pub tlink_cap: usize,
     /// RRF weight of the causal channel on why/intent questions (E4b).
     pub w_causal: f64,
+    /// H2-16: on a why-question, follow the stored cause relations of the top
+    /// answering memories (shared entity or memory link) and add their cause
+    /// memory and fact. 0 disables the follow step.
+    pub cause_follow: bool,
+    /// H2-15: on a "still open / unresolved" question, rank open bug reports
+    /// above bugs a later memory fixes. Re-ranks, never hides.
+    pub status_rank: bool,
     /// Extract cause relations from in-memory text cues (E4b). Off by default:
     /// the calling agent is the reliable extractor.
     pub causal_extract: bool,
@@ -163,6 +170,8 @@ impl Default for Config {
             tlink_window_hours: 24.0,
             tlink_cap: 20,
             w_causal: 0.0,
+            cause_follow: true,
+            status_rank: true,
             causal_extract: false,
             w_retention: 0.05,
             access_keep: 8,

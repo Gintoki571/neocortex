@@ -1273,3 +1273,209 @@ fn entity_lookup_falls_back_to_prefix_and_suggests_closest() {
         "{err}"
     );
 }
+
+// ---------------------------------------------------------------- nc-status H2-15/16
+
+#[test]
+fn status_intent_only_fires_on_unresolved_questions() {
+    for query in [
+        "what bug is still open in lumen",
+        "which issues are unresolved",
+        "what is still broken",
+        "which bugs are not fixed yet",
+        "any open bugs in lumen",
+        "what defects are outstanding",
+    ] {
+        assert!(paths::status_intent(query), "{query:?}");
+    }
+    for query in [
+        "what bugs did we fix",
+        "what did we fix in v0.3.1",
+        "what is the open question about workspaces",
+        "why is the sky blue",
+        "what is Mira working on",
+    ] {
+        assert!(!paths::status_intent(query), "{query:?}");
+    }
+}
+
+#[test]
+fn a_still_open_question_ranks_the_unfixed_bug_first() {
+    let e = engine(Arc::new(HashEmbedder));
+    let bug = remember(
+        &e,
+        "Bug on 2026-09-18: Lumen's sync loop panicked with DatabaseBusy when two devices synced at once.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-09-18".into());
+            i.entities = vec![entity("Lumen")];
+        },
+    );
+    let fixed = remember(
+        &e,
+        "Fix for the 2026-09-18 DatabaseBusy panic: set PRAGMA busy_timeout=5000 and retried the transaction once.",
+        |i| {
+            i.kind = Some("procedure".into());
+            i.valid_from = Some("2026-09-19".into());
+            i.entities = vec![entity("Lumen")];
+        },
+    );
+    let open = remember(
+        &e,
+        "A user reported on 2026-10-15 that offline edits from two devices lost one note body; suspected bug in merge_note_versions.",
+        |i| {
+            i.kind = Some("observation".into());
+            i.valid_from = Some("2026-10-15".into());
+            i.entities = vec![entity("Lumen")];
+        },
+    );
+    let question = remember(
+        &e,
+        "Open question 2026-10-15: whether Lumen should support team workspaces in v0.5; the decision was deferred.",
+        |i| {
+            i.kind = Some("note".into());
+            i.valid_from = Some("2026-10-16".into());
+            i.entities = vec![entity("Lumen")];
+        },
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "what bug is still open in lumen".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let position = |id: i64| out.memories.iter().position(|m| m.id == id);
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert_eq!(out.memories.first().map(|m| m.id), Some(open), "{shown:?}");
+    assert!(
+        position(open) < position(bug),
+        "the open bug must outrank the fixed one: {shown:?}"
+    );
+    assert!(
+        position(open) < position(fixed),
+        "the open bug must outrank its fix: {shown:?}"
+    );
+    assert!(
+        position(open) < position(question),
+        "an open question is not an open bug: {shown:?}"
+    );
+    // Re-ranking only: the fixed bug is demoted, never dropped.
+    assert!(position(bug).is_some(), "{shown:?}");
+}
+
+#[test]
+fn a_status_question_without_bugs_changes_nothing() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Lumen is written in Rust.", |i| {
+        i.entities = vec![entity("Lumen")];
+    });
+    remember(&e, "Lumen uses SQLite in WAL mode.", |i| {
+        i.entities = vec![entity("Lumen")];
+    });
+    let query = "what bug is still open in lumen".to_string();
+    let on = e
+        .recall(&RecallInput {
+            query: query.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    e.cfg.status_rank = false;
+    let base = e
+        .recall(&RecallInput {
+            query,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&on), ids(&base));
+}
+
+#[test]
+fn a_why_question_follows_the_cause_of_the_answering_memory() {
+    let e = engine(Arc::new(HashEmbedder));
+    let fix = remember(
+        &e,
+        "Mira Shah fixed the 2026-08-14 outage by adding a circuit breaker to the payments client.",
+        |i| {
+            i.entities = vec![entity("Mira Shah"), service("payments client")];
+        },
+    );
+    let cause = remember(
+        &e,
+        "The 2026-08-14 outage was caused by a retry storm from the payments client, which amplified the failure.",
+        |i| {
+            i.entities = vec![service("payments client")];
+            i.relations = vec![relation(
+                "retry storm",
+                "caused",
+                "2026-08-14 outage",
+                "retry storm caused 2026-08-14 outage",
+            )];
+        },
+    );
+    remember(
+        &e,
+        "Mira Shah prefers async written updates over meetings.",
+        |i| {
+            i.entities = vec![entity("Mira Shah")];
+        },
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "why did Mira add a circuit breaker".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert_eq!(out.memories.first().map(|m| m.id), Some(fix), "{shown:?}");
+    assert!(
+        out.memories.iter().any(|m| m.id == cause),
+        "the cause memory must be added: {shown:?}"
+    );
+    assert!(has_reason(&out, cause, "cause"), "{shown:?}");
+    assert!(
+        out.facts.iter().any(|f| f.source == "retry storm"),
+        "the cause fact must be rendered: {:?}",
+        out.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_why_question_without_causes_is_unchanged() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    remember(
+        &e,
+        "Mira Shah prefers async written updates over meetings.",
+        |i| {
+            i.entities = vec![entity("Mira Shah")];
+        },
+    );
+    remember(&e, "Mira Shah has a cat named Poppy.", |i| {
+        i.entities = vec![entity("Mira Shah")];
+    });
+    let query = "why is the sky blue".to_string();
+    let on = e
+        .recall(&RecallInput {
+            query: query.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    e.cfg.cause_follow = false;
+    let base = e
+        .recall(&RecallInput {
+            query,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&on), ids(&base));
+    assert!(on.facts.iter().all(|f| f.source != "retry storm"));
+}
