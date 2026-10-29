@@ -1709,6 +1709,61 @@ fn merge_entities_reprojects_only_the_surviving_entity() {
     assert_eq!(facts[0].target, "Widget");
 }
 
+/// KG-GHOST: an edge whose endpoint was never projected must complete that
+/// node from its relational row. A bare-id MERGE used to create a node with
+/// only `id`, which no label query can name.
+#[test]
+fn reprojection_completes_a_never_projected_endpoint() {
+    let engine = engine();
+    let first = remember(
+        &engine,
+        "Acme makes widgets",
+        vec![
+            named("Acme"),
+            EntityIn {
+                kind: Some("org".into()),
+                ..named("Widget")
+            },
+        ],
+        vec![rel("Acme", "makes", "Widget")],
+    );
+    let acme = first.entities[0].id;
+    let widget = first.entities[1].id;
+    // The projection lost the Widget node (the write path links a new entity
+    // before its node exists; a partial projection can too).
+    engine
+        .db
+        .graph()
+        .cypher(&format!(
+            "MATCH (n:Entity {{id:'e:{widget}'}}) DETACH DELETE n"
+        ))
+        .unwrap();
+    // A merge re-projects the surviving entity's edges, one of which points at
+    // the missing node.
+    kg::reproject_entity(&engine.db, acme).unwrap();
+    let rows = engine
+        .db
+        .graph()
+        .cypher(&format!(
+            "MATCH (e:Entity {{id:'e:{widget}'}}) RETURN e.name AS name, e.type AS type"
+        ))
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the relation edge did not come back");
+    assert_eq!(rows[0].get::<String>("name").unwrap(), "Widget");
+    assert_eq!(rows[0].get::<String>("type").unwrap(), "org");
+    // Anything else that still leaves a bare node is reported by validate.
+    engine
+        .db
+        .graph()
+        .cypher("MERGE (e:Entity {id:'e:999'})")
+        .unwrap();
+    let problems = engine.validate().unwrap();
+    assert!(
+        problems.iter().any(|p| p.contains("no name")),
+        "{problems:?}"
+    );
+}
+
 /// #4: a soft forget ends relations whose only live evidence was that memory.
 #[test]
 fn soft_forget_ends_relations_with_no_other_live_evidence() {

@@ -452,6 +452,26 @@ fn equal_and_unrelated_names_do_not_link() {
 }
 
 #[test]
+fn validate_counts_containment_edges() {
+    // VALIDATE-NAMEPART: a CONTAINS edge is a projection edge like a mention or
+    // a relation, so `validate` must compare against the name_part rows too.
+    let e = engine();
+    remember(
+        &e,
+        "Cascais is on the Atlantic.",
+        vec![entity("Cascais", "place")],
+    );
+    remember(
+        &e,
+        "Cascais marina is quiet in winter.",
+        vec![entity("Cascais marina", "marina")],
+    );
+    assert_eq!(parts(&e).len(), 1, "the fixture has no containment link");
+    let problems = e.validate().unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
+}
+
+#[test]
 fn containment_edge_reaches_the_graph_projection() {
     // The write path links a new entity before its node exists, so the edge
     // must be projected once the node is: both insertion orders.

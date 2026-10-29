@@ -1082,17 +1082,26 @@ impl Engine {
         let mentions = count("SELECT count(*) FROM mentions")?;
         let similar = count("SELECT count(*) FROM similar")?;
         let relations = count("SELECT count(*) FROM relations")?;
+        let name_parts = count("SELECT count(*) FROM name_part")?;
         if nodes != memories + entities {
             out.push(format!(
                 "projection nodes: {nodes}, relational: {}",
                 memories + entities
             ));
         }
-        if edges != mentions + similar + relations {
+        // A B5 containment link is a projection edge like a mention or a relation.
+        if edges != mentions + similar + relations + name_parts {
             out.push(format!(
                 "projection edges: {edges}, relational: {}",
-                mentions + similar + relations
+                mentions + similar + relations + name_parts
             ));
+        }
+        // An edge MERGE run before its endpoint was projected leaves a node
+        // with only `id`: every node is projected with a name.
+        let unnamed =
+            cypher_count("MATCH (n) WHERE n.name IS NULL OR n.name = '' RETURN count(n) AS c")?;
+        if unnamed != 0 {
+            out.push(format!("{unnamed} projection nodes have no name"));
         }
         if count("SELECT count(*) FROM memories_vec")? != memories {
             out.push("memory vectors do not match memories".into());

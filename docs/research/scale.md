@@ -345,6 +345,97 @@ the saved world-300 DB, 600 queries, 1 core, 3 interleaved pairs (`eval --load-d
 253.5 / 230.0 / 172.5 ms, branch 224.7 / 223.4 / 312.5 ms (medians 230.0 vs 224.7; the third branch run hit
 another lane's build). The read path does not touch this lane's code.
 
+## After nc-scale2: 108,667 real-model memories on today's main
+
+The section 6 ingest predates nc-write100k and was queried by bf73846. world-10000 (seed 10001) was re-ingested
+with the real model into an int8 DB (`NEOCORTEX_VEC=int8`, `eval --save-db`) by main fdcad90 - nc-perf 5e3e082,
+nc-write100k 06b695c, nc-er08 bf73846 and nc-inverse 717325e all in it - and measured with that build's binaries
+on copies of the DB on 2026-10-29/30.
+
+Ingest: 108,667 memories in 14,192 s (3.9 h, 7.66/s), from the log's progress lines:
+
+| memories | rate |
+|---|---|
+| 0-10k | 3.07/s |
+| 10k-20k | 6.85/s |
+| 20k-30k | 10.11/s |
+| 30k-40k | 9.19/s |
+| 40k-50k | 9.19/s |
+| 50k-60k | 10.61/s |
+| 60k-70k | 9.83/s |
+| 70k-80k | 9.56/s |
+| 80k-90k | 9.16/s |
+| 90k-100k | 8.48/s |
+| 100k-108.7k | 8.87/s |
+
+The write path no longer falls off with corpus size: after the slow first block (3.07/s; the log does not split
+model load, page-cache warmth and host load) the rate stays between 6.9 and 10.6 memories/s to 108k, against
+28,997 s (3.7/s average, 1.1/s in the last 9k) for the pre-nc-write100k build in section 6. `stats`: 108,667
+memories, 11,909 entities, 42,571 relations, 1,388 similar, 27 predicates; DB file 274,010,112 B (2,522 B per
+memory, int8).
+
+Accuracy (`eval --load-db`, 600 queries):
+
+| category | q | acc@10 | recall | MRR | agent_sim --hints |
+|---|---|---|---|---|---|
+| aggregation | 60 | 1.000 | 1.000 | 0.972 | 60/60 |
+| as-of | 102 | 1.000 | 1.000 | 0.818 | 102/102 |
+| current | 102 | 1.000 | 0.980 | 0.881 | 102/102 |
+| history | 78 | 1.000 | 1.000 | 1.000 | 78/78 |
+| temporal-window | 60 | 1.000 | 1.000 | 1.000 | 60/60 |
+| three-hop | 78 | 1.000 | 0.812 | 0.666 | 78/78 |
+| two-hop | 120 | 0.950 | 0.971 | 0.784 | 120/120 |
+| overall | 600 | 0.990 | 0.966 | 0.859 | 600/600 = 1.000 (1.01 calls/query) |
+
+Against section 6 (0.977 / 0.961 / 0.854, agent_sim 0.987): three-hop acc@10 is 1.000 (was 0.987) because ER-08
+removed the false person merges that ended hop-2 facts ("After nc-hop3"); its recall is still 0.812, the hop-3
+retrieval limit, unchanged. Two-hop acc@10 is 0.950 (was 0.892) and agent_sim answers all 120. The other
+non-perfect rows are `current` recall 0.980 and `as-of` MRR 0.818.
+
+Latency (`eval --load-db` on a copy; includes the query embedding; host shared with other lanes at load 3-10):
+
+| | 1 core | 2 cores |
+|---|---|---|
+| recall mean / p50 / p95 | 508.4 / 473.3 / 919.7 ms | 452.2 / 416.8 / 614.2 ms |
+
+Both latency rows are two separate `--load-db` passes on one copy, taken after another lane's real-model eval
+finished; load was 2.8 rising to 6.4 during the 1-core pass, so its p95 (920 ms) contains a lane burst while its
+p50 is stable (an earlier 1-core run under load 7-10 gave p50 475.0 / p95 589.6 ms; an earlier 2-core run p50
+437.4 / p95 1,287.9 ms). At p50 the read path matches section 6 (473/417 vs 478/395 ms on the same size): this
+lane does not touch it. Cold CLI recall (page cache warm; `RUSAGE_CHILDREN`): f32 model peak RSS 632.3 MiB, q8
+model 237.2 MiB, both unchanged from section 6 (633 / 237) - RSS is model-bound at 108k.
+
+### Two-hop misses: one query phrasing, ranking class
+
+The eval reports 45 two-hop queries with a non-rank-1 expected memory; only 6 have the answer string absent from
+the rendered context (acc@10 0.950 = 114/120). All 6 are "which language is used by <person>'s project" (5 of the
+5 queries in that exact shape) or its "what is the main language of the project led by <person>" variant (1 of
+2); both variants name the person, where the passing shapes name the project ("what language does the project X
+leads use": 5 of 5 pass). Hop 1 (the `leads` fact) is ranked 2-6; hop 2 (the language memory) is inside the top
+50 but far below 10, so every one is a ranking miss:
+
+| query (answer) | hop 1 | hop 2, rank at k=50 | class |
+|---|---|---|---|
+| Divya Yadwani (Kotlin) | w076433, rank 3 | w011731, rank 27 | ranking |
+| Gauri Mispore (Python) | w018038, rank 2 | w009238, rank 24 | ranking |
+| Saanvi Deshrao (Java) | w067002, rank 2 | w001399, rank 39 | ranking |
+| Luis Royrao (C#) | w068880, rank 2 | w005293, rank 25 | ranking (see below) |
+| Esther Sahzada (Scala) | w076795, rank 2 | w011823, rank 39 | ranking |
+| Daria Yadnath (Ruby) | w094289, rank 6 | w006636, rank 28 | ranking |
+
+No miss is a retrieval miss (all six hop-2 memories are in the top 50) or caused by a person merge: each of the
+six people is one `person` entity with a live `leads` relation to the expected project in the DB (a full
+`merge_audit` roster run at 108k needs another multi-hour ingest and was skipped, since no person-level merge is
+involved). The pattern is the same for all six: w009238 "Iris Platform is written in Python" carries the live
+relation "Iris Platform uses Python" (r3026), the project's entity card lists it, and `recall` for the question
+renders the hop-1 fact but not the hop-2 fact in the top 10. The question's "is used by" flips the stored `uses`
+direction while asking from the person's side; the fact/path channels stop at hop 1 for this phrasing.
+
+One miss also sits on a real entity-resolution defect, found while checking: "C#" and "C++" both normalise to
+`c` (`text::norm` drops the punctuation), so they are one `tool` entity (id 260, name "C++", 803 mentions: r1717
+"Quasar Signal uses C#" and every C++ fact share it). The relation text is right, but the entity name and its
+card are not. Not fixed here; open item TOOL-NAMES.
+
 ## Reproduce
 
 ```bash
