@@ -250,9 +250,12 @@ recall — is in [`skills/neocortex/SKILL.md`](skills/neocortex/SKILL.md).
 Four channels run in parallel: **BM25** over memory text and tags, **vector**
 KNN over UltraBERT embeddings, **graph** personalized PageRank over entities,
 memories and relations, and **temporal** overlap with a time window parsed from
-the query. A window also filters: a memory that states its own dates and falls
-outside the window is not returned, while a memory dated only by its ingest
-time stays. Their ranked lists are fused with weighted RRF, then lightly
+the query. A window also filters when the question scopes itself to it ("in
+August 2026", "during 2025"): a memory that states its own dates and falls
+outside the window is not returned, so a range in its text ("from X to Y")
+counts as spanning, while a month that only names the subject ("the December
+2026 conference") and a memory dated only by its ingest time stay. Their ranked
+lists are fused with weighted RRF, then lightly
 adjusted for recency, importance and whether a fact is ended. MMR removes
 near-duplicates and the result is packed into a token budget, whole items only.
 

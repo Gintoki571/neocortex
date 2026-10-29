@@ -578,3 +578,64 @@ pub fn communities(db: &Db) -> Result<HashMap<i64, i64>> {
     )?;
     Ok(out)
 }
+
+/// The entity-induced subgraph of a snapshot: entities only, weighted by the
+/// edges between them. Memory nodes exist so that a hub's mentions can pull it
+/// into a community; they say nothing about how the entities themselves group,
+/// so modularity is scored here. Returns the CSR and the entity id of each node.
+pub fn entity_subgraph(snap: &Snapshot) -> (Csr, Vec<i64>) {
+    let mut entities: Vec<i64> = snap.ent_node.keys().copied().collect();
+    entities.sort_unstable();
+    let index: HashMap<i64, u32> = entities
+        .iter()
+        .enumerate()
+        .map(|(i, &e)| (e, i as u32))
+        .collect();
+    let mut edges = Vec::new();
+    for &entity in &entities {
+        let node = snap.ent_node[&entity] as usize;
+        for k in snap.csr.offsets[node]..snap.csr.offsets[node + 1] {
+            let other = snap.csr.targets[k];
+            let ('e', other_id) = snap.node_kind[other as usize] else {
+                continue;
+            };
+            // Each edge once: keep the copy that starts at the lower entity id.
+            if other_id > entity {
+                edges.push((index[&entity], index[&other_id], snap.csr.weights[k]));
+            }
+        }
+    }
+    (Csr::from_edges(entities.len(), &edges), entities)
+}
+
+/// Quality of the partition the engine serves (`communities`, the one
+/// `overview` and entity cards show), scored on the entity-induced subgraph.
+/// `examples/community_eval` prints it: the flat Leiden partition the probe used
+/// to score cannot see H2-19 (mentions weight the community graph, attach moves
+/// a hub), so its number never moved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CommunityQuality {
+    pub modularity: f64,
+    pub communities: usize,
+    /// Communities holding exactly one entity: the shape H2-19 removes.
+    pub singletons: usize,
+}
+
+pub fn community_quality(db: &Db) -> Result<CommunityQuality> {
+    let snap = snapshot(db, None, false)?;
+    let (csr, entities) = entity_subgraph(&snap);
+    let labels = communities(db)?;
+    let comm: Vec<u32> = entities
+        .iter()
+        .map(|entity| labels.get(entity).copied().unwrap_or(-1) as u32)
+        .collect();
+    let mut sizes: HashMap<u32, usize> = HashMap::new();
+    for &c in &comm {
+        *sizes.entry(c).or_insert(0) += 1;
+    }
+    Ok(CommunityQuality {
+        modularity: crate::graph::modularity(&csr, &comm, 1.0),
+        communities: sizes.len(),
+        singletons: sizes.values().filter(|n| **n == 1).count(),
+    })
+}

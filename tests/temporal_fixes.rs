@@ -598,3 +598,72 @@ fn h2_10_bare_month_does_not_filter() {
         "a date on the subject must not filter the answer: {ids:?}"
     );
 }
+
+// H2-10: a memory whose text states a range ("from X to Y") keeps only its
+// start in the row, but the interval it states reaches into the window: an
+// event that runs into November is a November answer even though it started in
+// October.
+#[test]
+fn h2_10_window_keeps_event_whose_stated_range_reaches_into_it() {
+    let e = engine();
+    e.remember(RememberInput {
+        content: "Sprint 27 runs from 2026-10-26 to 2026-11-06.".into(),
+        kind: Some("event".into()),
+        valid_from: Some("2026-10-26".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    // "in" scopes the search to November, so the window filter is live; the
+    // row starts in October and must survive on the end its text states.
+    for query in [
+        "what is scheduled for November 2026",
+        "what happened in November 2026",
+    ] {
+        let out = e
+            .recall(&RecallInput {
+                query: query.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<i64> = out.memories.iter().map(|m| m.id).collect();
+        assert!(
+            ids.contains(&1),
+            "{query}: a stated range that reaches November is a November answer: {ids:?}"
+        );
+        assert!(
+            !out.window_empty,
+            "{query}: the November row is in view, so the window is not empty"
+        );
+    }
+}
+
+// H2-10: a month with an explicit year that still modifies a noun ("the
+// December 2026 conference") dates the subject, not the search: the year does
+// not turn a bare-month modifier into a scoping window.
+#[test]
+fn h2_10_year_on_a_noun_modifier_does_not_filter() {
+    let e = engine();
+    e.remember(RememberInput {
+        content: "The EMBO workshop accepted the lab's talk on Lon.".into(),
+        kind: Some("event".into()),
+        valid_from: Some("2026-10-07".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    for query in [
+        "which talk got the nod for the December 2026 conference",
+        "what happened at the December 2026 conference",
+    ] {
+        let out = e
+            .recall(&RecallInput {
+                query: query.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<i64> = out.memories.iter().map(|m| m.id).collect();
+        assert!(
+            ids.contains(&1),
+            "{query}: a year on the subject must not filter the answer: {ids:?}"
+        );
+    }
+}

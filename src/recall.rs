@@ -235,25 +235,41 @@ fn is_ended(row: &MemoryRow, cutoff: i64) -> bool {
 /// True when the memory states its own interval and that interval misses `w`
 /// (half-open overlap, the same rule as `since`/`until`). A row whose
 /// valid_from is only its ingest time has no stated interval: it is never
-/// outside a window, because nobody said when it happened. An event without an
-/// end happens at its start, so it belongs to the window that contains that
-/// start; anything else without an end is still true and overlaps later
+/// outside a window, because nobody said when it happened. An event without a
+/// stored end still has one when its text states it ("from X to Y"); otherwise
+/// it happens at its start, so it belongs to the window that contains that
+/// start. Anything else without an end is still true and overlaps later
 /// windows.
-fn dated_outside(row: &MemoryRow, w: &temporal::Window) -> bool {
+fn dated_outside(row: &MemoryRow, w: &temporal::Window, clock: &temporal::Clock) -> bool {
     let stated = row.10.is_some() || row.9 != row.8;
     if !stated {
         return false;
     }
-    match row.10 {
-        Some(to) => row.9 >= w.end || to <= w.start,
+    let end = match row.10 {
+        Some(to) => Some(to),
+        None if row.2 == "event" => stated_end(row, clock),
+        None => None,
+    };
+    match end {
+        Some(end) => row.9 >= w.end || end <= w.start,
         None => row.2 == "event" && !(w.start <= row.9 && row.9 < w.end),
     }
 }
 
+/// The exclusive end an event's own text states, when the writer stored only a
+/// start: a text date stores just its start (remember.rs), so "Sprint 27 runs
+/// from 2026-10-26 to 2026-11-06" keeps its end only in the wording. The same
+/// parser that dated the row reads it back; a text whose first window is not
+/// the stored start says nothing about this interval.
+fn stated_end(row: &MemoryRow, clock: &temporal::Clock) -> Option<i64> {
+    let text = temporal::find_window(&row.1, clock)?;
+    (text.start == row.9 && text.end > text.start).then_some(text.end)
+}
+
 /// A window filters only when the question scopes itself to it ("in August
 /// 2026", "during 2025", "on 2026-08-01"). A bare month that modifies a noun
-/// ("the December conference") dates the subject, not the search, so it stays a
-/// ranking boost.
+/// ("the December conference", "the December 2026 conference") dates the
+/// subject, not the search, so it stays a ranking boost.
 fn window_scope(w: &temporal::Window) -> bool {
     let matched = text::fold(&w.matched);
     let lead = matched.split_whitespace().next().unwrap_or("");
@@ -269,9 +285,7 @@ fn window_scope(w: &temporal::Window) -> bool {
             | "after"
             | "between"
             | "from"
-    ) || matched
-        .split(|c: char| !c.is_ascii_digit())
-        .any(|run| run.len() == 4)
+    )
 }
 
 /// A planned row is shown for a future-event question only when it is about
@@ -1472,7 +1486,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         if as_of.is_none()
             && window
                 .as_ref()
-                .is_some_and(|w| window_scope(w) && dated_outside(row, w))
+                .is_some_and(|w| window_scope(w) && dated_outside(row, w, &clock))
         {
             continue;
         }
