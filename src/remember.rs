@@ -1051,6 +1051,7 @@ pub fn remember_batch(
     }
     let mut base = 0;
     for chunk in inputs.chunks(BATCH_SIZE) {
+        let prepare_start = std::time::Instant::now();
         let mut prepared: Vec<(usize, Prepared)> = Vec::with_capacity(chunk.len());
         for (offset, inp) in chunk.iter().enumerate() {
             match prepare(db, cfg, clock, inp.clone()) {
@@ -1062,29 +1063,40 @@ pub fn remember_batch(
         if prepared.is_empty() {
             continue;
         }
+        let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1e3;
         let indices: Vec<usize> = prepared.iter().map(|(i, _)| *i).collect();
         let mut items: Vec<Prepared> = prepared.into_iter().map(|(_, p)| p).collect();
+        let embed_start = std::time::Instant::now();
         if let Err(e) = embed_prepared(emb, &mut items) {
             for i in indices {
                 slots[i] = Some(Err(crate::err!("{e}")));
             }
             continue;
         }
+        let embed_ms = embed_start.elapsed().as_secs_f64() * 1e3;
         let mut written: Vec<(usize, Result<RememberOutput>)> = Vec::with_capacity(items.len());
+        let items_len = items.len();
+        let write_start = std::time::Instant::now();
+        let mut savepoint_us = 0f64;
+        let mut savepoint_begin_us = 0f64;
         let transaction = db.write(|db| {
             for (i, item) in indices.iter().zip(items) {
+                let sp = std::time::Instant::now();
                 db.sql().execute_batch("SAVEPOINT remember_item")?;
-                match write_prepared(db, cfg, clock, emb.name(), item) {
+                savepoint_begin_us += sp.elapsed().as_secs_f64() * 1e6;
+                let result = match write_prepared(db, cfg, clock, emb.name(), item) {
                     Ok(out) => {
                         db.sql().execute_batch("RELEASE remember_item")?;
-                        written.push((*i, Ok(out)));
+                        Ok(out)
                     }
                     Err(e) => {
                         db.sql()
                             .execute_batch("ROLLBACK TO remember_item; RELEASE remember_item")?;
-                        written.push((*i, Err(e)));
+                        Err(e)
                     }
-                }
+                };
+                savepoint_us += sp.elapsed().as_secs_f64() * 1e6;
+                written.push((*i, result));
             }
             Ok(())
         });
@@ -1100,6 +1112,14 @@ pub fn remember_batch(
                 }
             }
         }
+        crate::wtiming::chunk(
+            items_len,
+            prepare_ms,
+            embed_ms,
+            write_start.elapsed().as_secs_f64() * 1e3,
+            savepoint_us / 1e3,
+            savepoint_begin_us / 1e3,
+        );
     }
     slots
         .into_iter()
@@ -1414,6 +1434,7 @@ fn write_prepared(
             write_names.push(norm);
         }
     }
+    crate::wtiming::begin_item();
     let endpoint_vector = |name: &str| -> &[f32] {
         let norm = text::norm_name(name);
         if let Some(pos) = entities
@@ -1427,15 +1448,8 @@ fn write_prepared(
         }
     };
     // Both checks read the database, so they belong after the earlier items of
-    // this chunk were written: a later input must see them.
-    // One scan serves the near-duplicate check (nearest) and, for a
-    // relation-less write, the related block below (top 10 once this memory
-    // is stored, so nine neighbours of the pre-insert list).
-    let neighbours = knn_memory(db, &vectors[0], if relations.is_empty() { 10 } else { 1 })?;
-    let near = neighbours
-        .first()
-        .copied()
-        .filter(|(_, s)| *s >= cfg.near_dup);
+    // this chunk were written: a later input must see them. They run after
+    // the mentions are written, because the candidate set is entity-driven.
     for id in &supersedes {
         let exists: bool = db.sql().query_row(
             "SELECT EXISTS(SELECT 1 FROM memories WHERE id=?1 AND expired_at IS NULL)",
@@ -1468,10 +1482,13 @@ fn write_prepared(
         touch_memory(db, id, now)?;
         id
     } else {
+        crate::wtiming::begin(crate::wtiming::MEM_INSERT);
         let inserted = db.sql().execute("INSERT INTO memories(content,kind,tags,importance,scope,source,session,created_at,valid_from,valid_to,content_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![content,kind,tags,importance,scope,source,session,now,valid_from,valid_to,stored_hash]);
+        crate::wtiming::end(crate::wtiming::MEM_INSERT);
         match inserted {
             Ok(_) => {
                 let id = db.sql().last_insert_rowid();
+                crate::wtiming::begin(crate::wtiming::VEC_INSERT);
                 db.sql().execute(
                     &format!(
                         "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,{},1)",
@@ -1479,7 +1496,10 @@ fn write_prepared(
                     ),
                     params![id, db.vec_blob(&vectors[0])],
                 )?;
+                crate::wtiming::end(crate::wtiming::VEC_INSERT);
+                crate::wtiming::begin(crate::wtiming::GRAPH);
                 kg::project_memory(db, id, &kind, &content)?;
+                crate::wtiming::end(crate::wtiming::GRAPH);
                 id
             }
             Err(e) if crate::db::is_unique_violation(&e) => {
@@ -1499,6 +1519,7 @@ fn write_prepared(
     let mut resolutions = Vec::new();
     let mut ids: HashMap<String, i64> = HashMap::new();
     for (i, entity) in entities.iter().enumerate() {
+        crate::wtiming::begin(crate::wtiming::ENTITIES);
         let resolved = resolve::resolve_entity(
             db,
             entity,
@@ -1509,10 +1530,13 @@ fn write_prepared(
             semantic,
             &write_names,
         )?;
+        crate::wtiming::end(crate::wtiming::ENTITIES);
         let eid = resolved.id;
         ids.insert(text::norm_name(&entity.name), eid);
+        crate::wtiming::begin(crate::wtiming::GRAPH);
         kg::project_entity_from_db(db, eid)?;
         kg::project_name_parts(db, eid)?;
+        crate::wtiming::end(crate::wtiming::GRAPH);
         add_mention(db, id, eid, now)?;
         for (other, _name, score) in &resolved.similar {
             write_similar(db, eid, *other, *score)?;
@@ -1528,6 +1552,7 @@ fn write_prepared(
     // Gazetteer: link known aliases that appear as whole-word n-grams in
     // the content (never agent-supplied entities, which are already in).
     let mut seen: HashSet<String> = HashSet::new();
+    crate::wtiming::begin(crate::wtiming::GAZETTEER);
     for (norm, _, _) in extract::ngrams(&content, 4) {
         if norm.chars().count() < 3 || !seen.insert(norm.clone()) {
             continue;
@@ -1544,11 +1569,36 @@ fn write_prepared(
             add_mention(db, id, eid, now)?;
         }
     }
+    crate::wtiming::end(crate::wtiming::GAZETTEER);
+    // Near-duplicate and related checks share one bounded candidate set: FTS
+    // hits on this text, the newest memories per mentioned entity and the
+    // newest memories overall. The vec0 KNN they replace compared every
+    // stored vector, so the write cost followed the corpus.
+    crate::wtiming::begin(crate::wtiming::KNN);
+    // Sorted: a hash map's order is per-process, and equal cosines keep the
+    // candidate order in the sort.
+    let mut entity_ids: Vec<i64> = ids.values().copied().collect();
+    entity_ids.sort_unstable();
+    let candidates = neighbour_candidates(db, &content, &entity_ids)?;
+    let neighbours = knn_among(
+        db,
+        &vectors[0],
+        &candidates,
+        if relations.is_empty() { 10 } else { 1 },
+        id,
+    )?;
+    crate::wtiming::end(crate::wtiming::KNN);
+    let near = neighbours
+        .first()
+        .copied()
+        .filter(|(_, s)| *s >= cfg.near_dup);
     // E4a: memories that share an entity and sit close in world time are
     // neighbours ("what else happened around the move"). The fan-out cap is
     // enforced on both endpoints, so no memory can become a hub.
     if duplicate_of.is_none() {
+        crate::wtiming::begin(crate::wtiming::TLINKS);
         write_temporal_links(db, id, valid_from, cfg)?;
+        crate::wtiming::end(crate::wtiming::TLINKS);
     }
     let mut rel_results = Vec::new();
     let mut invalidated = Vec::new();
@@ -1556,11 +1606,8 @@ fn write_prepared(
     let mut related = Vec::new();
     // Relations dropped because both ends resolved to one entity (H2-18).
     let mut self_relations = 0usize;
-    if relations.is_empty() && !ids.is_empty() {
-        let entity_ids: Vec<i64> = ids.values().copied().collect();
-        // A stored memory is its own nearest row; a duplicate stored nothing.
-        let keep = if duplicate_of.is_some() { 10 } else { 9 };
-        for &(mid, cosine) in neighbours.iter().take(keep) {
+    if relations.is_empty() && !entity_ids.is_empty() {
+        for &(mid, cosine) in neighbours.iter() {
             if cosine < cfg.update_candidate || cosine >= cfg.near_dup || mid == id {
                 continue;
             }
@@ -1587,6 +1634,7 @@ fn write_prepared(
         }
     }
     for (ri, relation) in relations.iter().enumerate() {
+        crate::wtiming::begin(crate::wtiming::RELATIONS);
         let pred_norm = text::norm_predicate(&relation.predicate);
         let phrase_vector = &vectors[pred_base + pred_index[&pred_norm]];
         let resolved = resolve::resolve_predicate(
@@ -1921,7 +1969,9 @@ fn write_prepared(
             )?;
         }
         invalidated.extend(ended_here);
+        crate::wtiming::begin(crate::wtiming::GRAPH);
         kg::project_relation(db, rid, src, dst, &predicate_text)?;
+        crate::wtiming::end(crate::wtiming::GRAPH);
         rel_results.push(RelationResult {
             id: rid,
             fact,
@@ -1931,6 +1981,7 @@ fn write_prepared(
                 "new".into()
             },
         });
+        crate::wtiming::end(crate::wtiming::RELATIONS);
     }
     // Text can still retract a different fact ("Alice no longer leads the
     // team") when the agent supplied relations of its own: end the one live
@@ -1938,6 +1989,7 @@ fn write_prepared(
     // ambiguous. The relations this memory just evidenced are its own
     // assertion and are never retracted by its prose.
     if duplicate_of.is_none() {
+        crate::wtiming::begin(crate::wtiming::RETRACTIONS);
         let own: Vec<i64> = rel_results.iter().map(|r: &RelationResult| r.id).collect();
         let mut sink = RetractionSink {
             exclude: &own,
@@ -1945,6 +1997,7 @@ fn write_prepared(
             conflicts: &mut conflicts,
         };
         end_text_retractions(db, &content, &entities, valid_from, now, &mut sink)?;
+        crate::wtiming::end(crate::wtiming::RETRACTIONS);
     }
     // A memory with an end (--until) ends the relations only it keeps current.
     if let (None, Some(to)) = (duplicate_of, valid_to) {
@@ -1965,8 +2018,10 @@ fn write_prepared(
         .copied()
         .chain(rel_results.iter().map(|r| r.id))
         .collect();
+    crate::wtiming::begin(crate::wtiming::FINALIZE);
     end_memories_of_ended_facts(db, &touched)?;
     kg::bump_gen(db)?;
+    crate::wtiming::end(crate::wtiming::FINALIZE);
     let mut hints = if content.len() > 2000 {
         vec!["long content: consider splitting into atomic memories".into()]
     } else {
@@ -1995,6 +2050,7 @@ fn write_prepared(
                 .into(),
         );
     }
+    crate::wtiming::end_item(id);
     Ok(RememberOutput {
         id,
         duplicate_of,
@@ -2011,6 +2067,7 @@ fn write_prepared(
 }
 
 fn add_mention(db: &Db, memory: i64, entity: i64, now: i64) -> Result<bool> {
+    crate::wtiming::begin(crate::wtiming::MENTIONS);
     let inserted = db.sql().execute(
         "INSERT OR IGNORE INTO mentions(memory_id,entity_id) VALUES (?1,?2)",
         params![memory, entity],
@@ -2020,7 +2077,12 @@ fn add_mention(db: &Db, memory: i64, entity: i64, now: i64) -> Result<bool> {
             "UPDATE entities SET mention_count=mention_count+1, updated_at=?1 WHERE id=?2",
             params![now, entity],
         )?;
+        crate::wtiming::end(crate::wtiming::MENTIONS);
+        crate::wtiming::begin(crate::wtiming::GRAPH);
         kg::project_mention(db, memory, entity)?;
+        crate::wtiming::end(crate::wtiming::GRAPH);
+    } else {
+        crate::wtiming::end(crate::wtiming::MENTIONS);
     }
     Ok(inserted)
 }
@@ -2047,8 +2109,10 @@ const TLINK_DAY: f64 = 86_400.0;
 const TLINK_FLOOR: f64 = 0.3;
 
 /// E4a: link a new memory to the closest live memories that share one of its
-/// entities. Weight is `max(0.3, 1 - gap/24h)` (Hindsight); the candidate
-/// query is driven by `idx_mentions_entity` and `idx_memories_valid`.
+/// entities. Weight is `max(0.3, 1 - gap/24h)` (Hindsight); the window scan
+/// is driven by `idx_memories_valid` and each candidate probes the
+/// `mentions(memory_id, entity_id)` primary key, so the write cost tracks the
+/// window, not the corpus.
 fn write_temporal_links(db: &Db, memory: i64, valid_from: i64, cfg: &Config) -> Result<()> {
     let cap = cfg.tlink_cap;
     let window = (cfg.tlink_window_hours.max(0.0) * 3_600.0).round() as i64;
@@ -2068,17 +2132,17 @@ fn write_temporal_links(db: &Db, memory: i64, valid_from: i64, cfg: &Config) -> 
     if entity_ids.is_empty() {
         return Ok(());
     }
-    let marks = std::iter::repeat_n("?", entity_ids.len())
+    let marks = (1..=entity_ids.len())
+        .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
         "SELECT m.id,m.valid_from FROM memories m
-         JOIN mentions me ON me.memory_id=m.id
-         WHERE me.entity_id IN ({marks})
+         WHERE m.valid_from BETWEEN ?{lo} AND ?{hi}
            AND m.id!=?{a} AND m.expired_at IS NULL
-           AND m.valid_from BETWEEN ?{lo} AND ?{hi}
-         GROUP BY m.id
-         ORDER BY MIN(ABS(m.valid_from-?{at})), m.id
+           AND EXISTS (SELECT 1 FROM mentions me
+                       WHERE me.memory_id=m.id AND me.entity_id IN ({marks}))
+         ORDER BY ABS(m.valid_from-?{at}), m.id
          LIMIT ?{limit}",
         a = entity_ids.len() + 1,
         lo = entity_ids.len() + 2,
@@ -2283,14 +2347,117 @@ pub fn retract_relations(db: &Db, ids: &[i64], now: i64) -> Result<()> {
     Ok(())
 }
 
-/// The `k` nearest live memories, nearest first, as (id, cosine).
-fn knn_memory(db: &Db, v: &[f32], k: usize) -> Result<Vec<(i64, f32)>> {
-    let mut st = db.sql().prepare(&format!(
-        "SELECT rowid,1-distance FROM memories_vec WHERE embedding MATCH {} AND k={k} AND live=1 ORDER BY distance",
-        db.vec_sql("?1")
-    ))?;
-    let rows = st.query_map([db.vec_blob(v)], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+/// Bounds of the write-path neighbour search. The candidate set is lexical
+/// and entity overlap plus the newest memories, so a repeat of recent work
+/// is found without comparing every stored vector.
+const NEIGHBOUR_FTS: usize = 128;
+const NEIGHBOUR_PER_ENTITY: usize = 256;
+const NEIGHBOUR_RECENT: usize = 512;
+const NEIGHBOUR_CAP: usize = 1024;
+
+fn push_candidate(out: &mut Vec<i64>, seen: &mut HashSet<i64>, id: i64) {
+    if out.len() < NEIGHBOUR_CAP && seen.insert(id) {
+        out.push(id);
+    }
+}
+
+/// FTS expression for the candidate lookup: the longest exact content tokens
+/// (no prefix arms; a near duplicate shares whole words). Ranking by bm25
+/// would score every match; newest-first stops after `LIMIT`.
+fn candidate_fts_query(content: &str) -> Option<String> {
+    let mut toks: Vec<String> = text::tokens(content)
+        .into_iter()
+        .filter(|t| t.chars().count() >= 4 && !text::is_stopword(t))
+        .collect();
+    toks.sort_by_key(|t| std::cmp::Reverse(t.chars().count()));
+    toks.dedup();
+    toks.truncate(8);
+    if toks.is_empty() {
+        return None;
+    }
+    Some(
+        toks.iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
+/// Candidate memories for the near-duplicate and related checks: the newest
+/// memories whose text shares words with this one, the newest memories per
+/// mentioned entity (the `related` block needs shared entities anyway) and
+/// the newest memories overall (agents repeat what they just wrote).
+fn neighbour_candidates(db: &Db, content: &str, entity_ids: &[i64]) -> Result<Vec<i64>> {
+    let mut out: Vec<i64> = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    if let Some(q) = candidate_fts_query(content) {
+        let mut st = db.sql().prepare(
+            "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1
+             ORDER BY rowid DESC LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![q, NEIGHBOUR_FTS as i64], |r| r.get::<_, i64>(0))?;
+        for row in rows {
+            push_candidate(&mut out, &mut seen, row?);
+        }
+    }
+    {
+        // The index walks backwards, so this is the newest `LIMIT` mentions
+        // of the entity, not a scan of all of them.
+        let mut st = db.sql().prepare(
+            "SELECT memory_id FROM mentions WHERE entity_id=?1
+             ORDER BY memory_id DESC LIMIT ?2",
+        )?;
+        for eid in entity_ids {
+            let rows = st.query_map(params![eid, NEIGHBOUR_PER_ENTITY as i64], |r| {
+                r.get::<_, i64>(0)
+            })?;
+            for row in rows {
+                push_candidate(&mut out, &mut seen, row?);
+            }
+        }
+    }
+    {
+        let mut st = db
+            .sql()
+            .prepare("SELECT id FROM memories ORDER BY rowid DESC LIMIT ?1")?;
+        let rows = st.query_map([NEIGHBOUR_RECENT as i64], |r| r.get::<_, i64>(0))?;
+        for row in rows {
+            push_candidate(&mut out, &mut seen, row?);
+        }
+    }
+    Ok(out)
+}
+
+/// Cosine between `v` and the stored vectors of `candidates`, nearest first.
+/// Point reads keep the cost tied to the candidate count, not the corpus.
+fn knn_among(
+    db: &Db,
+    v: &[f32],
+    candidates: &[i64],
+    k: usize,
+    skip: i64,
+) -> Result<Vec<(i64, f32)>> {
+    let mut st = db
+        .sql()
+        .prepare("SELECT embedding FROM memories_vec WHERE rowid=?1 AND live=1")?;
+    let mut scored: Vec<(i64, f32)> = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        if *id == skip {
+            continue;
+        }
+        match st.query_row([id], |r| r.get::<_, Vec<u8>>(0)) {
+            Ok(blob) => {
+                if let Some(other) = db.blob_to_vec(&blob) {
+                    scored.push((*id, crate::rank::cosine(v, &other)));
+                }
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored.truncate(k);
+    Ok(scored)
 }
 
 #[cfg(test)]

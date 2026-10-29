@@ -1294,6 +1294,66 @@ fn near_duplicate_is_reported_but_stored() {
     assert!(score >= 0.97, "{score}");
 }
 
+/// The near-duplicate check no longer compares every stored vector: it looks
+/// at lexical overlap, shared entities and the newest memories. A repeat has
+/// to stay visible once thousands of unrelated memories sit between the two
+/// writes, even when it lacks one of those signals.
+#[test]
+fn near_duplicate_survives_a_crowded_corpus() {
+    let mut at2 = vec![0.0; 768];
+    at2[2] = 0.98;
+    at2[3] = (1.0_f32 - 0.98 * 0.98).sqrt();
+    let engine = engine_with(Arc::new(MapEmbedder::new(vec![
+        ("alpha beta gamma", axis(0)),
+        ("delta epsilon zeta", at(0.98)),
+        ("quiet harbor notes", axis(2)),
+        ("quiet harbor notez", at2),
+    ])));
+    // One pair has no shared entity, so only the lexical arm can find it.
+    let harbor = remember(&engine, "quiet harbor notes", vec![], vec![]);
+    // The other pair shares an entity, so the mention arm must find it.
+    let alpha = remember(&engine, "alpha beta gamma", vec![named("Mira")], vec![]);
+    for i in 0..2000 {
+        remember(
+            &engine,
+            &format!("filler memory number {i}"),
+            vec![],
+            vec![],
+        );
+    }
+    let harbor_again = remember(&engine, "quiet harbor notez", vec![], vec![]);
+    assert_eq!(
+        harbor_again.near_duplicate.map(|(id, _)| id),
+        Some(harbor.id),
+        "lexical near duplicate lost in a crowded corpus"
+    );
+    let alpha_again = remember(&engine, "delta epsilon zeta", vec![named("Mira")], vec![]);
+    assert_eq!(
+        alpha_again.near_duplicate.map(|(id, _)| id),
+        Some(alpha.id),
+        "entity near duplicate lost in a crowded corpus"
+    );
+    // An exact repeat still resolves through the hash path, not as near.
+    let exact = remember(&engine, "alpha beta gamma", vec![], vec![]);
+    assert_eq!(exact.duplicate_of, Some(alpha.id));
+    assert!(exact.near_duplicate.is_none());
+}
+
+/// `related` still needs a shared entity and a cosine in the update window.
+#[test]
+fn related_reports_shared_entity_neighbours() {
+    let engine = engine_with(Arc::new(MapEmbedder::new(vec![
+        ("alpha beta gamma", axis(0)),
+        ("delta epsilon zeta", at(0.80)),
+    ])));
+    let first = remember(&engine, "alpha beta gamma", vec![named("Mira")], vec![]);
+    let second = remember(&engine, "delta epsilon zeta", vec![named("Mira")], vec![]);
+    assert_eq!(second.related.len(), 1, "{:?}", second.related);
+    assert_eq!(second.related[0].memory_id, first.id);
+    assert!((second.related[0].cosine - 0.80).abs() < 1e-3);
+    assert!(second.near_duplicate.is_none());
+}
+
 #[test]
 fn relative_valid_from_is_parsed_against_the_clock() {
     let engine = engine();

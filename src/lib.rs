@@ -24,5 +24,6 @@ pub mod resolve;
 pub mod temporal;
 pub mod text;
 pub mod ultrabert;
+pub mod wtiming;
 
 pub use error::{Error, Result};
