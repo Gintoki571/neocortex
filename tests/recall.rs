@@ -510,12 +510,140 @@ fn negation_intent_ignores_negation_of_the_speakers_memory_verb() {
     }
     for query in [
         "who does not like jazz",
-        "which service is not in rust",
-        "what database does lumen not use",
         "what no longer works",
+        "what did we decide not to use",
     ] {
         assert!(paths::negation_intent(query), "{query:?}");
     }
+}
+
+// ---------------------------------------------------------------- nc-negq H2-02/03
+
+#[test]
+fn exclusion_questions_are_not_negation_questions() {
+    for query in [
+        "which service is not in rust",
+        "which services are not written in rust",
+        "what database does lumen not use",
+        "which database does lumen not use",
+        "which services don't use redis",
+        "which of the services doesn't use redis",
+        "services that don't use redis",
+        "what do we use other than rust",
+        "everything except rust",
+    ] {
+        assert!(paths::exclusion_intent(query), "{query:?}");
+        assert!(!paths::negation_intent(query), "{query:?}");
+    }
+    for query in [
+        "who does not like jazz",
+        "what no longer works",
+        "what did we decide not to use",
+        "what did we decide to use",
+    ] {
+        assert!(!paths::exclusion_intent(query), "{query:?}");
+    }
+}
+
+fn service(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("service".into()),
+        ..Default::default()
+    }
+}
+
+fn tool(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("tool".into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn an_exclusion_question_returns_the_item_that_lacks_the_property() {
+    let e = engine(Arc::new(HashEmbedder));
+    let mut rust_services = Vec::new();
+    for name in ["auth-service", "billing-service"] {
+        let id = remember(&e, &format!("{name} is written in Rust."), |i| {
+            i.entities = vec![service(name), tool("Rust")];
+            i.relations = vec![relation(name, "written in", "Rust", "")];
+        });
+        rust_services.push(id);
+    }
+    let python = remember(&e, "report-service is written in Python.", |i| {
+        i.entities = vec![service("report-service"), tool("Python")];
+        i.relations = vec![relation("report-service", "written in", "Python", "")];
+    });
+    let out = e
+        .recall(&RecallInput {
+            query: "which service is not in rust".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        out.memories.first().map(|m| m.id),
+        Some(python),
+        "the service without the property must rank first: {:?}",
+        out.memories
+            .iter()
+            .map(|m| (m.id, m.content.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        out.memories
+            .get(1)
+            .is_some_and(|m| rust_services.contains(&m.id)),
+        "{:?}",
+        out.memories.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+    // The Rust facts are the wrong answers for this question, so the fact that
+    // answers it comes first.
+    assert_eq!(
+        out.facts
+            .first()
+            .map(|f| (f.source.as_str(), f.target.as_str())),
+        Some(("report-service", "Python")),
+        "{:?}",
+        out.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn an_exclusion_question_without_a_known_property_runs_the_plain_channels() {
+    // "what database does lumen not use": no typed entities back the noun, so
+    // the ordinary channels answer with the current and the past value.
+    let e = engine(Arc::new(HashEmbedder));
+    let sqlite = remember(&e, "Lumen uses SQLite.", |i| {
+        i.entities = vec![entity("Lumen")];
+        i.relations = vec![relation("Lumen", "uses", "SQLite", "Lumen uses SQLite")];
+    });
+    let postgres = remember(&e, "Lumen used Postgres before the switch.", |i| {
+        i.entities = vec![entity("Lumen")];
+        i.relations = vec![RelationIn {
+            valid_from: Some("2026-01-01".into()),
+            valid_to: Some("2026-09-29".into()),
+            ..relation("Lumen", "used", "Postgres", "Lumen used Postgres")
+        }];
+    });
+    let out = e
+        .recall(&RecallInput {
+            query: "what database does lumen not use".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let got = ids(&out);
+    assert!(got.contains(&sqlite), "{:?}", out.memories);
+    assert!(got.contains(&postgres), "{:?}", out.memories);
+    assert!(
+        out.facts
+            .iter()
+            .any(|f| f.fact == "Lumen uses SQLite" || f.fact == "Lumen used Postgres"),
+        "{:?}",
+        out.facts
+    );
 }
 
 #[test]
