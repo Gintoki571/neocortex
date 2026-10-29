@@ -147,9 +147,13 @@ and `next:` when present.
   property matches, it is answered like an ordinary question.
 - A status question ("what bug is still open", "which issues are unresolved")
   ranks the defect reports no later memory fixes first; a bug a later memory
-  fixes is still shown, after them. The question has to name a defect ("is the
-  API still open to the public" and "which PRs are outstanding" are ordinary
-  questions), and "open question" is a pending decision, not an open defect.
+  fixes is still shown, after them. A report that says it is not fixed yet
+  ("not fixed yet", "no fix yet", "needs a fix") is an open report. When the
+  question names one defect ("is the login bug still open"), only that
+  defect's report is re-ranked and it keeps its place against unrelated bugs.
+  The question has to name a defect ("is the API still open to the public" and
+  "which PRs are outstanding" are ordinary questions), and "open question" is
+  a pending decision, not an open defect.
 - A why-question also returns the cause: after the first pass, the stored
   cause of the memory that answered it (a `cause` relation that ends at an
   entity of the question, or whose memory shares a specific entity with the

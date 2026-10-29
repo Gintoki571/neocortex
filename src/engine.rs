@@ -92,8 +92,10 @@ pub struct Config {
     /// the follow step.
     pub cause_follow: bool,
     /// H2-15: on a question that names a defect and asks whether it is still
-    /// open, rank open bug reports above bugs a later memory fixes. Re-ranks,
-    /// never hides, and never demotes a better-matching answer.
+    /// open, rank open bug reports above bugs a later memory fixes: every open
+    /// report on a general question, only the named defect's report when the
+    /// question names one. Re-ranks, never hides, and never demotes a
+    /// better-matching answer.
     pub status_rank: bool,
     /// Extract cause relations from in-memory text cues (E4b). Off by default:
     /// the calling agent is the reliable extractor.

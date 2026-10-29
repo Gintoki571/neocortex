@@ -245,31 +245,41 @@ fn top_by_cosine(db: &Db, ids: &[i64], query_vec: &[f32], keep: usize) -> Result
 
 /// H2-15: the bug reports among the candidates, split into the ones no later
 /// memory fixes (the answer to "what is still open") and the ones a later
-/// memory fixes. A report that carries a fix cue itself is already closed.
+/// memory fixes. A report that carries a fix cue itself is already closed
+/// unless the cue is negated ("not fixed yet").
+///
+/// A question that names a defect ("is the login bug still open") only ranks
+/// the reports about that defect; a general question ("what bug is still
+/// open") ranks every open report. Reports are ranked by query cosine before
+/// the lookup budget, so which ones are classified never depends on the order
+/// they were stored in.
 fn status_channels(
     engine: &Engine,
+    want: &HashSet<String>,
     query_vec: &[f32],
     rows: &HashMap<i64, MemoryRow>,
     now: i64,
 ) -> Result<(Vec<i64>, HashSet<i64>)> {
-    let mut open = Vec::new();
     let mut closed = HashSet::new();
-    let mut ids: Vec<i64> = rows.keys().copied().collect();
-    ids.sort_unstable();
-    let mut lookups = 0;
-    for id in ids {
-        let Some(row) = rows.get(&id) else { continue };
+    let mut bugs = Vec::new();
+    for (id, row) in rows {
         if !paths::is_bug_memory(&row.1) {
             continue;
         }
         if paths::has_fix_cue(&row.1) {
-            closed.insert(id);
-            continue;
+            closed.insert(*id);
+        } else if want.is_empty()
+            || paths::status_terms(&row.1)
+                .iter()
+                .any(|term| want.contains(term))
+        {
+            bugs.push(*id);
         }
-        if lookups >= STATUS_LOOKUPS {
-            continue;
-        }
-        lookups += 1;
+    }
+    let ranked = top_by_cosine(&engine.db, &bugs, query_vec, STATUS_LOOKUPS)?;
+    let mut open = Vec::new();
+    for id in ranked {
+        let Some(row) = rows.get(&id) else { continue };
         if fixed_later(&engine.db, id, &row.1, row.9, now)? {
             closed.insert(id);
         } else {
@@ -1425,8 +1435,16 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // ---------------------------------------------------------- status
     // H2-15: "what is still open" asks for the defects no later memory fixes.
     // Only the candidate rows are classified; the rule re-ranks, never hides.
+    // A question that names a defect (`want` is not empty) is about that
+    // defect: only its reports are ranked, and its own fix is not demoted.
+    let status_want: HashSet<String> = if status_query {
+        paths::status_question_terms(&input.query)
+    } else {
+        HashSet::new()
+    };
+    let status_specific = !status_want.is_empty();
     let (mut status_ids, status_closed) = if status_query {
-        status_channels(engine, &query_vec, &rows, now)?
+        status_channels(engine, &status_want, &query_vec, &rows, now)?
     } else {
         (Vec::new(), HashSet::new())
     };
@@ -1592,7 +1610,11 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         }
         if status_query {
             if paths::is_bug_memory(&row.1) {
-                if status_closed.contains(&f.id) {
+                // A general "what is still open" ranks fixed reports after the
+                // open ones. A question that names one defect keeps its report
+                // and its fix where the ordinary channels put them: halving
+                // them would let unrelated open bugs answer for it.
+                if !status_specific && status_closed.contains(&f.id) {
                     score *= STATUS_CLOSED_PENALTY;
                 }
             } else if f.score < best_bug {

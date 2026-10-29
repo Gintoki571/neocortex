@@ -1595,6 +1595,177 @@ fn an_unfixed_crash_report_is_ranked_as_open() {
 }
 
 #[test]
+fn a_report_that_says_not_fixed_yet_is_still_open() {
+    let e = engine(Arc::new(HashEmbedder));
+    let asked = remember(
+        &e,
+        "Bug 2026-10-08: the nightly export crashes with a null pointer in the CSV writer; it is not fixed yet.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-08".into());
+        },
+    );
+    remember(
+        &e,
+        "Bug 2026-10-07: the search index rebuild hangs on large vaults.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-07".into());
+        },
+    );
+    remember(
+        &e,
+        "Bug 2026-10-05: the login fails with a 500 when the session cookie is missing.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-05".into());
+        },
+    );
+    for (day, fact) in [
+        (
+            1,
+            "The nightly export writes one CSV file per table to the export bucket.",
+        ),
+        (2, "The export bucket keeps objects for 30 days."),
+        (3, "The CSV writer quotes fields that contain a comma."),
+        (4, "The search index is rebuilt on every deploy."),
+    ] {
+        remember(&e, fact, |i| {
+            i.kind = Some("fact".into());
+            i.valid_from = Some(format!("2026-10-{day:02}"));
+        });
+    }
+    let out = e
+        .recall(&RecallInput {
+            query: "is the nightly export bug still open".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert_eq!(out.memories.first().map(|m| m.id), Some(asked), "{shown:?}");
+    assert!(has_reason(&out, asked, "status"), "{shown:?}");
+}
+
+#[test]
+fn a_question_about_a_fixed_bug_keeps_the_fix_in_front() {
+    let e = engine(Arc::new(HashEmbedder));
+    let bug = remember(
+        &e,
+        "Bug 2026-10-05: the login fails with a 500 when the session cookie is missing.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-05".into());
+        },
+    );
+    let fix = remember(
+        &e,
+        "Fix for the 2026-10-05 login bug: the session cookie is now signed before it is stored.",
+        |i| {
+            i.kind = Some("procedure".into());
+            i.valid_from = Some("2026-10-06".into());
+        },
+    );
+    let export = remember(
+        &e,
+        "Bug 2026-10-02: the nightly export crashes with a null pointer in the CSV writer.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-02".into());
+        },
+    );
+    let index = remember(
+        &e,
+        "Bug 2026-10-03: the search index rebuild hangs on large vaults.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-03".into());
+        },
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "is the login bug still open".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    let position = |id: i64| out.memories.iter().position(|m| m.id == id);
+    assert!(
+        matches!(out.memories.first().map(|m| m.id), Some(first) if first == fix || first == bug),
+        "the asked bug or its fix must answer: {shown:?}"
+    );
+    for id in [fix, bug] {
+        for other in [export, index] {
+            assert!(
+                position(id) < position(other),
+                "an unrelated open bug outranks the asked one: {shown:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_status_answer_does_not_depend_on_ingestion_order() {
+    let subjects = [
+        "proxy", "cache", "billing", "search", "export", "import", "auth", "session", "webhook",
+        "queue", "worker", "invoice", "mailer", "router", "gateway", "storage", "backup",
+        "restore", "report", "digest", "ledger", "hooks", "plugins", "themes",
+    ];
+    let build = |scheduler_at: usize| -> (Engine, i64) {
+        let e = engine(Arc::new(HashEmbedder));
+        let mut scheduler = 0;
+        for (i, subject) in subjects.iter().enumerate() {
+            let content = if i == scheduler_at {
+                "Bug 2026-10-02: the scheduler job fails with a 500 error on retry.".to_string()
+            } else {
+                format!("Bug 2026-10-01: the {subject} path fails with a 500 error on retry.")
+            };
+            let id = remember(&e, &content, |i| {
+                i.kind = Some("mistake".into());
+                i.valid_from = Some("2026-10-01".into());
+            });
+            if i == scheduler_at {
+                scheduler = id;
+            }
+        }
+        (e, scheduler)
+    };
+    let mut tops = Vec::new();
+    for (at, label) in [(0, "first"), (22, "last")] {
+        let (e, scheduler) = build(at);
+        let out = e
+            .recall(&RecallInput {
+                query: "is the scheduler bug still open".into(),
+                k: Some(8),
+                ..Default::default()
+            })
+            .unwrap();
+        let shown: Vec<(i64, &str)> = out
+            .memories
+            .iter()
+            .map(|m| (m.id, m.content.as_str()))
+            .collect();
+        assert_eq!(
+            out.memories.first().map(|m| m.id),
+            Some(scheduler),
+            "scheduler bug stored {label}: {shown:?}"
+        );
+        assert!(has_reason(&out, scheduler, "status"), "{label}: {shown:?}");
+        tops.push(out.memories.first().map(|m| m.content.clone()));
+    }
+    assert_eq!(tops[0], tops[1]);
+}
+
+#[test]
 fn a_why_question_renders_each_cause_fact_once() {
     let e = engine(Arc::new(HashEmbedder));
     remember(

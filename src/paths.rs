@@ -431,6 +431,36 @@ const FIX_CUES: &[&str] = &[
     "patched", "hotfix", "released", "shipped", "bump", "bumped",
 ];
 
+/// Words that say the work is still to be done ("needs a fix", "pending").
+const FIX_PENDING: &[&str] = &[
+    "await", "awaiting", "need", "needed", "needing", "needs", "pending", "require", "required",
+    "requires",
+];
+
+/// Noun forms of a fix: only these also take the negation right after them
+/// ("the fix is not deployed").
+const FIX_NOUNS: &[&str] = &["fix", "fixes", "fixing", "hotfix", "patch"];
+
+/// True when the fix cue at `words[i]` is negated or still pending, so the
+/// sentence reports an *unfixed* defect ("not fixed yet", "no fix yet",
+/// "needs a fix", "the fix is not deployed").
+fn fix_cue_negated(words: &[String], i: usize) -> bool {
+    let lo = i.saturating_sub(3);
+    if words[lo..i]
+        .iter()
+        .any(|w| NEGATION_WORDS.contains(&w.as_str()) || FIX_PENDING.contains(&w.as_str()))
+    {
+        return true;
+    }
+    FIX_NOUNS.contains(&words[i].as_str())
+        && i + 2 < words.len()
+        && AUXILIARIES.contains(&words[i + 1].as_str())
+        && matches!(
+            words[i + 2].as_str(),
+            "not" | "never" | "no" | "needed" | "pending" | "required" | "awaited"
+        )
+}
+
 /// Generic words that say nothing about *which* bug a memory is about.
 const STATUS_GENERIC: &[&str] = &[
     "bug", "bugs", "issue", "issues", "error", "errors", "defect", "defects", "fix", "fixed",
@@ -451,7 +481,15 @@ pub(crate) fn is_bug_memory(text: &str) -> bool {
 }
 
 pub(crate) fn has_fix_cue(text: &str) -> bool {
-    has_cue(text, FIX_CUES)
+    // A sentence boundary ends a negation's scope: "Fixed the crash. No
+    // regressions since." reports a fix.
+    text.split(['.', ';', '!', '?', '\n']).any(|clause| {
+        let words = bare_words(&text::fold(clause));
+        words
+            .iter()
+            .enumerate()
+            .any(|(i, w)| FIX_CUES.contains(&w.as_str()) && !fix_cue_negated(&words, i))
+    })
 }
 
 /// The words two memories must share to be about the same bug.
@@ -463,6 +501,41 @@ pub(crate) fn status_terms(text: &str) -> HashSet<String> {
                 && !text::is_stopword(token)
                 && !STATUS_GENERIC.contains(&token.as_str())
         })
+        .collect()
+}
+
+/// The specific defect a status question names ("nightly", "export" in "is
+/// the nightly export bug still open"), without the status scaffolding.
+/// Empty when the question asks about defects in general ("what bug is still
+/// open"), in which case every open report is an answer.
+pub(crate) fn status_question_terms(query: &str) -> HashSet<String> {
+    const SCAFFOLD: &[&str] = &[
+        "any",
+        "broken",
+        "crash",
+        "crashes",
+        "crashing",
+        "failing",
+        "incident",
+        "incidents",
+        "known",
+        "left",
+        "list",
+        "open",
+        "outstanding",
+        "remaining",
+        "show",
+        "status",
+        "still",
+        "ticket",
+        "tickets",
+        "unfixed",
+        "unresolved",
+        "yet",
+    ];
+    status_terms(query)
+        .into_iter()
+        .filter(|token| !SCAFFOLD.contains(&token.as_str()))
         .collect()
 }
 
@@ -2161,6 +2234,29 @@ mod tests {
         // A fix note is a bug memory with a fix cue, never an open report.
         assert!(has_fix_cue("Fixed the export crash in the CSV writer."));
         assert!(!is_bug_memory("Lumen is written in Rust."));
+    }
+
+    #[test]
+    fn a_negated_or_pending_fix_is_not_a_fix() {
+        for report in [
+            "Bug 2026-10-27: the nightly export crashes; it is not fixed yet.",
+            "The nightly export crashes with a null pointer; no fix yet.",
+            "The sync loop still hangs when two devices write at once and needs a fix.",
+            "The nightly export crash is known; the fix is not deployed.",
+            "The login bug is unresolved: it was never fixed.",
+            "The export crash has not been fixed.",
+        ] {
+            assert!(!has_fix_cue(report), "{report:?}");
+            assert!(is_bug_memory(report), "{report:?}");
+        }
+        for note in [
+            "Fixed the export crash in the CSV writer.",
+            "Fix for the 2026-10-25 login bug: the cookie is signed now.",
+            "The login bug was resolved and released in v0.3.2.",
+            "The sync loop panic is closed; no more DatabaseBusy errors.",
+        ] {
+            assert!(has_fix_cue(note), "{note:?}");
+        }
     }
 
     #[test]
