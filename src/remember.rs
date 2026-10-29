@@ -287,6 +287,25 @@ fn words_of(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Predicates that name the entity again instead of relating it to another
+/// thing: on a self-resolving relation the target becomes an alias (H2-18).
+fn is_name_predicate(predicate: &str) -> bool {
+    matches!(
+        text::fold(predicate).trim(),
+        "nickname"
+            | "nicknames"
+            | "nicknamed"
+            | "alias"
+            | "aliases"
+            | "aka"
+            | "a k a"
+            | "also known as"
+            | "known as"
+            | "goes by"
+            | "go by"
+    )
+}
+
 /// Conservative negation cue for one relation: the clause must name the
 /// relation's own source, `text` must name the target within 3 tokens after
 /// the predicate verb, and a cue may only be separated from that verb by an
@@ -1585,6 +1604,8 @@ fn write_prepared(
     let mut invalidated = Vec::new();
     let mut conflicts = Vec::new();
     let mut related = Vec::new();
+    // Relations dropped because both ends resolved to one entity (H2-18).
+    let mut self_relations = 0usize;
     if relations.is_empty() && !entity_ids.is_empty() {
         for &(mid, cosine) in neighbours.iter() {
             if cosine < cfg.update_candidate || cosine >= cfg.near_dup || mid == id {
@@ -1662,6 +1683,17 @@ fn write_prepared(
         )?;
         if pred.symmetric && src > dst {
             std::mem::swap(&mut src, &mut dst);
+        }
+        // H2-18: a relation whose ends are the same entity says nothing about
+        // two things. A name-like predicate ("nickname", "aka") keeps the
+        // target as another name of the entity; any other predicate is
+        // dropped, because a self-loop only adds noise to PPR and the card.
+        if src == dst {
+            if is_name_predicate(&relation.predicate) {
+                resolve::add_alias(db, src, &relation.target, "agent")?;
+            }
+            self_relations += 1;
+            continue;
         }
         // Exclusivity is per semantic subject: src normally, the original
         // source for an inverse write (stored as dst), min(src,dst) when
@@ -2003,6 +2035,11 @@ fn write_prepared(
         hints.push(format!(
             "if this updates m{}, pass supersedes=[m{}]",
             related[0].memory_id, related[0].memory_id
+        ));
+    }
+    if self_relations > 0 {
+        hints.push(format!(
+            "dropped {self_relations} relation(s) whose source and target are the same entity; nickname/alias targets are kept as names"
         ));
     }
     // Text alone yields no graph facts (no CPU-sized extractor is reliable

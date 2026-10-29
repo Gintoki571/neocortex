@@ -676,6 +676,103 @@ fn role_nouns_and_tail_changes_never_alias() {
 
 // ------------------------------------------------------------------ relations
 
+// ---------------------------------------------------------------- nc-negq H2-18
+
+fn alias(name: &str, kind: &str, aliases: &[&str]) -> EntityIn {
+    EntityIn {
+        aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        ..typed(name, kind)
+    }
+}
+
+fn self_loops(engine: &Engine) -> i64 {
+    count(engine, "SELECT count(*) FROM relations WHERE src=dst")
+}
+
+#[test]
+fn a_nickname_relation_to_the_same_entity_becomes_an_alias() {
+    let engine = engine();
+    let out = remember(
+        &engine,
+        "Robert Okafor goes by Bob.",
+        vec![alias("Robert Okafor", "person", &["Bob"])],
+        vec![rel("Robert Okafor", "nickname", "Bob")],
+    );
+    assert_eq!(self_loops(&engine), 0, "{:?}", out.relations);
+    assert!(out.relations.is_empty(), "{:?}", out.relations);
+    // The nickname is still a name of the person, not a relation.
+    let card = engine.entity("Bob", 10).unwrap();
+    assert_eq!(card.card.id, out.entities[0].id);
+    assert!(card.card.aliases.iter().any(|a| a == "bob"));
+    assert!(
+        card.current_facts.is_empty(),
+        "{:?}",
+        card.current_facts
+            .iter()
+            .map(|f| &f.fact)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_relation_whose_target_resolves_to_the_source_is_not_stored() {
+    let engine = engine();
+    let out = remember(
+        &engine,
+        "Robert Okafor works with Bob Okafor.",
+        vec![alias("Robert Okafor", "person", &["Bob Okafor"])],
+        vec![rel("Robert Okafor", "works with", "Bob Okafor")],
+    );
+    assert_eq!(self_loops(&engine), 0, "{:?}", out.relations);
+    assert!(out.relations.is_empty(), "{:?}", out.relations);
+}
+
+#[test]
+fn recall_and_entity_cards_skip_stored_self_loops() {
+    let engine = engine();
+    let out = remember(
+        &engine,
+        "Robert Okafor leads payments rewrite.",
+        vec![
+            typed("Robert Okafor", "person"),
+            typed("payments rewrite", "project"),
+        ],
+        vec![rel("Robert Okafor", "leads", "payments rewrite")],
+    );
+    let id = out.entities[0].id;
+    let predicate_id: i64 = engine
+        .db
+        .sql()
+        .query_row("SELECT predicate_id FROM relations LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    // A database written before the fix still holds the row.
+    engine
+        .db
+        .sql()
+        .execute(
+            "INSERT INTO relations(src,dst,predicate_id,predicate_text,subj,fact,valid_from,created_at)
+             VALUES(?1,?1,?2,'nickname','Robert Okafor','Robert Okafor nickname Bob',?3,?3)",
+            rusqlite::params![id, predicate_id, NOW],
+        )
+        .unwrap();
+    assert_eq!(self_loops(&engine), 1);
+    let card = engine.entity("Robert Okafor", 10).unwrap();
+    for fact in card.current_facts.iter().chain(&card.past_facts) {
+        assert_ne!(fact.source, fact.target, "{:?}", fact.fact);
+    }
+    let recalled = engine
+        .recall(&neocortex::engine::RecallInput {
+            query: "who is Robert Okafor".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    for fact in &recalled.facts {
+        assert_ne!(fact.source, fact.target, "{:?}", fact.fact);
+    }
+}
+
 #[test]
 fn exclusive_older_relation_ends_at_new_start() {
     let engine = engine();

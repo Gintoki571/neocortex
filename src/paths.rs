@@ -86,7 +86,9 @@ pub fn has_negation_cue(value: &str) -> bool {
 ///
 /// Negation that scopes the speaker's own memory verb ("I don't remember
 /// what database Lumen uses") is a request, not a question about what is not
-/// the case, so that cue is screened out first.
+/// the case, so that cue is screened out first. An exclusion question
+/// ("which service is not in Rust") keeps its cue but is not a negation
+/// question either: the answer is the item that lacks the property.
 pub fn negation_intent(query: &str) -> bool {
     let folded = text::fold(query);
     let words: Vec<&str> = folded.split_whitespace().collect();
@@ -103,7 +105,181 @@ pub fn negation_intent(query: &str) -> bool {
         }
         kept
     };
-    has_negation_cue(&kept.join(" "))
+    let kept = kept.join(" ");
+    if exclusion_intent(&kept) {
+        return false;
+    }
+    has_negation_cue(&kept)
+}
+
+fn bare_words(value: &str) -> Vec<String> {
+    value.split_whitespace().map(bare_word).collect()
+}
+
+const AUXILIARIES: &[&str] = &[
+    "are", "can", "could", "did", "do", "does", "had", "has", "have", "is", "might", "must",
+    "shall", "should", "was", "were", "will", "would",
+];
+
+/// Negated contractions ("don't", "doesn't", ...) already folded to bare words.
+const CONTRACTIONS: &[&str] = &[
+    "arent", "cannot", "cant", "didnt", "doesnt", "dont", "hadnt", "hasnt", "havent", "isnt",
+    "wasnt", "werent", "wont",
+];
+
+/// True when the question asks which item lacks a property ("which service is
+/// not in Rust", "which services don't use Redis", "everything except Rust").
+///
+/// The negation qualifies the item the question wants, so recall must not
+/// restrict the answer to memories that carry a negation cue.
+pub fn exclusion_intent(query: &str) -> bool {
+    let folded = text::fold(query);
+    let words = bare_words(&folded);
+    if folded.contains("other than") || folded.contains("apart from") {
+        return true;
+    }
+    if words.iter().any(|w| w == "except" || w == "excluding") {
+        return true;
+    }
+    exclusion_noun(&words).is_some()
+}
+
+/// Position of the noun an exclusion question asks about: the noun after a
+/// leading wh-word ("which **service** is not ...", "what **database** does
+/// lumen not use"), or the phrase before a negated relative clause
+/// ("**services** that don't use Redis"). None when the negation belongs to
+/// the question's own verb ("what did we decide not to use").
+fn exclusion_noun(words: &[String]) -> Option<usize> {
+    match words.first().map(String::as_str) {
+        Some("which" | "what") => {
+            let noun = words.iter().enumerate().skip(1).find_map(|(i, word)| {
+                (!text::is_stopword(word) && !NEGATION_WORDS.contains(&word.as_str())).then_some(i)
+            })?;
+            negated_predicate(&words[noun + 1..]).then_some(noun)
+        }
+        _ => {
+            let relative = words.iter().position(|w| w == "that" || w == "which")?;
+            let noun = words[..relative]
+                .iter()
+                .rposition(|w| !text::is_stopword(w))?;
+            negated_predicate(&words[relative + 1..]).then_some(noun)
+        }
+    }
+}
+
+/// True when the words after the noun hold a negated predicate of that noun:
+/// "is not in Rust", "don't use Redis", "does Lumen not use Redis".
+fn negated_predicate(rest: &[String]) -> bool {
+    let window = &rest[..rest.len().min(4)];
+    for (i, word) in window.iter().enumerate() {
+        if CONTRACTIONS.contains(&word.as_str()) {
+            return true;
+        }
+        if AUXILIARIES.contains(&word.as_str()) {
+            return window[i + 1..]
+                .iter()
+                .take(2)
+                .any(|w| NEGATION_WORDS.contains(&w.as_str()));
+        }
+    }
+    false
+}
+
+/// Words that build the verb phrase of a property question ("is **written in**
+/// Rust") instead of naming the property itself.
+const PROPERTY_SKIP: &[&str] = &[
+    "anymore", "belong", "belongs", "depend", "depends", "each", "either", "every", "have",
+    "having", "just", "like", "likes", "member", "need", "needs", "only", "part", "run", "running",
+    "runs", "still", "support", "supports", "use", "used", "uses", "using", "want", "wants",
+    "work", "worked", "working", "works", "write", "writes", "written", "wrote", "yet",
+];
+
+/// Cap on the type population an exclusion question resolves. Above it the
+/// channel is skipped and the ordinary channels answer, so one question can
+/// never scan a whole type (and its memories) on the low-resource target.
+const EXCLUSION_MAX_ENTITIES: usize = 1000;
+
+/// The typed entities an exclusion question asks about: the ones with no live
+/// positive fact naming the property (`lacking`), and the ones that do have it
+/// (the wrong answers for this question, `with_property`) together with the
+/// relation ids that say so (`facts`).
+pub struct Exclusion {
+    pub lacking: Vec<i64>,
+    pub with_property: Vec<i64>,
+    pub facts: Vec<i64>,
+}
+
+/// Resolve the type and the property of an exclusion question through the
+/// stored graph: "which service is not in Rust" -> the `service` entities with
+/// no live relation to the `Rust` entity. None when the question is not an
+/// exclusion question or the type/property names nothing stored, so the
+/// ordinary channels answer as before.
+pub fn exclusion_entities(db: &Db, query: &str, now: i64) -> Result<Option<Exclusion>> {
+    let words = bare_words(&text::fold(query));
+    let Some(noun) = exclusion_noun(&words) else {
+        return Ok(None);
+    };
+    let kind = text::singularize(&words[noun]);
+    let mut st = db
+        .sql()
+        .prepare("SELECT id FROM entities WHERE type=?1 ORDER BY id")?;
+    let typed: Vec<i64> = st
+        .query_map([&kind], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if typed.is_empty() || typed.len() > EXCLUSION_MAX_ENTITIES {
+        return Ok(None);
+    }
+    let property = words[noun + 1..].iter().find_map(|word| {
+        if word.chars().count() < 2
+            || text::is_stopword(word)
+            || NEGATION_WORDS.contains(&word.as_str())
+            || AUXILIARIES.contains(&word.as_str())
+            || CONTRACTIONS.contains(&word.as_str())
+            || PROPERTY_SKIP.contains(&word.as_str())
+        {
+            return None;
+        }
+        db.sql()
+            .query_row(
+                "SELECT entity_id FROM entity_aliases WHERE alias_norm=?1 LIMIT 1",
+                [word],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    });
+    let Some(property) = property else {
+        return Ok(None);
+    };
+    let mut lacking = Vec::new();
+    let mut with_property = Vec::new();
+    let mut facts = Vec::new();
+    let mut linked = db.sql().prepare_cached(
+        "SELECT r.id FROM relations r
+          WHERE r.polarity=1 AND r.expired_at IS NULL
+            AND (r.valid_to IS NULL OR r.valid_to>?3)
+            AND ((r.src=?1 AND r.dst=?2) OR (r.dst=?1 AND r.src=?2))",
+    )?;
+    for id in typed {
+        if id == property {
+            continue;
+        }
+        let ids: Vec<i64> = linked
+            .query_map(params![id, property, now], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if ids.is_empty() {
+            lacking.push(id);
+        } else {
+            with_property.push(id);
+            facts.extend(ids);
+        }
+    }
+    Ok(Some(Exclusion {
+        lacking,
+        with_property,
+        facts,
+    }))
 }
 
 fn bare_word(word: &str) -> String {
@@ -1616,6 +1792,50 @@ mod tests {
             .map(|h| h.steps[0].relation_id)
             .collect();
         assert_eq!(only, vec![1, 2]);
+    }
+}
+
+/// The exclusion channel resolves a whole type before ranking, so its
+/// population is capped: past the cap the ordinary channels answer, which is
+/// exactly the pre-H2-02 behaviour.
+#[cfg(test)]
+mod exclusion_tests {
+    use super::{exclusion_entities, EXCLUSION_MAX_ENTITIES};
+    use crate::db::Db;
+    use rusqlite::params;
+
+    fn typed(db: &Db, name: &str, kind: &str) -> i64 {
+        db.sql()
+            .execute(
+                "INSERT INTO entities(name,norm,type,homonym,created_at,updated_at)
+                 VALUES (?1,?1,?2,0,0,0)",
+                params![name, kind],
+            )
+            .unwrap();
+        db.sql().last_insert_rowid()
+    }
+
+    #[test]
+    fn a_type_past_the_cap_falls_back_to_the_ordinary_channels() {
+        let db = Db::open_in_memory().unwrap();
+        let rust = typed(&db, "rust", "language");
+        db.sql()
+            .execute(
+                "INSERT INTO entity_aliases(alias_norm,entity_id,origin) VALUES ('rust',?1,'name')",
+                params![rust],
+            )
+            .unwrap();
+        for i in 0..EXCLUSION_MAX_ENTITIES {
+            typed(&db, &format!("widget {i}"), "widget");
+        }
+        let query = "which widget is not in rust";
+        let at_cap = exclusion_entities(&db, query, 0).unwrap();
+        assert_eq!(
+            at_cap.map(|ex| ex.lacking.len()),
+            Some(EXCLUSION_MAX_ENTITIES)
+        );
+        typed(&db, &format!("widget {EXCLUSION_MAX_ENTITIES}"), "widget");
+        assert!(exclusion_entities(&db, query, 0).unwrap().is_none());
     }
 }
 

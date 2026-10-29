@@ -26,6 +26,7 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | nc-skill | SKILL.md synced with current behaviour | claims checked against src/ | 25eabf8 |
 | nc-contain | connector spans (B5), EX-05 with common-noun guard, possessive ends spans, name-containment links | heuristic entity F1 0.675 -> 0.762; accepted exception blind 0.830 -> 0.810 (0.820 after histprose), private 0.875 -> 0.867, each lost query traced to rank noise from removed junk entities | f95327e |
 | nc-scale | measurement at 11k / 33k / 109k memories | see `scale.md` | dfe7e79 |
+| nc-scale100k (orchestrator measured) | real-model world-10000, 108,667 memories, int8 | acc@10 0.977, agent_sim 0.987, p50 478 / 395 ms (1 / 2 cores), RSS 633 / 237 MiB (f32 / q8), 2,522 B/memory; ingest 13.5/s -> 1.1/s | (docs only) |
 | nc-perf | `idx_rel_subj`, deferred `current_values`, one `memories_vec` scan per remember | 33k: recall p50 -33%, p95 -44%, ingest -20%, results byte-identical | 5e3e082 |
 | nc-hunt2 (qoder) | dogfood bug hunt: 8 fictional agent scenarios, 178 probes, real model | 20 findings (8 wrong fact, 8 missing, 4 noise) in workspace `lanes/research/hunt2.md` | (no code) |
 | nc-fix2 (qoder) | negation/retraction scoped to the right subject and clause; first names via supplied entities; "A and B are no longer partners"; "I don't remember" is not negation; future-event questions see planned rows | hunt2 probes fixed; retraction table 27/27; private 0.867 and agent_sim 111/120 unchanged | 1caba99 |
@@ -50,7 +51,7 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | multihop-holdout / blind / private acc@10 (one recall) | 0.825 / 0.820 / 0.867 |
 | agent_sim --hints (recall + follow, ~1.3 calls/query) | 0.863 / 0.910 / 0.925 |
 | world-300 / world-1000 / world-3000 acc@10 | 0.992 / 0.992 / 0.997 (three-hop 1.000 / 1.000 / 1.000) |
-| world-10000 (108,667 memories, int8 DB, build 5e3e082) acc@10 | 0.977 (two-hop 0.892, three-hop 0.987); see `scale.md` |
+| world-10000 (108,667 memories, int8 DB, ingest 5e3e082) acc@10 / agent_sim | 0.977 / 0.987 (two-hop 0.892 / 0.942); recall p50 478 ms 1 core, 395 ms 2 cores; see `scale.md` section 6 |
 | cold-recall peak RSS | 612-633 MiB f32 model, ~237 MiB q8, flat in DB size up to 108k memories |
 | DB bytes per memory | ~5,950 f32 vectors, ~2,250 int8 |
 

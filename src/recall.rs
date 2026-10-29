@@ -15,6 +15,12 @@ const MEMORY_COLUMNS: &str =
 
 /// Weight of the query-directed path channel in the RRF fusion.
 const PATH_WEIGHT: f64 = 2.5;
+/// Weight of the exclusion channel: the memories of the typed items that lack
+/// the property a "which X is not Y" question asks about (H2-02).
+const EXCLUSION_WEIGHT: f64 = 2.5;
+/// Score multiplier for memories of the typed items that do have the
+/// excluded property: they are the wrong answer to that question.
+const EXCLUSION_PENALTY: f64 = 0.5;
 /// Top dense-retrieval cosine below which a query with no lexical or entity
 /// support is treated as "nothing relevant is stored".
 const ABSTAIN_COSINE: f64 = 0.18;
@@ -103,6 +109,24 @@ fn fetch_rows(db: &Db, ids: &[i64]) -> Result<HashMap<i64, MemoryRow>> {
     Ok(out)
 }
 
+/// Memories that mention any of the entities, deduplicated and in id order.
+fn memories_mentioning(db: &Db, entities: &[i64]) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    for chunk in entities.chunks(400) {
+        let marks = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT DISTINCT memory_id FROM mentions WHERE entity_id IN ({marks})");
+        let mut st = db.sql().prepare(&sql)?;
+        for id in st.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, i64>(0))? {
+            out.push(id?);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
 /// E4a: expand the best dense hits through temporal links. A memory one day
 /// away from the anchor is a weak neighbour; a memory minutes away is nearly
 /// as relevant as the anchor itself.
@@ -176,6 +200,31 @@ fn fetch_vectors(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<f32>>> {
         }
     }
     Ok(out)
+}
+
+/// The `keep` memory ids closest to the query, read in bounded chunks so an
+/// exclusion question over a whole type never holds that type's vectors in RAM
+/// (low-resource target). Ties break on id, like a stable sort by cosine.
+fn top_by_cosine(db: &Db, ids: &[i64], query_vec: &[f32], keep: usize) -> Result<Vec<i64>> {
+    let chunk = 1024;
+    let mut scored: Vec<(f32, i64)> = Vec::new();
+    for part in ids.chunks(chunk) {
+        let vectors = fetch_vectors(db, part)?;
+        for id in part {
+            let cosine = vectors
+                .get(id)
+                .map(|v| rank::cosine(query_vec, v))
+                .unwrap_or(0.0);
+            scored.push((cosine, *id));
+        }
+        if scored.len() >= keep * 2 {
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            scored.truncate(keep);
+        }
+    }
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.truncate(keep);
+    Ok(scored.into_iter().map(|(_, id)| id).collect())
 }
 
 /// World-time end of a memory (valid_to reached) or system retirement.
@@ -823,6 +872,13 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let k = input.k.unwrap_or(8).clamp(1, 50);
     let budget = input.budget.unwrap_or(1200).min(20_000);
     let negated = paths::negation_intent(&input.query);
+    // H2-02: "which service is not in Rust" names a type and a property; the
+    // answer is the item that lacks it, not a memory containing a negation.
+    let exclusion = if negated {
+        None
+    } else {
+        paths::exclusion_entities(&engine.db, &input.query, now)?
+    };
     let causal_query = paths::causal_intent(&input.query);
     let query_text = input
         .query
@@ -1251,6 +1307,39 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     });
     tlink_ids.truncate(depth);
 
+    // ------------------------------------------------------- exclusion
+    // The typed items without the property are the answer ("report-service is
+    // written in Python" answers "which service is not in Rust"), so their
+    // memories form a channel of their own, ranked by the query vector. Items
+    // that do have the property are demoted below.
+    let mut excl_ids: Vec<i64> = Vec::new();
+    let mut blocked_ids: HashSet<i64> = HashSet::new();
+    if let Some(ex) = &exclusion {
+        let lacking_all = memories_mentioning(&engine.db, &ex.lacking)?;
+        excl_ids = top_by_cosine(
+            &engine.db,
+            &lacking_all,
+            &query_vec,
+            depth.saturating_mul(4),
+        )?;
+        let lacking: HashSet<i64> = lacking_all.into_iter().collect();
+        blocked_ids = memories_mentioning(&engine.db, &ex.with_property)?
+            .into_iter()
+            .filter(|id| !lacking.contains(id))
+            .collect();
+    }
+    let missing: Vec<i64> = excl_ids
+        .iter()
+        .copied()
+        .filter(|id| !rows.contains_key(id))
+        .collect();
+    rows.extend(fetch_rows(&engine.db, &missing)?);
+    excl_ids.retain(|id| {
+        rows.get(id)
+            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
+    });
+    excl_ids.truncate(depth);
+
     let channels = [
         rank::Channel {
             name: "bm25",
@@ -1291,6 +1380,11 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             name: "tlink",
             weight: engine.cfg.w_tlink,
             ids: &tlink_ids,
+        },
+        rank::Channel {
+            name: "excl",
+            weight: EXCLUSION_WEIGHT,
+            ids: &excl_ids,
         },
     ];
     let fused = rank::rrf(&channels, engine.cfg.rrf_k);
@@ -1349,6 +1443,9 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         score *= 0.9 + 0.2 * row.4;
         if let Some(retention) = retention_scores.get(&f.id) {
             score *= 1.0 + engine.cfg.w_retention * retention;
+        }
+        if blocked_ids.contains(&f.id) {
+            score *= EXCLUSION_PENALTY;
         }
         candidates.push((f.id, score, f.ranks));
     }
@@ -1574,6 +1671,15 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         merged.truncate(8);
         merged
     };
+    // The facts that give the excluded property to a typed item are the wrong
+    // answers ("auth-service is written in Rust" for "which service is not in
+    // Rust"): keep them, but after the facts that answer the question.
+    if let Some(ex) = &exclusion {
+        if !ex.facts.is_empty() {
+            let wrong: HashSet<i64> = ex.facts.iter().copied().collect();
+            facts.sort_by_key(|fact| wrong.contains(&fact.id));
+        }
+    }
     // Ordering and duration questions want the intervals themselves, oldest
     // first, with the elapsed time spelled out. Other queries keep relevance
     // order.
@@ -1834,7 +1940,7 @@ fn facts_for_view(
             (SELECT nb.fact FROM relations nb WHERE nb.id=r.ended_by)
          FROM relations r JOIN predicates p ON p.id=r.predicate_id
          JOIN entities e ON e.id=r.src JOIN entities d ON d.id=r.dst
-         WHERE r.src IN ({marks}) OR r.dst IN ({marks})"
+         WHERE (r.src IN ({marks}) OR r.dst IN ({marks})) AND r.src != r.dst"
     ))?;
     let mut out = Vec::new();
     let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = ids

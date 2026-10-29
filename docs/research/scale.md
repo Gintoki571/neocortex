@@ -181,6 +181,29 @@ Measured on this host, `taskset -c 0`, interleaved main/branch runs, both binari
 
 The world-300 p50 gain is small because that graph has only 1,283 relations; the effect grows with hub fan-in and graph size (world-3000: recall p50 -33%, p95 -44%; ingest -20%). Results are identical: acc@10 / recall / MRR and every per-category row match main on world-300 (0.992 / 0.965 / 0.881) and world-3000 (0.898 / 0.837 / 0.603), and the ingested DBs match table by table (`memories`, `entities`, `relations`, `mentions`, `memory_links`, `relation_evidence` row hashes equal on both worlds). Not re-measured at 108k (the DB from nc-scale was a scratch build).
 
+## 6. Real model at 108,667 memories (nc-scale100k)
+
+world-10000 (seed 10001) ingested with the real model into an int8 DB (`NEOCORTEX_VEC=int8`, `eval --save-db`) by the nc-perf build 5e3e082, before ER-08: 28,997 s (8.1 h, 3.7 memories/s average). Ingest rate by DB size: 13.5/s (0-11k), 8.1/s (30k), 6.3/s (50k), 4.5/s (70k), 2.4/s (90k), 1.1/s (100k-108k); the write path is still super-linear (open item WRITE-100K). `stats`: 108,667 memories, 11,677 entities, 42,561 relations, DB 261.5 MiB (2,522 B/memory).
+
+Queried with main bf73846 (`eval --load-db`, a copy of the DB; the host was otherwise idle, load 1-4):
+
+| | 1 core | 2 cores |
+|---|---|---|
+| recall p50 / p95 / mean | 478.3 / 555.4 / 484.8 ms | 395.1 / 442.1 / 398.3 ms |
+
+| category | q | acc@10 | recall | MRR | agent_sim --hints |
+|---|---|---|---|---|---|
+| aggregation | 60 | 1.000 | 1.000 | 0.972 | 60/60 |
+| as-of | 102 | 1.000 | 1.000 | 0.818 | 102/102 |
+| current | 102 | 1.000 | 0.990 | 0.870 | 102/102 |
+| history | 78 | 1.000 | 1.000 | 0.994 | 78/78 |
+| temporal-window | 60 | 1.000 | 1.000 | 1.000 | 60/60 |
+| three-hop | 78 | 0.987 | 0.812 | 0.659 | 77/78 |
+| two-hop | 120 | 0.892 | 0.933 | 0.777 | 113/120 |
+| overall | 600 | 0.977 | 0.961 | 0.854 | 592/600 = 0.987 (1.04 calls/query) |
+
+Cold CLI recall, 1 core (`taskset -c 0`, python `RUSAGE_CHILDREN`): f32 model peak RSS 633 MiB (wall 1.2 s), q8 model 237 MiB (wall 3.8 s). RSS stays model-bound at 108k. Context tokens per query 427.5. Two-hop is the weakest category (0.892 one recall, 0.942 with follow); the DB predates ER-08, so some of those misses may be false person merges (world-10000 reuses surnames more than world-3000); re-ingest with ER-08 before chasing them (open item TWO-HOP-100K).
+
 ## After nc-hop3: the third hop is ended by a false entity merge
 
 The world-3000 three-hop misses are not a fan-out or depth limit. Every one of the 8 replicated misses (6 unique
