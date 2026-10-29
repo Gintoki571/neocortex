@@ -209,6 +209,119 @@ no `valid_to`.
 
 Resolution: fixed at the write side by nc-er08 (main bf73846; a typo-sized near-name merge needs corroboration). Re-ingested world-3000 with the real model: acc@10 0.997, three-hop 1.000, two-hop 0.983, false merges 26 -> 0. nc-hop3's read-side knobs stay on branch `lane-nc-hop3` (cd957ea), not merged: `hop_ended` is no longer needed; `hop_last_open` (the hop-3 fact is outside the question's 100 nearest relations for 78 of 78 world-300 three-hop chains; opening low-degree entities lifts world-300 three-hop recall 0.761 -> 0.812, acc@10 unchanged) is an open item.
 
+## After nc-write100k: the write path stops scanning the corpus
+
+Section 4 found the two write-time memory scans growing ~1.6 ms per 1,000 memories each and ~75 ms per
+remember at 100k in steps it did not itemise. nc-write100k added per-step timers
+(`NEOCORTEX_WRITE_TIMING=<file>`, `src/wtiming.rs`: 11 `item` stages and a `chunk` line), measured a DB grown
+to 102,656 memories (hash embedder, world-10000 slices, 1,024 fresh inputs per size) and replaced the stages
+that grow with N. Base = main d4c4bd1 with the timers added and nothing else; both builds run interleaved on
+copies of the same DBs. Wall rates on this host swing with the other lanes (the same build measured 8 and 22
+memories/s an hour apart), so CPU per memory is the stable figure.
+
+Per memory, ms:
+
+| stage | 13k base | 13k branch | 50k base | 50k branch | 102k base | 102k branch |
+|---|---|---|---|---|---|---|
+| knn (near-dup + `related` candidates) | 21.90 | 5.73 | 83.65 | 7.58 | 285.29 | 13.74 |
+| graph (graphqlite projection) | 16.00 | 1.98 | 51.85 | 2.35 | 158.94 | 2.41 |
+| entities | 7.63 | 7.04 | 1.78 | 0.24 | 0.83 | 0.38 |
+| relations | 2.59 | 1.25 | 9.78 | 0.70 | 7.70 | 0.13 |
+| gazetteer | 0.83 | 0.51 | 2.92 | 0.95 | 5.94 | 0.79 |
+| tlinks | 1.62 | 1.55 | 0.34 | 1.08 | 1.16 | 0.65 |
+| mem/vec insert, mentions, retractions, finalize | 0.22 | 0.22 | 1.35 | 0.37 | 1.31 | 0.37 |
+| item total | 48.74 | 18.22 | 140.27 | 12.52 | 449.76 | 18.31 |
+| CPU per memory (process) | 46.6 | 16.5 | 127.5 | 11.0 | 289.0 | 17.8 |
+
+The smallest column is 13k rather than the requested 10k: it is the first size both builds ran with the stage
+timers. The base build's separate 10k run measured p50 39.9 ms against 43.6 ms at 13k, so nothing turns over
+between the two.
+
+Three changes:
+
+- **knn.** `memories_vec` KNN (k=1 for the duplicate check, k=10 for `related`) compared every stored vector.
+  `remember::neighbour_candidates` now collects a bounded set - the newest 128 FTS hits on the memory's
+  longest content tokens, the newest 256 mentions of each mentioned entity, the newest 512 memories, cap 1024 -
+  and `knn_among` scores it by cosine over point reads. 285 ms -> 14 ms at 102k.
+- **graph.** Every edge was projected with `MATCH (a:...), (b:...) MERGE (a)-[r]->(b)`; graphqlite planned that
+  as a cartesian product, so one projection walked every node (a memory with 3 mentions and 3 relations paid it
+  six times). One `MERGE (a:...)-[r:...]->(b:...)` statement per edge: 159 ms -> 2.4 ms at 102k.
+- **tlinks.** The `mentions` JOIN `memories` with `GROUP BY m.id` became an `idx_memories_valid` range scan with
+  an EXISTS probe on the `mentions` primary key.
+
+The stages that did not change shrank at 102k anyway because the old global KNN dragged 620 MB of vector blobs
+through the page cache for every memory: relations 7.70 -> 0.13 ms, gazetteer 5.94 -> 0.79 ms, the inserts
+1.3 -> 0.4 ms. That is cache damage, not a code change.
+
+The residual knn cost is the point reads themselves: sqlite-vec answers `WHERE rowid=?` by reading chunk blobs
+from the newest end, so an old row costs more than a recent one (31 us at the tail vs up to 1.7 ms at the head of
+a 90k DB, measured row by row with a scratch probe). The FTS arm is bounded by `LIMIT` but not free on a cold
+cache: `ORDER BY rowid DESC` over a large match set cost 245 ms cold / 7.7 ms warm on the 90k probe DB.
+
+Ingest by corpus size, hash embedder, 1,024 fresh inputs at each size, batch, `taskset -c 0` (per-memory p50
+from the item timers; rate = 1,000 / mean item time - other lanes shared the host, so wall rates run 2-2.5x
+slower than this):
+
+| memories | main p50 | main rate | branch p50 | branch rate |
+|---|---|---|---|---|
+| 13k | 43.6 ms | 20.6/s | 10.8 ms | 55.3/s |
+| 50k | 128.0 ms | 7.1/s | 9.9 ms | 80.1/s |
+| 102k | 360.7 ms | 2.2/s | 19.5 ms | 54.7/s |
+
+The branch stays at 10-20 ms per memory at every size; the spread between its rows is host contention.
+
+Ingest at 102,656 memories, hash embedder, 1,024 fresh inputs, `taskset -c 0` (the wall-time runs):
+
+| metric | main | branch |
+|---|---|---|
+| batch `remember_batch`, wall rate | 2.11/s | 22.18/s |
+| batch, p50 / mean / p95 per memory | 434.81 / 473.95 / 584.64 ms | 43.85 / 45.08 / 47.01 ms |
+| batch, CPU per memory | 289.0 ms | 17.8 ms |
+| single `remember`, p50 (3 interleaved pairs) | 432.39 ms (450.02 / 432.39 / 262.55) | 19.61 ms (31.20 / 19.61 / 19.57) |
+| single `remember`, CPU per memory of the 3 runs | 445 / 400 / 259 ms | 31 / 20 / 20 ms |
+| peak RSS | 20.0 MiB | 20.2 MiB |
+| DB after the 1,024 writes | 624,635,904 B | 624,635,904 B |
+
+Correctness at 102,656 memories (`wdcheck` / `wdnears` scratch probes, both builds on copies of the same DB):
+
+| check | main | branch |
+|---|---|---|
+| exact repeat of old m66777 (115 chars) | `duplicate_of=m66777`, near none | same |
+| one-letter variant of m66777 (cosine 0.979) | `near=(66777, 0.9789604)` | `near=(66777, 0.97896093)` |
+| exact repeat of old m51328 (61 chars) | `duplicate_of=m51328`, near none | same |
+| one-letter variant of m51328 (cosine 0.9366) | near none | near none |
+| 40 sampled replays, exact duplicates | - | 0 differ |
+| 40 sampled replays, near target | - | 1 differs (same text: m97524 vs the replay copy m102713) |
+| 40 sampled replays, `related` | 20 non-empty | 2 differ (m15399 3 -> 0, m69293 3 -> 1) |
+
+A one-letter edit of a 61-character sentence is 0.94 cosine on the hash embedder, below `near_dup` 0.97 on both
+builds; the near band is only reachable for longer texts. The two `related` losses are the real cost of the
+bounded set: a replay of an old memory whose related neighbours are older than the 256 newest mentions of the
+entity (and outside the FTS top 128 and the newest 512) no longer lists them.
+
+world-3000 (seed 3001, 32,567 memories, hash embedder), every input re-ingested through both builds (branch
+2,895 s = 11.3/s; the main wall time is not quoted, the run was paused for ~2.5 h):
+
+- `duplicate_of`: 0 of 32,567 differ.
+- `near_duplicate`: 0 of 32,567 differ (id and cosine, tolerance 1e-5).
+- `related`: 260 of the 6,294 non-empty lists differ. 163 hold the same ids in another order, 35 gain one
+  neighbour (a candidate the old k=10 scan cut off - it spent one of its ten rows on the memory itself), 62
+  swap one entry for another with the same cosine (a tie the two paths break differently), and 0 lose an entry
+  main listed. On inputs with the same id order the cosines drift by <= 1e-6 (sqlite-vec's KNN and the
+  point-read cosine sum the same f32 products in another order).
+- Tables: both databases are 192,765,952 B with the same counts and aggregates - 32,567 memories, 3,826
+  entities, 70,860 mentions, 12,750 relations (all live), equal id sums and content lengths.
+
+So the bounded candidate set keeps every near-duplicate decision on this world, and changes only which of
+several near-equal neighbours `related` lists.
+
+Gates on world-300 with the real model are unchanged (final build, `eval/world-300.json --save-db`): acc@10
+0.992, recall 0.965, MRR 0.881 - the same numbers as main d4c4bd1 - with every category at acc@10 1.000 except
+two-hop 0.958; ingest 3,264 memories in 475 s (contended with another lane's model test). Recall latency on
+the saved world-300 DB, 600 queries, 1 core, 3 interleaved pairs (`eval --load-db` on copies): main p50
+253.5 / 230.0 / 172.5 ms, branch 224.7 / 223.4 / 312.5 ms (medians 230.0 vs 224.7; the third branch run hit
+another lane's build). The read path does not touch this lane's code.
+
 ## Reproduce
 
 ```bash

@@ -142,3 +142,28 @@ pub fn chunk(
         "chunk\t{n}\t{prepare_ms:.3}\t{embed_ms:.3}\t{write_ms:.3}\t{savepoint_ms:.3}\t{savepoint_begin_ms:.3}"
     ));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_indices_match_names() {
+        assert_eq!(STAGES.len(), 11);
+        for (i, name) in [
+            (KNN, "knn"),
+            (MEM_INSERT, "mem_insert"),
+            (VEC_INSERT, "vec_insert"),
+            (ENTITIES, "entities"),
+            (MENTIONS, "mentions"),
+            (GAZETTEER, "gazetteer"),
+            (GRAPH, "graph"),
+            (TLINKS, "tlinks"),
+            (RELATIONS, "relations"),
+            (RETRACTIONS, "retractions"),
+            (FINALIZE, "finalize"),
+        ] {
+            assert_eq!(STAGES[i], name);
+        }
+    }
+}

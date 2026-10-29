@@ -80,9 +80,11 @@ pub fn bump_gen(db: &Db) -> Result<()> {
 }
 
 pub fn project_mention(db: &Db, memory: i64, entity: i64) -> Result<()> {
+    // One MERGE statement: the two-`MATCH` form made graphqlite plan a
+    // cartesian product and cost O(edges) per call on a grown graph.
     run(
         db,
-        "MATCH (m:Memory {id:$m}), (e:Entity {id:$e}) MERGE (m)-[:MENTIONS]->(e)",
+        "MERGE (m:Memory {id:$m})-[:MENTIONS]->(e:Entity {id:$e})",
         &[
             ("m", format!("m:{memory}").into()),
             ("e", format!("e:{entity}").into()),
@@ -91,17 +93,29 @@ pub fn project_mention(db: &Db, memory: i64, entity: i64) -> Result<()> {
 }
 
 pub fn project_similar(db: &Db, a: i64, b: i64, score: f32) -> Result<()> {
-    run(db, "MATCH (a:Entity {id:$a}), (b:Entity {id:$b}) MERGE (a)-[r:SIMILAR]->(b) SET r.score=$score", &[
-        ("a", format!("e:{a}").into()), ("b", format!("e:{b}").into()), ("score", f64::from(score).into()),
-    ])
+    run(
+        db,
+        "MERGE (a:Entity {id:$a})-[r:SIMILAR]->(b:Entity {id:$b}) SET r.score=$score",
+        &[
+            ("a", format!("e:{a}").into()),
+            ("b", format!("e:{b}").into()),
+            ("score", f64::from(score).into()),
+        ],
+    )
 }
 
 /// B5: a name-containment edge ("Cascais marina" contains "Cascais"), the
 /// weak hop the semantic beam and PPR walk.
 pub fn project_name_part(db: &Db, a: i64, b: i64, weight: f32) -> Result<()> {
-    run(db, "MATCH (a:Entity {id:$a}), (b:Entity {id:$b}) MERGE (a)-[r:CONTAINS]->(b) SET r.weight=$weight", &[
-        ("a", format!("e:{a}").into()), ("b", format!("e:{b}").into()), ("weight", f64::from(weight).into()),
-    ])
+    run(
+        db,
+        "MERGE (a:Entity {id:$a})-[r:CONTAINS]->(b:Entity {id:$b}) SET r.weight=$weight",
+        &[
+            ("a", format!("e:{a}").into()),
+            ("b", format!("e:{b}").into()),
+            ("weight", f64::from(weight).into()),
+        ],
+    )
 }
 
 /// Project the containment edges of one entity. The caller must have
@@ -122,7 +136,7 @@ pub fn project_name_parts(db: &Db, entity: i64) -> Result<()> {
 }
 
 pub fn project_relation(db: &Db, id: i64, src: i64, dst: i64, predicate: &str) -> Result<()> {
-    run(db, "MATCH (a:Entity {id:$a}), (b:Entity {id:$b}) MERGE (a)-[r:REL {rid:$rid}]->(b) SET r.predicate=$predicate", &[
+    run(db, "MERGE (a:Entity {id:$a})-[r:REL {rid:$rid}]->(b:Entity {id:$b}) SET r.predicate=$predicate", &[
         ("a", format!("e:{src}").into()), ("b", format!("e:{dst}").into()),
         ("rid", id.into()), ("predicate", predicate.into()),
     ])

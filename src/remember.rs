@@ -1429,17 +1429,8 @@ fn write_prepared(
         }
     };
     // Both checks read the database, so they belong after the earlier items of
-    // this chunk were written: a later input must see them.
-    // One scan serves the near-duplicate check (nearest) and, for a
-    // relation-less write, the related block below (top 10 once this memory
-    // is stored, so nine neighbours of the pre-insert list).
-    crate::wtiming::begin(crate::wtiming::KNN);
-    let neighbours = knn_memory(db, &vectors[0], if relations.is_empty() { 10 } else { 1 })?;
-    crate::wtiming::end(crate::wtiming::KNN);
-    let near = neighbours
-        .first()
-        .copied()
-        .filter(|(_, s)| *s >= cfg.near_dup);
+    // this chunk were written: a later input must see them. They run after
+    // the mentions are written, because the candidate set is entity-driven.
     for id in &supersedes {
         let exists: bool = db.sql().query_row(
             "SELECT EXISTS(SELECT 1 FROM memories WHERE id=?1 AND expired_at IS NULL)",
@@ -1560,6 +1551,28 @@ fn write_prepared(
         }
     }
     crate::wtiming::end(crate::wtiming::GAZETTEER);
+    // Near-duplicate and related checks share one bounded candidate set: FTS
+    // hits on this text, the newest memories per mentioned entity and the
+    // newest memories overall. The vec0 KNN they replace compared every
+    // stored vector, so the write cost followed the corpus.
+    crate::wtiming::begin(crate::wtiming::KNN);
+    // Sorted: a hash map's order is per-process, and equal cosines keep the
+    // candidate order in the sort.
+    let mut entity_ids: Vec<i64> = ids.values().copied().collect();
+    entity_ids.sort_unstable();
+    let candidates = neighbour_candidates(db, &content, &entity_ids)?;
+    let neighbours = knn_among(
+        db,
+        &vectors[0],
+        &candidates,
+        if relations.is_empty() { 10 } else { 1 },
+        id,
+    )?;
+    crate::wtiming::end(crate::wtiming::KNN);
+    let near = neighbours
+        .first()
+        .copied()
+        .filter(|(_, s)| *s >= cfg.near_dup);
     // E4a: memories that share an entity and sit close in world time are
     // neighbours ("what else happened around the move"). The fan-out cap is
     // enforced on both endpoints, so no memory can become a hub.
@@ -1572,11 +1585,8 @@ fn write_prepared(
     let mut invalidated = Vec::new();
     let mut conflicts = Vec::new();
     let mut related = Vec::new();
-    if relations.is_empty() && !ids.is_empty() {
-        let entity_ids: Vec<i64> = ids.values().copied().collect();
-        // A stored memory is its own nearest row; a duplicate stored nothing.
-        let keep = if duplicate_of.is_some() { 10 } else { 9 };
-        for &(mid, cosine) in neighbours.iter().take(keep) {
+    if relations.is_empty() && !entity_ids.is_empty() {
+        for &(mid, cosine) in neighbours.iter() {
             if cosine < cfg.update_candidate || cosine >= cfg.near_dup || mid == id {
                 continue;
             }
@@ -2062,8 +2072,10 @@ const TLINK_DAY: f64 = 86_400.0;
 const TLINK_FLOOR: f64 = 0.3;
 
 /// E4a: link a new memory to the closest live memories that share one of its
-/// entities. Weight is `max(0.3, 1 - gap/24h)` (Hindsight); the candidate
-/// query is driven by `idx_mentions_entity` and `idx_memories_valid`.
+/// entities. Weight is `max(0.3, 1 - gap/24h)` (Hindsight); the window scan
+/// is driven by `idx_memories_valid` and each candidate probes the
+/// `mentions(memory_id, entity_id)` primary key, so the write cost tracks the
+/// window, not the corpus.
 fn write_temporal_links(db: &Db, memory: i64, valid_from: i64, cfg: &Config) -> Result<()> {
     let cap = cfg.tlink_cap;
     let window = (cfg.tlink_window_hours.max(0.0) * 3_600.0).round() as i64;
@@ -2083,17 +2095,17 @@ fn write_temporal_links(db: &Db, memory: i64, valid_from: i64, cfg: &Config) -> 
     if entity_ids.is_empty() {
         return Ok(());
     }
-    let marks = std::iter::repeat_n("?", entity_ids.len())
+    let marks = (1..=entity_ids.len())
+        .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
         "SELECT m.id,m.valid_from FROM memories m
-         JOIN mentions me ON me.memory_id=m.id
-         WHERE me.entity_id IN ({marks})
+         WHERE m.valid_from BETWEEN ?{lo} AND ?{hi}
            AND m.id!=?{a} AND m.expired_at IS NULL
-           AND m.valid_from BETWEEN ?{lo} AND ?{hi}
-         GROUP BY m.id
-         ORDER BY MIN(ABS(m.valid_from-?{at})), m.id
+           AND EXISTS (SELECT 1 FROM mentions me
+                       WHERE me.memory_id=m.id AND me.entity_id IN ({marks}))
+         ORDER BY ABS(m.valid_from-?{at}), m.id
          LIMIT ?{limit}",
         a = entity_ids.len() + 1,
         lo = entity_ids.len() + 2,
@@ -2298,14 +2310,117 @@ pub fn retract_relations(db: &Db, ids: &[i64], now: i64) -> Result<()> {
     Ok(())
 }
 
-/// The `k` nearest live memories, nearest first, as (id, cosine).
-fn knn_memory(db: &Db, v: &[f32], k: usize) -> Result<Vec<(i64, f32)>> {
-    let mut st = db.sql().prepare(&format!(
-        "SELECT rowid,1-distance FROM memories_vec WHERE embedding MATCH {} AND k={k} AND live=1 ORDER BY distance",
-        db.vec_sql("?1")
-    ))?;
-    let rows = st.query_map([db.vec_blob(v)], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+/// Bounds of the write-path neighbour search. The candidate set is lexical
+/// and entity overlap plus the newest memories, so a repeat of recent work
+/// is found without comparing every stored vector.
+const NEIGHBOUR_FTS: usize = 128;
+const NEIGHBOUR_PER_ENTITY: usize = 256;
+const NEIGHBOUR_RECENT: usize = 512;
+const NEIGHBOUR_CAP: usize = 1024;
+
+fn push_candidate(out: &mut Vec<i64>, seen: &mut HashSet<i64>, id: i64) {
+    if out.len() < NEIGHBOUR_CAP && seen.insert(id) {
+        out.push(id);
+    }
+}
+
+/// FTS expression for the candidate lookup: the longest exact content tokens
+/// (no prefix arms; a near duplicate shares whole words). Ranking by bm25
+/// would score every match; newest-first stops after `LIMIT`.
+fn candidate_fts_query(content: &str) -> Option<String> {
+    let mut toks: Vec<String> = text::tokens(content)
+        .into_iter()
+        .filter(|t| t.chars().count() >= 4 && !text::is_stopword(t))
+        .collect();
+    toks.sort_by_key(|t| std::cmp::Reverse(t.chars().count()));
+    toks.dedup();
+    toks.truncate(8);
+    if toks.is_empty() {
+        return None;
+    }
+    Some(
+        toks.iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
+/// Candidate memories for the near-duplicate and related checks: the newest
+/// memories whose text shares words with this one, the newest memories per
+/// mentioned entity (the `related` block needs shared entities anyway) and
+/// the newest memories overall (agents repeat what they just wrote).
+fn neighbour_candidates(db: &Db, content: &str, entity_ids: &[i64]) -> Result<Vec<i64>> {
+    let mut out: Vec<i64> = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    if let Some(q) = candidate_fts_query(content) {
+        let mut st = db.sql().prepare(
+            "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1
+             ORDER BY rowid DESC LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![q, NEIGHBOUR_FTS as i64], |r| r.get::<_, i64>(0))?;
+        for row in rows {
+            push_candidate(&mut out, &mut seen, row?);
+        }
+    }
+    {
+        // The index walks backwards, so this is the newest `LIMIT` mentions
+        // of the entity, not a scan of all of them.
+        let mut st = db.sql().prepare(
+            "SELECT memory_id FROM mentions WHERE entity_id=?1
+             ORDER BY memory_id DESC LIMIT ?2",
+        )?;
+        for eid in entity_ids {
+            let rows = st.query_map(params![eid, NEIGHBOUR_PER_ENTITY as i64], |r| {
+                r.get::<_, i64>(0)
+            })?;
+            for row in rows {
+                push_candidate(&mut out, &mut seen, row?);
+            }
+        }
+    }
+    {
+        let mut st = db
+            .sql()
+            .prepare("SELECT id FROM memories ORDER BY rowid DESC LIMIT ?1")?;
+        let rows = st.query_map([NEIGHBOUR_RECENT as i64], |r| r.get::<_, i64>(0))?;
+        for row in rows {
+            push_candidate(&mut out, &mut seen, row?);
+        }
+    }
+    Ok(out)
+}
+
+/// Cosine between `v` and the stored vectors of `candidates`, nearest first.
+/// Point reads keep the cost tied to the candidate count, not the corpus.
+fn knn_among(
+    db: &Db,
+    v: &[f32],
+    candidates: &[i64],
+    k: usize,
+    skip: i64,
+) -> Result<Vec<(i64, f32)>> {
+    let mut st = db
+        .sql()
+        .prepare("SELECT embedding FROM memories_vec WHERE rowid=?1 AND live=1")?;
+    let mut scored: Vec<(i64, f32)> = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        if *id == skip {
+            continue;
+        }
+        match st.query_row([id], |r| r.get::<_, Vec<u8>>(0)) {
+            Ok(blob) => {
+                if let Some(other) = db.blob_to_vec(&blob) {
+                    scored.push((*id, crate::rank::cosine(v, &other)));
+                }
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored.truncate(k);
+    Ok(scored)
 }
 
 #[cfg(test)]
