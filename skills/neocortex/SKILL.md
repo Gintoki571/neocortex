@@ -75,6 +75,10 @@ Store something when it will still matter next week:
   do not pass is not stored.
 - **Negation**: pass `negated: true` for "does not support Y"; it renders as
   `—NOT→` and ends the matching positive interval.
+- **Nicknames are aliases**: `{"source": "Robert Okafor", "predicate":
+  "nickname", "target": "Bob"}` stores no fact; the target becomes another name
+  of the same entity (prefer `entities[].aliases`). Any relation whose two ends
+  resolve to the same entity is dropped, and the reply counts it in `hints`.
 - **Text-only retraction**: a sentence with no relation ("Ivan left Acme; he no
   longer works there") ends the one live fact it names, at `valid_from`, and
   reports it as `invalidated`. It also runs on a write that supplies its own
@@ -135,6 +139,11 @@ and `next:` when present.
   deprecated").
 - A memory-lapse phrasing ("I don't remember ...", "I forgot ...", "remind me
   ...") is a request, not a negation: pass the question itself to recall.
+- An exclusion question ("which service is not in Rust", "what database does
+  Lumen not use", "everything except Rust") asks which item lacks a property:
+  the memories of the items that lack it come first, and the facts that give
+  the property to the other items are kept last. When no stored entity type or
+  property matches, it is answered like an ordinary question.
 - History is automatic for past-tense wording ("used to", "before",
   "previously", "changed", "did ... use", "no longer"), so ended facts appear
   without `include_history`. Use `as_of` for "what was true then".

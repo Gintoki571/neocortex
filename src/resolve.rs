@@ -1278,6 +1278,23 @@ fn unique_prefix(
     })
 }
 
+/// Record one more name for an entity, e.g. the nickname a relation would
+/// otherwise store as a self-loop (H2-18).
+pub(crate) fn add_alias(db: &Db, id: i64, alias: &str, origin: &str) -> Result<()> {
+    let norm = text::norm_name(alias);
+    if norm.is_empty() {
+        return Ok(());
+    }
+    if db.sql().execute(
+        "INSERT OR IGNORE INTO entity_aliases(alias_norm,entity_id,origin) VALUES (?1,?2,?3)",
+        params![norm, id, origin],
+    )? > 0
+    {
+        refresh_entity_fts(db, id)?;
+    }
+    Ok(())
+}
+
 /// Add the mention's name and aliases to an entity. Never touches
 /// `mention_count` (the caller counts mention rows).
 fn add_aliases(db: &Db, id: i64, item: &EntityIn, origin: &str) -> Result<()> {
