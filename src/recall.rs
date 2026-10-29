@@ -2061,14 +2061,21 @@ fn facts_for_view(
     out.into_iter()
         .map(|(_, mut fact, key)| {
             if let Some((subj, group)) = key {
-                let n: i64 = engine.db.sql().query_row(
-                    "SELECT count(*) FROM relations WHERE subj=?1 AND predicate_id IN
+                // Several current values are only worth a marker when the
+                // predicate is single-valued (seeded exclusive, or a group an
+                // agent flagged): on "depends on" or "uses" two live values
+                // are ordinary and the marker read like a conflict warning.
+                let (n, single): (i64, i64) = engine.db.sql().query_row(
+                    "SELECT count(*),
+                            (SELECT COALESCE(MAX(exclusive),0) FROM predicates
+                             WHERE id=?2 OR group_id=?2)
+                     FROM relations WHERE subj=?1 AND predicate_id IN
                          (SELECT id FROM predicates WHERE group_id=?2) AND polarity=1
                      AND expired_at IS NULL AND valid_from<=?3 AND (valid_to IS NULL OR valid_to>?3)",
                     params![subj, group, cutoff],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
-                fact.current_values = (n >= 2).then_some(n as usize);
+                fact.current_values = (n >= 2 && single != 0).then_some(n as usize);
             }
             Ok(fact)
         })

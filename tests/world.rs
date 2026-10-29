@@ -353,10 +353,13 @@ fn batch_matches_sequential_on_a_mixed_workload() {
             .find(|(fact, ..)| fact == needle)
             .unwrap_or_else(|| panic!("no relation '{needle}' in {facts:?}"))
     };
-    assert_eq!(
-        find("Priya Shah NOT works at Northwind Labs").1,
-        0,
-        "inferred negation must be stored as a negative relation"
+    // A negative row keeps the positive reading; polarity carries the
+    // negation, so the positive and the negative share the fact text.
+    assert!(
+        facts.iter().any(
+            |(fact, polarity, ..)| fact == "Priya Shah works at Northwind Labs" && *polarity == 0
+        ),
+        "inferred negation must be stored as a negative relation: {facts:?}"
     );
     assert!(
         find("Meera Iyer lives in Pune").2.is_some(),

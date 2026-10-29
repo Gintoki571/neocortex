@@ -74,11 +74,14 @@ Store something when it will still matter next week:
   `causal_extract` text-cue extractor is an eval-only knob (off); a cause you
   do not pass is not stored.
 - **Negation**: pass `negated: true` for "does not support Y"; it renders as
-  `—NOT→` and ends the matching positive interval.
+  `—NOT→` and ends the matching positive interval. JSON facts carry the same
+  information as `"polarity": 0`; their `fact` text is the positive reading, so
+  read `polarity` (or the `—NOT→` arrow in text) instead of string-matching.
 - **Nicknames are aliases**: `{"source": "Robert Okafor", "predicate":
   "nickname", "target": "Bob"}` stores no fact; the target becomes another name
   of the same entity (prefer `entities[].aliases`). Any relation whose two ends
-  resolve to the same entity is dropped, and the reply counts it in `hints`.
+  resolve to the same entity is dropped, and the reply names it in `hints`
+  (`dropped self-relation: Robert Okafor nickname Bob (kept "Bob" as an alias)`).
 - **Text-only retraction**: a sentence with no relation ("Ivan left Acme; he no
   longer works there") ends the one live fact it names, at `valid_from`, and
   reports it as `invalidated`. It also runs on a write that supplies its own
@@ -130,6 +133,12 @@ and `next:` when present.
   the prefix.
 - `facts:` lines are relations: `[r9] Mom —live in→ Pune (since 2026-09-14)`.
   `—NOT→` is a negation. Current facts show `since <date>` or no end.
+- `[1 of N current]` appears only on a single-valued predicate (seeded: lives
+  in, works at, married to, reports to, ...; or one you flagged `exclusive:
+  true`) when more than one value is still live. It means two facts disagree:
+  invalidate the stale one. Multi-valued predicates (uses, depends on, owns,
+  likes) never carry it; their several current values are ordinary. JSON has
+  the same count in `current_values`.
 - `[planned]` / `[recurring]` mark a future plan or a rule; neither is a current
   fact. A range with `ended` is **history**: true then, not now. `retracted`
   means the source was forgotten, not that the fact stopped being true.

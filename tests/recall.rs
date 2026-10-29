@@ -789,6 +789,137 @@ fn unrelated_question_abstains_instead_of_ranking_noise() {
 }
 
 #[test]
+fn follow_and_aggregate_skip_stored_self_loops() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Robert Okafor leads payments rewrite.", |i| {
+        i.entities = vec![entity("Robert Okafor"), entity("payments rewrite")];
+        i.relations = vec![relation(
+            "Robert Okafor",
+            "lead",
+            "payments rewrite",
+            "Robert Okafor leads payments rewrite.",
+        )];
+    });
+    let robert: i64 =
+        e.db.sql()
+            .query_row(
+                "SELECT id FROM entities WHERE name='Robert Okafor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let predicate_id: i64 =
+        e.db.sql()
+            .query_row("SELECT predicate_id FROM relations", [], |r| r.get(0))
+            .unwrap();
+    // An older build left a nickname self-loop in the database.
+    e.db.sql()
+        .execute(
+            "INSERT INTO relations(src,dst,predicate_id,predicate_text,subj,fact,valid_from,created_at)
+             VALUES(?1,?1,?2,'nickname','Robert Okafor','Robert Okafor nickname Robert Okafor',?3,?3)",
+            rusqlite::params![robert, predicate_id, clock().now],
+        )
+        .unwrap();
+    let out = paths::follow(
+        &e,
+        &paths::FollowInput {
+            from: "Robert Okafor".into(),
+            depth: Some(2),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        out.facts.iter().all(|f| f.source != f.target),
+        "{:?}",
+        out.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+    let agg = paths::aggregate(
+        &e,
+        &paths::AggregateInput {
+            target: Some("Robert Okafor".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(agg.count, 0, "{:?}", agg.items);
+    assert!(agg.items.is_empty(), "{:?}", agg.items);
+}
+
+#[test]
+fn every_fact_channel_renders_one_predicate_spelling() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "The platform team uses Jenkins for CI.", |i| {
+        i.entities = vec![entity("platform team"), entity("Jenkins")];
+        i.relations = vec![relation(
+            "platform team",
+            "uses",
+            "Jenkins",
+            "platform team uses Jenkins",
+        )];
+    });
+    remember(&e, "The platform team uses Buildkite.", |i| {
+        i.entities = vec![entity("platform team"), entity("Buildkite")];
+        i.relations = vec![relation(
+            "platform team",
+            "uses",
+            "Buildkite",
+            "platform team uses Buildkite",
+        )];
+    });
+    // A query the lexical path channel answers itself: the path facts used to
+    // render the stemmed canonical ("use") while the DB channel showed "uses".
+    let out = e
+        .recall(&RecallInput {
+            query: "platform team uses Jenkins Buildkite".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let team: Vec<_> = out
+        .facts
+        .iter()
+        .filter(|f| f.source == "platform team")
+        .collect();
+    assert!(!team.is_empty(), "{:?}", out.facts);
+    assert!(
+        team.iter().all(|f| f.predicate == "uses"),
+        "{:?}",
+        team.iter()
+            .map(|f| (&f.predicate, &f.fact))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_negative_fact_is_marked_by_polarity_not_a_not_string() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Kepler does not use Redis.", |i| {
+        i.entities = vec![entity("Kepler"), entity("Redis")];
+        i.relations = vec![RelationIn {
+            source: "Kepler".into(),
+            predicate: "uses".into(),
+            target: "Redis".into(),
+            negated: Some(true),
+            ..Default::default()
+        }];
+    });
+    let out = e
+        .recall(&RecallInput {
+            query: "does Kepler use Redis".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let fact = out
+        .facts
+        .iter()
+        .find(|f| f.target == "Redis")
+        .unwrap_or_else(|| panic!("no Redis fact in {:?}", out.facts));
+    assert_eq!(fact.polarity, 0);
+    assert_eq!(fact.predicate, "uses");
+    assert!(!fact.fact.contains("NOT"), "{}", fact.fact);
+}
+
+#[test]
 fn follow_walks_to_a_named_target() {
     let e = engine(Arc::new(HashEmbedder));
     remember(&e, "Noah Tansen's manager is Mira Shah.", |i| {

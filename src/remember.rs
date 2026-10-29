@@ -1554,8 +1554,9 @@ fn write_prepared(
     let mut invalidated = Vec::new();
     let mut conflicts = Vec::new();
     let mut related = Vec::new();
-    // Relations dropped because both ends resolved to one entity (H2-18).
-    let mut self_relations = 0usize;
+    // Relations dropped because both ends resolved to one entity (H2-18),
+    // described so the hint can name each one.
+    let mut self_relations: Vec<String> = Vec::new();
     if relations.is_empty() && !ids.is_empty() {
         let entity_ids: Vec<i64> = ids.values().copied().collect();
         // A stored memory is its own nearest row; a duplicate stored nothing.
@@ -1641,10 +1642,21 @@ fn write_prepared(
         // target as another name of the entity; any other predicate is
         // dropped, because a self-loop only adds noise to PPR and the card.
         if src == dst {
+            let dropped = format!(
+                "{} {} {}",
+                relation.source.trim(),
+                relation.predicate.trim(),
+                relation.target.trim()
+            );
             if is_name_predicate(&relation.predicate) {
                 resolve::add_alias(db, src, &relation.target, "agent")?;
+                self_relations.push(format!(
+                    "{dropped} (kept \"{}\" as an alias)",
+                    relation.target.trim()
+                ));
+            } else {
+                self_relations.push(dropped);
             }
-            self_relations += 1;
             continue;
         }
         // Exclusivity is per semantic subject: src normally, the original
@@ -1689,13 +1701,9 @@ fn write_prepared(
             1
         };
         if relation.fact.is_none() && (swap || polarity == 0) {
-            fact = format!(
-                "{}{} {} {}",
-                src_name,
-                if polarity == 0 { " NOT" } else { "" },
-                pred.display,
-                dst_name
-            );
+            // Polarity carries negation, not the text: JSON facts expose it as
+            // `polarity: 0` and the text renderer draws the `—NOT` arrow.
+            fact = format!("{} {} {}", src_name, pred.display, dst_name);
         }
         // Relations this one ends; each gets ended_by = this relation.
         let mut ended_here: Vec<i64> = Vec::new();
@@ -1982,10 +1990,16 @@ fn write_prepared(
             related[0].memory_id, related[0].memory_id
         ));
     }
-    if self_relations > 0 {
-        hints.push(format!(
-            "dropped {self_relations} relation(s) whose source and target are the same entity; nickname/alias targets are kept as names"
-        ));
+    if let Some(first) = self_relations.first() {
+        hints.push(if self_relations.len() == 1 {
+            format!("dropped self-relation: {first}")
+        } else {
+            format!(
+                "dropped {} self-relations: {}",
+                self_relations.len(),
+                self_relations.join("; ")
+            )
+        });
     }
     // Text alone yields no graph facts (no CPU-sized extractor is reliable
     // here, see docs/research/extraction.md); the calling agent is the extractor.
