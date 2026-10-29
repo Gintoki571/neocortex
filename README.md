@@ -356,7 +356,10 @@ also render the interval with a computed duration ("3 years 2 months",
   mentors. The hand-written seed set is reconciled on every open, so a database
   written by an older build gains predicates and aliases added since (the
   `mentor` pair, `accountable to`) without a re-import; a predicate or alias
-  the agent created itself is never taken over.
+  the agent created itself is never taken over. The reconcile writes only when
+  something is missing, so a database another process is writing, or one opened
+  read-only, still opens (`stats`, `recall`, `validate` only read) and is
+  repaired on the next writable open.
 
 ## Quality
 

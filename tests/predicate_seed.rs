@@ -1,10 +1,12 @@
 //! Predicate seeding on open (Fix-up 2): a v4 database written by an older
 //! build must gain the seeds and aliases added since. Seeding is idempotent,
 //! never takes over a user-created predicate or alias, and a reopen with a
-//! complete ontology writes nothing.
+//! complete ontology writes nothing (Fix-up 3: and takes no write transaction,
+//! so a busy or read-only database still opens).
 use neocortex::embed::HashEmbedder;
 use neocortex::engine::{Engine, EntityIn, RecallInput, RelationIn, RememberInput};
 use std::sync::Arc;
+use std::time::Duration;
 
 mod common;
 
@@ -469,5 +471,185 @@ fn a_second_reopen_writes_nothing() {
             "SELECT count(DISTINCT alias_norm) FROM predicate_aliases"
         ),
         "no duplicate alias rows"
+    );
+}
+
+/// A complete ontology must not take the write lock on open: another
+/// connection holding `BEGIN IMMEDIATE` must not be able to fail the open (it
+/// did before: `BEGIN IMMEDIATE` waited out the timeout and errored), and the
+/// open must not move the change counter. Wall time is not the signal here -
+/// the graphqlite extension contends for the same lock on every open.
+#[test]
+fn a_complete_ontology_opens_without_a_write_transaction() {
+    let dir = TempDir::new("seed-no-write-lock");
+    let path = dir.join("seed.db");
+    {
+        let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        remember(
+            &e,
+            "Noah Tansen manages Mira Shah.",
+            &[("Noah Tansen", "person"), ("Mira Shah", "person")],
+            vec![relation("Noah Tansen", "manages", "Mira Shah")],
+        );
+    }
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    holder.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        e.db.sql().total_changes(),
+        0,
+        "a complete ontology writes no row"
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "Who manages Mira Shah?".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!out.memories.is_empty(), "the open database still answers");
+}
+
+/// A read-only database file must open and answer: `stats`, `recall` and
+/// `validate` only read, so the reconcile cannot be a hard requirement.
+#[cfg(unix)]
+#[test]
+fn a_read_only_database_opens_and_recalls() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("seed-read-only");
+    let path = dir.join("seed.db");
+    {
+        let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        remember(
+            &e,
+            "Noah Tansen manages Mira Shah.",
+            &[("Noah Tansen", "person"), ("Mira Shah", "person")],
+            vec![relation("Noah Tansen", "manages", "Mira Shah")],
+        );
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    assert_eq!(
+        count(&e, "SELECT count(*) FROM predicates WHERE seeded=1"),
+        23,
+        "the ontology is already complete, so nothing has to be written"
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "Who manages Mira Shah?".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.facts
+            .iter()
+            .any(|f| !f.memory && f.source == "Noah Tansen" && f.target == "Mira Shah"),
+        "a read-only database still answers: {:?}",
+        out.facts
+    );
+}
+
+/// A read-only database that needs the seeds must still open: the reconcile is
+/// skipped (a read-only file accepts `BEGIN IMMEDIATE` and fails at the first
+/// statement, so it is decided before the transaction) and the next writable
+/// open repairs the seeds.
+#[cfg(unix)]
+#[test]
+fn a_read_only_database_that_needs_the_seeds_opens_anyway() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("seed-read-only-repair");
+    let path = dir.join("seed.db");
+    {
+        let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        remember(
+            &e,
+            "Noah Tansen manages Mira Shah.",
+            &[("Noah Tansen", "person"), ("Mira Shah", "person")],
+            vec![relation("Noah Tansen", "manages", "Mira Shah")],
+        );
+        rewind_to_the_old_seed_set(&e);
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    assert_eq!(
+        count(
+            &e,
+            "SELECT count(*) FROM predicates WHERE canonical IN ('mentor','mentored by')"
+        ),
+        0,
+        "nothing can be written to a read-only file"
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "Who manages Mira Shah?".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!out.memories.is_empty(), "recall works read-only");
+    drop(e);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    assert_eq!(
+        count(
+            &e,
+            "SELECT count(*) FROM predicates WHERE canonical IN ('mentor','mentored by') AND seeded=1"
+        ),
+        2,
+        "the next writable open repairs the seeds"
+    );
+}
+
+/// A database that needs the seeds but is being written by another process
+/// must still open: the reconcile is skipped with one stderr line and the next
+/// writable open repairs the seeds.
+#[test]
+fn an_open_skips_the_reconcile_while_another_writer_holds_the_lock() {
+    let dir = TempDir::new("seed-busy-open");
+    let path = dir.join("seed.db");
+    {
+        let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        remember(
+            &e,
+            "Mira Shah is accountable to Noah Tansen.",
+            &[("Noah Tansen", "person"), ("Mira Shah", "person")],
+            vec![relation("Mira Shah", "accountable to", "Noah Tansen")],
+        );
+        rewind_to_the_old_seed_set(&e);
+    }
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    assert_eq!(
+        count(
+            &e,
+            "SELECT count(*) FROM predicates WHERE canonical IN ('mentor','mentored by')"
+        ),
+        0,
+        "the reconcile is skipped while another writer holds the lock"
+    );
+    // The read path records access in one write; a short timeout keeps the
+    // recall from waiting for the holder (the write is best-effort anyway).
+    e.db.sql().busy_timeout(Duration::from_millis(50)).unwrap();
+    let out = e
+        .recall(&RecallInput {
+            query: "Who is Mira Shah accountable to?".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        !out.memories.is_empty(),
+        "recall works while another writer holds the lock"
+    );
+    drop(e);
+    holder.execute_batch("ROLLBACK").unwrap();
+    drop(holder);
+    let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    assert_eq!(
+        count(
+            &e,
+            "SELECT count(*) FROM predicates WHERE canonical IN ('mentor','mentored by') AND seeded=1"
+        ),
+        2,
+        "the next writable open reconciles the seeds"
     );
 }
