@@ -1652,6 +1652,61 @@ fn a_report_that_says_not_fixed_yet_is_still_open() {
 }
 
 #[test]
+fn a_shared_date_alone_does_not_close_a_bug() {
+    // A release note dated the same day as a bug report is not its fix: the
+    // two share a date and nothing else, so the report stays open and keeps
+    // the top answer instead of being halved below a plain fact.
+    let e = engine(Arc::new(HashEmbedder));
+    let bug = remember(
+        &e,
+        "Bug 2026-10-15: the nightly export crashes with a null pointer in the CSV writer; it is not fixed yet.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-15".into());
+        },
+    );
+    remember(
+        &e,
+        "Lumen v0.9.0 was released on 2026-10-15 with the new dashboard layout.",
+        |i| {
+            i.kind = Some("note".into());
+            i.valid_from = Some("2026-10-15".into());
+            i.entities = vec![entity("Lumen")];
+        },
+    );
+    for (day, fact) in [
+        (
+            14,
+            "The nightly export writes one CSV file per table to the export bucket.",
+        ),
+        (14, "The export bucket keeps objects for 30 days."),
+        (13, "The CSV writer quotes fields that contain a comma."),
+    ] {
+        remember(&e, fact, |i| {
+            i.kind = Some("fact".into());
+            i.valid_from = Some(format!("2026-10-{day:02}"));
+        });
+    }
+    let out = e
+        .recall(&RecallInput {
+            query: "what bugs are still open".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert_eq!(out.memories.first().map(|m| m.id), Some(bug), "{shown:?}");
+    assert!(
+        has_reason(&out, bug, "status"),
+        "not ranked as open: {shown:?}"
+    );
+}
+
+#[test]
 fn a_question_about_a_fixed_bug_keeps_the_fix_in_front() {
     let e = engine(Arc::new(HashEmbedder));
     let bug = remember(

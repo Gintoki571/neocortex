@@ -37,6 +37,16 @@ const CAUSE_SEEDS: usize = 2;
 const CAUSE_WEIGHT: f64 = 1.5;
 /// Most "is a later memory a fix" lookups one status question may run.
 const STATUS_LOOKUPS: usize = 20;
+/// How many FTS hits one "is a later memory a fix" lookup reads: enough to
+/// find the live candidates for a bug from any point in the timeline.
+const STATUS_FTS_HITS: usize = 200;
+/// How many live candidates one lookup examines, in bm25 order.
+const STATUS_FIX_CANDIDATES: usize = 30;
+/// The status lookup's candidate query. The FTS table is the only source, so
+/// the MATCH runs once per lookup; a join that starts from `memories` makes
+/// SQLite evaluate it once per stored memory.
+const STATUS_FTS_SQL: &str = "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1
+     ORDER BY bm25(memories_fts) LIMIT ?2";
 /// Top dense-retrieval cosine below which a query with no lexical or entity
 /// support is treated as "nothing relevant is stored".
 const ABSTAIN_COSINE: f64 = 0.18;
@@ -291,8 +301,12 @@ fn status_channels(
 }
 
 /// A memory written at or after `from` and still live at `now` that fixes the
-/// defect `content` reports: it carries a fix cue and shares a date or two
-/// content words.
+/// defect `content` reports: it carries a fix cue and shares a date and a
+/// content word, or two content words.
+///
+/// The lookup is driven by the FTS index (`STATUS_FTS_SQL`) and filters the
+/// hits in bm25 order, so a status question costs one MATCH per lookup, not
+/// one per stored memory.
 fn fixed_later(db: &Db, id: i64, content: &str, from: i64, now: i64) -> Result<bool> {
     let mut terms: Vec<String> = paths::status_terms(content).into_iter().collect();
     terms.sort();
@@ -300,19 +314,29 @@ fn fixed_later(db: &Db, id: i64, content: &str, from: i64, now: i64) -> Result<b
     let Some(q) = text::fts_query(&terms.join(" "), &[]) else {
         return Ok(false);
     };
-    let mut st = db.sql().prepare(
-        "SELECT m.id,m.content FROM memories m
-         JOIN memories_fts ON memories_fts.rowid=m.id
-         WHERE memories_fts MATCH ?1 AND m.id<>?2 AND m.valid_from>=?3
-           AND m.expired_at IS NULL AND (m.valid_to IS NULL OR m.valid_to>?4)
-         ORDER BY bm25(memories_fts) LIMIT 30",
-    )?;
-    for row in st.query_map(params![q, id, from, now], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-    })? {
-        let (other, fix) = row?;
-        if other != id && paths::has_fix_cue(&fix) && paths::same_bug(content, &fix) {
+    let hits: Vec<i64> = db
+        .sql()
+        .prepare_cached(STATUS_FTS_SQL)?
+        .query_map(params![q, STATUS_FTS_HITS as i64], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let rows = fetch_rows(db, &hits)?;
+    let mut live = 0;
+    for other in hits {
+        if other == id {
+            continue;
+        }
+        let Some(row) = rows.get(&other) else {
+            continue;
+        };
+        if row.9 < from || is_ended(row, now) {
+            continue;
+        }
+        live += 1;
+        if paths::has_fix_cue(&row.1) && paths::same_bug(content, &row.1) {
             return Ok(true);
+        }
+        if live >= STATUS_FIX_CANDIDATES {
+            break;
         }
     }
     Ok(false)
@@ -2914,5 +2938,46 @@ mod hint_tests {
         let f = fixture();
         let chain = chain(f.step_to_mira.clone());
         assert!(hint(&f, &[&chain], &[(f.mira, 0.9)], &[], &[], 0.0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query_plan(db: &Db, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Vec<String> {
+        let mut st = db
+            .sql()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let mut out = Vec::new();
+        for row in st
+            .query_map(params_from_iter(params.iter()), |r| r.get::<_, String>(3))
+            .unwrap()
+        {
+            out.push(row.unwrap());
+        }
+        out
+    }
+
+    /// D2: the status lookup must run the FTS MATCH once, not once per stored
+    /// memory. The old query joined `memories`, so its plan had two data
+    /// sources (the plan SQLite picked on a vault with stats was `SCAN m` then
+    /// a virtual-table lookup per row) and a status question runs up to
+    /// STATUS_LOOKUPS of these lookups. One source is the FTS table alone.
+    #[test]
+    fn the_status_lookup_is_driven_by_the_fts_index_alone() {
+        let db = Db::open_in_memory().unwrap();
+        let plan = query_plan(&db, STATUS_FTS_SQL, &[&"\"export\"*", &10i64]);
+        let sources: Vec<&String> = plan
+            .iter()
+            .filter(|step| step.contains("SCAN") || step.contains("SEARCH"))
+            .collect();
+        assert_eq!(
+            sources.len(),
+            1,
+            "the lookup reads more than the FTS index: {plan:?}"
+        );
+        assert!(sources[0].contains("memories_fts"), "{plan:?}");
     }
 }

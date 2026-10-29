@@ -498,6 +498,9 @@ pub(crate) fn status_terms(text: &str) -> HashSet<String> {
         .into_iter()
         .filter(|token| {
             token.chars().count() >= 3
+                // A year says nothing about which defect a memory is about;
+                // two bugs filed the same day share it and nothing else.
+                && !token.chars().all(|c| c.is_ascii_digit())
                 && !text::is_stopword(token)
                 && !STATUS_GENERIC.contains(&token.as_str())
         })
@@ -562,13 +565,15 @@ fn date_literals(text: &str) -> HashSet<String> {
     out
 }
 
-/// True when `fix` is about the same defect as `bug`: a date they share, or
-/// two content words.
+/// True when `fix` is about the same defect as `bug`: two content words, or a
+/// shared date plus one. A date alone is a coincidence: a release note dated
+/// the day a bug was filed says nothing about that bug.
 pub(crate) fn same_bug(bug: &str, fix: &str) -> bool {
+    let shared = status_terms(bug).intersection(&status_terms(fix)).count();
     if !date_literals(bug).is_disjoint(&date_literals(fix)) {
-        return true;
+        return shared >= 1;
     }
-    status_terms(bug).intersection(&status_terms(fix)).count() >= 2
+    shared >= 2
 }
 
 /// Every surface form a word may take in a stored fact.
@@ -1476,6 +1481,89 @@ fn specific_entities(db: &Db, ids: &HashSet<i64>) -> Result<HashSet<i64>> {
     Ok(out)
 }
 
+/// Memories that share a specific entity with a seed, the seeds themselves
+/// excluded: the only ones whose cause can be about the same thing as the
+/// answer.
+fn related_memories(db: &Db, seeds: &[i64], specific: &HashSet<i64>) -> Result<HashSet<i64>> {
+    if specific.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let marks = |n: usize| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
+    let mut st = db.sql().prepare(&format!(
+        "SELECT DISTINCT a.memory_id FROM mentions a
+         JOIN mentions b ON b.entity_id=a.entity_id
+         WHERE b.memory_id IN ({}) AND a.memory_id NOT IN ({}) AND a.entity_id IN ({})",
+        marks(seeds.len()),
+        marks(seeds.len()),
+        marks(specific.len())
+    ))?;
+    let p: Vec<Box<dyn rusqlite::ToSql>> = seeds
+        .iter()
+        .chain(seeds.iter())
+        .chain(specific.iter())
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    let mut out = HashSet::new();
+    for id in st.query_map(params_from_iter(p.iter().map(|x| x.as_ref())), |r| {
+        r.get::<_, i64>(0)
+    })? {
+        out.insert(id?);
+    }
+    Ok(out)
+}
+
+/// The live cause relations that can explain the answer: those evidenced by
+/// one of `candidates`, plus those that end at a question anchor. The endpoint
+/// lists are literal placeholders so the plan is driven by `idx_relev_memory`
+/// and `idx_rel_src`/`idx_rel_dst` instead of a scan of every stored relation.
+fn cause_relation_query(
+    group: i64,
+    candidates: &[i64],
+    anchors: &[i64],
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let marks = |n: usize| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
+    let mut branches = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(group)];
+    if !candidates.is_empty() {
+        branches.push(format!(
+            "SELECT relation_id FROM relation_evidence WHERE memory_id IN ({})",
+            marks(candidates.len())
+        ));
+        params.extend(
+            candidates
+                .iter()
+                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
+        );
+    }
+    if !anchors.is_empty() {
+        branches.push(format!(
+            "SELECT id FROM relations WHERE src IN ({0}) OR dst IN ({0})",
+            marks(anchors.len())
+        ));
+        params.extend(
+            anchors
+                .iter()
+                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
+        );
+        params.extend(
+            anchors
+                .iter()
+                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
+        );
+    }
+    let sql = format!(
+        "SELECT r.id,r.valid_from,r.valid_to,r.expired_at,e.memory_id,r.src,r.dst
+         FROM relations r
+         JOIN predicates p ON p.id=r.predicate_id
+         JOIN relation_evidence e ON e.relation_id=r.id
+         WHERE COALESCE(NULLIF(p.group_id,0),p.id)=? AND r.polarity=1
+           AND r.id IN ({})
+         ORDER BY r.id,e.memory_id",
+        branches.join(" UNION ")
+    );
+    (sql, params)
+}
+
 /// H2-16: the cause of what the first pass answered. A why-question is about
 /// the cause of the memory that answered it, and that memory rarely repeats
 /// the cause relation, so follow the stored causal facts one step out from the
@@ -1519,19 +1607,22 @@ pub(crate) fn cause_follow(
         return Ok((Vec::new(), Vec::new()));
     }
     let specific = specific_entities(db, &seed_entities)?;
-    // Live cause relations and their evidence memories. A relation that ends
-    // at a question anchor is about the question by construction.
-    let mut st = db.sql().prepare(
-        "SELECT r.id,r.valid_from,r.valid_to,r.expired_at,e.memory_id,r.src,r.dst
-         FROM relations r
-         JOIN predicates p ON p.id=r.predicate_id
-         JOIN relation_evidence e ON e.relation_id=r.id
-         WHERE COALESCE(NULLIF(p.group_id,0),p.id)=?1 AND r.polarity=1
-         ORDER BY r.id,e.memory_id",
-    )?;
+    // Only a cause evidenced by a memory that shares a specific entity with a
+    // seed, or a relation that ends at a question anchor, can explain the
+    // answer. Seeding the query with those two sets keeps its cost with the
+    // seeds instead of every relation ever stored.
+    let mut candidates: Vec<i64> = related_memories(db, seeds, &specific)?
+        .into_iter()
+        .collect();
+    candidates.sort_unstable();
+    if candidates.is_empty() && anchors.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let (sql, params) = cause_relation_query(group, &candidates, anchors);
+    let mut st = db.sql().prepare(&sql)?;
     let mut pairs: Vec<(i64, i64)> = Vec::new();
     let mut anchored: HashSet<i64> = HashSet::new();
-    for row in st.query_map([group], |r| {
+    for row in st.query_map(params_from_iter(params.iter().map(|x| x.as_ref())), |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
@@ -1555,38 +1646,10 @@ pub(crate) fn cause_follow(
     }
     // The seeds stay in: a cause relation the answer itself evidences must
     // still render, it just does not need a channel entry.
-    let memories: Vec<i64> = pairs.iter().map(|(_, memory)| *memory).collect();
-    let mut mentioned: HashSet<i64> = HashSet::new();
-    if !specific.is_empty() && !memories.is_empty() {
-        // The cause memory must share a specific entity with a seed *other
-        // than itself*: an entity only the candidate mentions is not shared.
-        let marks = |n: usize| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
-        let mut st = db.sql().prepare(&format!(
-            "SELECT DISTINCT a.memory_id FROM mentions a
-             JOIN mentions b ON b.entity_id=a.entity_id
-             WHERE a.memory_id IN ({}) AND b.memory_id IN ({})
-               AND a.entity_id IN ({}) AND a.memory_id<>b.memory_id",
-            marks(memories.len()),
-            marks(seeds.len()),
-            marks(specific.len())
-        ))?;
-        let p: Vec<Box<dyn rusqlite::ToSql>> = memories
-            .iter()
-            .chain(seeds.iter())
-            .chain(specific.iter())
-            .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
-            .collect();
-        for id in st.query_map(
-            rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
-            |r| r.get::<_, i64>(0),
-        )? {
-            mentioned.insert(id?);
-        }
-    }
     let mut out_memories = Vec::new();
     let mut out_relations = Vec::new();
     for (relation, memory) in pairs {
-        if !(anchored.contains(&relation) || mentioned.contains(&memory)) {
+        if !(anchored.contains(&relation) || candidates.binary_search(&memory).is_ok()) {
             continue;
         }
         // The relation is rendered even when its evidence memory was already
@@ -2274,6 +2337,34 @@ mod tests {
             .map(|h| h.steps[0].relation_id)
             .collect();
         assert_eq!(only, vec![1, 2]);
+    }
+
+    /// D3: the cause follow must not scan every stored relation. The query is
+    /// seeded with the answer's related memories and the question's anchors,
+    /// so its cost follows the seeds, not the vault.
+    #[test]
+    fn the_cause_follow_does_not_scan_every_relation() {
+        let db = Db::open_in_memory().unwrap();
+        let (sql, params) = cause_relation_query(1, &[2, 3], &[4, 5]);
+        let mut st = db
+            .sql()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let plan: Vec<String> = st
+            .query_map(params_from_iter(params.iter().map(|x| x.as_ref())), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !plan.iter().any(|step| step.contains("SCAN r")),
+            "every relation is scanned: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|step| step.contains("idx_relev_memory")),
+            "the seed index is not used: {plan:?}"
+        );
     }
 }
 
