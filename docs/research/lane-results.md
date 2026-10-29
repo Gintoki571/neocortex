@@ -42,6 +42,7 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | nc-context | B8 context-inherited membership | inherited-mention precision 0.023 on world-300; aggregation gain 0; holdout breaks |
 | nc-split | B3 two-ended chain scoring | mh1 and blind three-hop -1 each; 1-core p50 +109%; UltraBERT hop cosines flat (0.206 vs 0.211 right/wrong) |
 | nc-chainx | cross-encoder verification of top chains | mh1 +2 (tuning set), blind and world-300 unchanged; p50 +51%, RSS +228 MB |
+| nc-hoplast (qoder) | `hop_last_open`: the semantic beam's last hop opens low-degree entities beyond the question's 100-nearest relations | world-300 three-hop recall 0.761 -> 0.812 (MRR -0.006, acc@10 1.000 both); fixtures/holdout/mh1/mh2 identical; private mh3 identical in every category at 0 and 8: no transfer, not merged (branch e2f4b72) |
 | nc-hop3 | read-side `hop_ended` knob for three-hop misses at world-3000 | 0.897 -> 0.974, but the misses were ER-08 false merges; fixed at the write side by nc-er08 (1.000), knob not needed |
 
 ## Where main stands (bf73846)
