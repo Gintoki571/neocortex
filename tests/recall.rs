@@ -891,7 +891,7 @@ fn every_fact_channel_renders_one_predicate_spelling() {
 }
 
 #[test]
-fn a_negative_fact_is_marked_by_polarity_not_a_not_string() {
+fn a_negative_fact_carries_polarity_and_explicit_not_string() {
     let e = engine(Arc::new(HashEmbedder));
     remember(&e, "Kepler does not use Redis.", |i| {
         i.entities = vec![entity("Kepler"), entity("Redis")];
@@ -916,7 +916,96 @@ fn a_negative_fact_is_marked_by_polarity_not_a_not_string() {
         .unwrap_or_else(|| panic!("no Redis fact in {:?}", out.facts));
     assert_eq!(fact.polarity, 0);
     assert_eq!(fact.predicate, "uses");
-    assert!(!fact.fact.contains("NOT"), "{}", fact.fact);
+    assert_eq!(fact.fact, "Kepler NOT uses Redis");
+
+    // follow also carries polarity 0 and the explicit NOT fact string
+    let fol = paths::follow(
+        &e,
+        &paths::FollowInput {
+            from: "Kepler".into(),
+            depth: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let ffact = fol
+        .facts
+        .iter()
+        .find(|f| f.target == "Redis")
+        .unwrap_or_else(|| panic!("no Redis follow fact in {:?}", fol.facts));
+    assert_eq!(ffact.polarity, 0);
+    assert_eq!(ffact.predicate, "uses");
+    assert_eq!(ffact.fact, "Kepler NOT uses Redis");
+
+    // aggregate negative bucket also carries the explicit NOT fact string
+    let agg = paths::aggregate(
+        &e,
+        &paths::AggregateInput {
+            target: Some("Redis".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let neg = agg
+        .negative
+        .iter()
+        .find(|item| item.name == "Kepler")
+        .unwrap_or_else(|| panic!("no Kepler in negative aggregate {:?}", agg.negative));
+    assert!(
+        neg.facts.contains(&"Kepler NOT uses Redis".to_string()),
+        "{:?}",
+        neg.facts
+    );
+}
+
+#[test]
+fn replaced_by_renders_explicit_negation_marker() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Kepler uses Redis.", |i| {
+        i.valid_from = Some("2026-01-01".into());
+        i.entities = vec![entity("Kepler"), entity("Redis")];
+        i.relations = vec![RelationIn {
+            source: "Kepler".into(),
+            predicate: "uses".into(),
+            target: "Redis".into(),
+            exclusive: Some(true),
+            ..Default::default()
+        }];
+    });
+    remember(&e, "Kepler does not use Redis.", |i| {
+        i.valid_from = Some("2026-03-01".into());
+        i.entities = vec![entity("Kepler"), entity("Redis")];
+        i.relations = vec![RelationIn {
+            source: "Kepler".into(),
+            predicate: "uses".into(),
+            target: "Redis".into(),
+            negated: Some(true),
+            ..Default::default()
+        }];
+    });
+    let out = e
+        .recall(&RecallInput {
+            query: "Kepler Redis".into(),
+            include_history: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let old_fact = out
+        .facts
+        .iter()
+        .find(|f| f.ended)
+        .unwrap_or_else(|| panic!("no ended fact in {:?}", out.facts));
+    let (_, repl_fact) = old_fact
+        .replaced_by
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected replaced_by in {:?}", old_fact));
+    assert_eq!(repl_fact, "Kepler NOT uses Redis");
+
+    let text = neocortex::render::render_recall(&out, &|t| t.to_string());
+    assert!(
+        text.contains("replaced by r2: Kepler NOT uses Redis"),
+        "{text}"
+    );
 }
 
 #[test]

@@ -1701,9 +1701,13 @@ fn write_prepared(
             1
         };
         if relation.fact.is_none() && (swap || polarity == 0) {
-            // Polarity carries negation, not the text: JSON facts expose it as
-            // `polarity: 0` and the text renderer draws the `—NOT` arrow.
-            fact = format!("{} {} {}", src_name, pred.display, dst_name);
+            fact = format!(
+                "{}{} {} {}",
+                src_name,
+                if polarity == 0 { " NOT" } else { "" },
+                pred.display,
+                dst_name
+            );
         }
         // Relations this one ends; each gets ended_by = this relation.
         let mut ended_here: Vec<i64> = Vec::new();

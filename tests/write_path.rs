@@ -2897,3 +2897,32 @@ fn a_shared_short_alias_never_merges_two_different_full_names() {
     );
     assert_eq!(short.entities[0].id, mota.entities[0].id);
 }
+
+#[test]
+fn remember_reply_for_negated_relation_states_negation() {
+    let e = engine();
+    let out = remember(
+        &e,
+        "Kepler does not use Redis.",
+        vec![
+            EntityIn {
+                name: "Kepler".into(),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Redis".into(),
+                ..Default::default()
+            },
+        ],
+        vec![RelationIn {
+            source: "Kepler".into(),
+            predicate: "uses".into(),
+            target: "Redis".into(),
+            negated: Some(true),
+            ..Default::default()
+        }],
+    );
+    assert_eq!(out.relations.len(), 1);
+    assert_eq!(out.relations[0].fact, "Kepler NOT uses Redis");
+    assert_eq!(out.relations[0].status, "new");
+}

@@ -220,7 +220,7 @@ fn inferred_negation_ends_positive_and_flip_back_ends_negative() {
                 |r| r.get(0),
             )
             .unwrap();
-    assert_eq!(fact, "Alice likes jazz");
+    assert_eq!(fact, "Alice NOT likes jazz");
     let again = e
         .remember(likes("Alice likes jazz again.", T0 + 200, None))
         .unwrap();

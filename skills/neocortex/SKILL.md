@@ -74,9 +74,8 @@ Store something when it will still matter next week:
   `causal_extract` text-cue extractor is an eval-only knob (off); a cause you
   do not pass is not stored.
 - **Negation**: pass `negated: true` for "does not support Y"; it renders as
-  `—NOT→` and ends the matching positive interval. JSON facts carry the same
-  information as `"polarity": 0`; their `fact` text is the positive reading, so
-  read `polarity` (or the `—NOT→` arrow in text) instead of string-matching.
+  `—NOT→` and ends the matching positive interval. JSON facts carry `"polarity": 0`
+  next to the explicit negative `fact` text.
 - **Nicknames are aliases**: `{"source": "Robert Okafor", "predicate":
   "nickname", "target": "Bob"}` stores no fact; the target becomes another name
   of the same entity (prefer `entities[].aliases`). Any relation whose two ends
