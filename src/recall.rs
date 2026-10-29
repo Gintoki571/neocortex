@@ -232,6 +232,48 @@ fn is_ended(row: &MemoryRow, cutoff: i64) -> bool {
     row.10.is_some_and(|x| x <= cutoff) || row.11.is_some()
 }
 
+/// True when the memory states its own interval and that interval misses `w`
+/// (half-open overlap, the same rule as `since`/`until`). A row whose
+/// valid_from is only its ingest time has no stated interval: it is never
+/// outside a window, because nobody said when it happened. An event without an
+/// end happens at its start, so it belongs to the window that contains that
+/// start; anything else without an end is still true and overlaps later
+/// windows.
+fn dated_outside(row: &MemoryRow, w: &temporal::Window) -> bool {
+    let stated = row.10.is_some() || row.9 != row.8;
+    if !stated {
+        return false;
+    }
+    match row.10 {
+        Some(to) => row.9 >= w.end || to <= w.start,
+        None => row.2 == "event" && !(w.start <= row.9 && row.9 < w.end),
+    }
+}
+
+/// A window filters only when the question scopes itself to it ("in August
+/// 2026", "during 2025", "on 2026-08-01"). A bare month that modifies a noun
+/// ("the December conference") dates the subject, not the search, so it stays a
+/// ranking boost.
+fn window_scope(w: &temporal::Window) -> bool {
+    let matched = text::fold(&w.matched);
+    let lead = matched.split_whitespace().next().unwrap_or("");
+    matches!(
+        lead,
+        "in" | "during"
+            | "over"
+            | "throughout"
+            | "within"
+            | "on"
+            | "since"
+            | "before"
+            | "after"
+            | "between"
+            | "from"
+    ) || matched
+        .split(|c: char| !c.is_ascii_digit())
+        .any(|run| run.len() == 4)
+}
+
 /// A planned row is shown for a future-event question only when it is about
 /// the same thing: at least two non-stopword query tokens (3+ chars) appear in
 /// its text.
@@ -1423,6 +1465,17 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let mut candidates = Vec::new();
     for f in fused {
         let Some(row) = rows.get(&f.id) else { continue };
+        // H2-10: a calendar window in the question is a filter, not only a
+        // boost. A row that states its own interval and misses the window is
+        // not an answer to "what happened in August 2026"; a row dated only by
+        // its ingest time has no stated interval and stays, ranked as before.
+        if as_of.is_none()
+            && window
+                .as_ref()
+                .is_some_and(|w| window_scope(w) && dated_outside(row, w))
+        {
+            continue;
+        }
         let mut score = f.score;
         if is_ended(row, cutoff) {
             if !history {
@@ -1493,7 +1546,9 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             tokens_used: 0,
             tokens_budget: budget,
             omitted: 0,
-            window_empty: false,
+            // A window that filtered every candidate out is as empty as one
+            // that overlapped nothing.
+            window_empty,
             over_budget: false,
         });
     }

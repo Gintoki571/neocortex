@@ -142,6 +142,10 @@ and `next:` when present.
   plans ("upcoming", "planned", "scheduled"), names a future window, or asks
   about that event ("when does the deploy freeze start", "is the v1 API
   deprecated").
+- A month, year or date range in the question is a window: memories whose
+  stored dates fall outside it are dropped, while memories with no stated date
+  still appear (their `valid_from` is only when they were written), so check the
+  date on each line before answering "what happened in August".
 - A memory-lapse phrasing ("I don't remember ...", "I forgot ...", "remind me
   ...") is a request, not a negation: pass the question itself to recall.
 - An exclusion question ("which service is not in Rust", "what database does

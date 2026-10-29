@@ -222,7 +222,11 @@ says what to fix.
 
 `overview` runs deterministic Leiden community detection over the live graph
 (the same seed always gives the same partition; `cN` ids are matched to the
-previous run by member overlap). Each community is summarised without an LLM:
+previous run by member overlap). A mention counts by how selective it is
+(`1/sqrt(deg(memory)·deg(entity))`), so a hub that hundreds of memories mention
+still lands with the entities its relations name, and a community that would
+hold one entity alone is attached to the community holding most of that
+entity's live relations. Each community is summarised without an LLM:
 a label of its highest-degree entities, its size, the most common live
 predicates, the date span of its memories, three central facts and a
 representative memory. `entity` cards carry the same community as
@@ -246,7 +250,9 @@ recall — is in [`skills/neocortex/SKILL.md`](skills/neocortex/SKILL.md).
 Four channels run in parallel: **BM25** over memory text and tags, **vector**
 KNN over UltraBERT embeddings, **graph** personalized PageRank over entities,
 memories and relations, and **temporal** overlap with a time window parsed from
-the query. Their ranked lists are fused with weighted RRF, then lightly
+the query. A window also filters: a memory that states its own dates and falls
+outside the window is not returned, while a memory dated only by its ingest
+time stays. Their ranked lists are fused with weighted RRF, then lightly
 adjusted for recency, importance and whether a fact is ended. MMR removes
 near-duplicates and the result is packed into a token budget, whole items only.
 

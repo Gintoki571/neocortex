@@ -282,6 +282,21 @@ pub fn snapshot_with(
     include_ended: bool,
     name_parts: bool,
 ) -> Result<Snapshot> {
+    build_snapshot(db, as_of, include_ended, name_parts, false)
+}
+
+/// `selective_mentions` weights every mention edge by
+/// `1/sqrt(deg(memory) * deg(entity))` instead of 1: a mention counts by how
+/// selective it is, so a hub that hundreds of memories mention stops
+/// out-weighing the entity-entity relations that say what it is. Used by
+/// community detection only (PPR keeps the flat snapshot).
+fn build_snapshot(
+    db: &Db,
+    as_of: Option<i64>,
+    include_ended: bool,
+    name_parts: bool,
+    selective_mentions: bool,
+) -> Result<Snapshot> {
     let mut nodes = Vec::new();
     let mut mem_node = HashMap::new();
     let mut ent_node = HashMap::new();
@@ -310,12 +325,29 @@ pub fn snapshot_with(
         }
     }
     let mut edges = Vec::new();
+    let mut ments: Vec<(u32, u32)> = Vec::new();
     let mut st = db
         .sql()
         .prepare("SELECT memory_id,entity_id FROM mentions")?;
     for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
         let (m, e) = row?;
         if let (Some(&a), Some(&b)) = (mem_node.get(&m), ent_node.get(&e)) {
+            ments.push((a, b));
+        }
+    }
+    if selective_mentions {
+        let mut mem_deg: HashMap<u32, f32> = HashMap::new();
+        let mut ent_deg: HashMap<u32, f32> = HashMap::new();
+        for &(a, b) in &ments {
+            *mem_deg.entry(a).or_insert(0.0) += 1.0;
+            *ent_deg.entry(b).or_insert(0.0) += 1.0;
+        }
+        for &(a, b) in &ments {
+            let w = 1.0 / (mem_deg[&a] * ent_deg[&b]).sqrt();
+            edges.push((a, b, w));
+        }
+    } else {
+        for &(a, b) in &ments {
             edges.push((a, b, 1.0));
         }
     }
@@ -396,9 +428,82 @@ pub fn snapshot_with(
 /// partition, so ids only change when the graph does.
 const COMMUNITY_SEED: u64 = 7;
 
+/// H2-19: modularity isolates a hub. On the project scenario the hub carries 53
+/// mention edges against 6.2 of relation weight, so the best cut puts it alone
+/// in a community labelled by itself while its facts sit in other communities.
+/// A one-entity community groups nothing: attach it to the community that holds
+/// most of that entity's live relations (ties: more evidence, then the lowest
+/// community id). Entities without a live relation stay where they are; the
+/// pass is deterministic and leaves Leiden's partition otherwise untouched.
+fn attach_singletons(db: &Db, snap: &Snapshot, partition: &mut [u32]) -> Result<()> {
+    let mut live: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
+    {
+        let mut st = db.sql().prepare(
+            "SELECT src,dst,evidence_count FROM relations
+             WHERE valid_to IS NULL AND expired_at IS NULL",
+        )?;
+        for row in st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (src, dst, evidence) = row?;
+            if src == dst {
+                continue;
+            }
+            live.entry(src).or_default().push((dst, evidence));
+            live.entry(dst).or_default().push((src, evidence));
+        }
+    }
+    let mut members: HashMap<u32, usize> = HashMap::new();
+    for &node in snap.ent_node.values() {
+        *members.entry(partition[node as usize]).or_insert(0) += 1;
+    }
+    let mut entities: Vec<(i64, u32)> = snap.ent_node.iter().map(|(&e, &n)| (e, n)).collect();
+    entities.sort_unstable_by_key(|&(entity, _)| entity);
+    for (entity, node) in entities {
+        let own = partition[node as usize];
+        if members.get(&own).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let Some(neighbours) = live.get(&entity) else {
+            continue;
+        };
+        let mut score: HashMap<u32, (usize, i64)> = HashMap::new();
+        for &(other, evidence) in neighbours {
+            let Some(&onode) = snap.ent_node.get(&other) else {
+                continue;
+            };
+            let community = partition[onode as usize];
+            if community == own {
+                continue;
+            }
+            let entry = score.entry(community).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += evidence;
+        }
+        let best = score.into_iter().max_by(|a, b| {
+            a.1 .0
+                .cmp(&b.1 .0)
+                .then_with(|| a.1 .1.cmp(&b.1 .1))
+                .then_with(|| b.0.cmp(&a.0))
+        });
+        let Some((target, _)) = best else {
+            continue;
+        };
+        partition[node as usize] = target;
+        members.insert(own, 0);
+        *members.entry(target).or_insert(0) += 1;
+    }
+    Ok(())
+}
+
 pub fn communities(db: &Db) -> Result<HashMap<i64, i64>> {
-    let snap = snapshot(db, None, false)?;
-    let partition = crate::graph::leiden(&snap.csr, COMMUNITY_SEED, 1.0);
+    let snap = build_snapshot(db, None, false, true, true)?;
+    let mut partition = crate::graph::leiden(&snap.csr, COMMUNITY_SEED, 1.0);
+    attach_singletons(db, &snap, &mut partition)?;
     let mut current: HashMap<i64, u32> = HashMap::with_capacity(snap.ent_node.len());
     for (&entity, &node) in &snap.ent_node {
         current.insert(entity, partition[node as usize]);

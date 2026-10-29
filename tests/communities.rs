@@ -214,3 +214,62 @@ fn entity_card_carries_its_community() {
         .iter()
         .all(|e| e.community.is_none()));
 }
+
+// H2-19: the strongest hub used to become a singleton community of its own
+// because every memory that mentions it pulls it with a full-weight edge,
+// while its entity-entity relations weigh less. A hub must land in the
+// community that holds its relations.
+#[test]
+fn hub_joins_the_community_of_its_relations() {
+    let engine = engine();
+    let chatter = [
+        "The Lumen backlog grew again this week.",
+        "A Lumen user reported a slow screen.",
+        "Lumen release notes are due on Friday.",
+        "The Lumen dashboard needs a new colour.",
+        "Someone asked about Lumen pricing.",
+        "Lumen onboarding copy is too long.",
+        "The Lumen logo needs a vector version.",
+        "Lumen support hours move to CET.",
+        "A Lumen demo is booked for Thursday.",
+        "The Lumen roadmap slide is out of date.",
+        "Lumen documentation misses a glossary.",
+        "The Lumen newsletter goes out monthly.",
+    ];
+    for content in chatter {
+        engine
+            .remember(RememberInput {
+                content: content.into(),
+                entities: vec![named("Lumen")],
+                valid_from: Some(EARLIER.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    for (tool, content) in [
+        ("tokio", "Lumen runs its background jobs on tokio."),
+        ("axum", "Lumen serves HTTP through axum."),
+        ("SQLite", "Lumen stores its state in SQLite."),
+    ] {
+        engine
+            .remember(RememberInput {
+                content: content.into(),
+                entities: vec![named("Lumen"), named(tool)],
+                relations: vec![rel("Lumen", "depends on", tool)],
+                valid_from: Some(EARLIER.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let out = engine.overview(None, 10).unwrap();
+    let map = mapping(&engine);
+    let hub = map["Lumen"];
+    let with_tool = ["tokio", "axum", "SQLite"]
+        .iter()
+        .filter(|t| map[**t] == hub)
+        .count();
+    assert!(
+        with_tool >= 2,
+        "hub is not with its relations: {map:?} ({out:?})"
+    );
+}
