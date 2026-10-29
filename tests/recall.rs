@@ -1450,6 +1450,267 @@ fn a_why_question_follows_the_cause_of_the_answering_memory() {
 }
 
 #[test]
+fn status_intent_needs_a_defect_in_the_question() {
+    for query in [
+        "what bug is still open in lumen",
+        "which issues are unresolved",
+        "what is still broken",
+        "what is still failing in the sync loop",
+        "which bugs are not fixed yet",
+        "any open bugs in lumen",
+        "what defects are outstanding",
+        "which crashes are unresolved",
+        "which incident tickets are still open for the 500 error",
+    ] {
+        assert!(paths::status_intent(query), "{query:?}");
+    }
+    // "still open" / "outstanding" describe a state, not a defect: a plain
+    // question about an API or a PR is not a status question.
+    for query in [
+        "is the API still open to the public",
+        "is the API gateway still open to the public",
+        "which PRs are outstanding",
+        "is the office still open on fridays",
+        "which tickets are outstanding for the offsite",
+        "what is the open question about workspaces",
+    ] {
+        assert!(!paths::status_intent(query), "{query:?}");
+    }
+}
+
+#[test]
+fn an_open_ended_question_is_not_a_status_question() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    let api = remember(
+        &e,
+        "The API is open to the public; anonymous requests are rate limited to 60 per minute.",
+        |i| {
+            i.entities = vec![entity("API")];
+        },
+    );
+    let gateway = remember(
+        &e,
+        "The API gateway is open to the public and routes anonymous traffic to the billing service.",
+        |i| {
+            i.entities = vec![entity("API gateway")];
+        },
+    );
+    let pr = remember(
+        &e,
+        "PR 412 adds the export endpoint and is awaiting review.",
+        |i| {
+            i.entities = vec![entity("PR 412")];
+        },
+    );
+    // Unrelated defect reports in the same database.
+    remember(
+        &e,
+        "The ingest worker failed with a 500 error on 2026-10-02.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-02".into());
+        },
+    );
+    remember(
+        &e,
+        "The smoke test failed against staging on 2026-10-03.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-03".into());
+        },
+    );
+    for (query, allowed) in [
+        ("is the API still open to the public", [api, gateway]),
+        (
+            "is the API gateway still open to the public",
+            [gateway, api],
+        ),
+        ("which PRs are outstanding", [pr, pr]),
+    ] {
+        let on = e
+            .recall(&RecallInput {
+                query: query.into(),
+                k: Some(8),
+                ..Default::default()
+            })
+            .unwrap();
+        let shown: Vec<(i64, &str)> = on
+            .memories
+            .iter()
+            .map(|m| (m.id, m.content.as_str()))
+            .collect();
+        assert!(
+            on.memories.first().is_some_and(|m| allowed.contains(&m.id)),
+            "{query:?}: {shown:?}"
+        );
+        e.cfg.status_rank = false;
+        let base = e
+            .recall(&RecallInput {
+                query: query.into(),
+                k: Some(8),
+                ..Default::default()
+            })
+            .unwrap();
+        e.cfg.status_rank = true;
+        assert_eq!(ids(&on), ids(&base), "{query:?}: {shown:?}");
+    }
+}
+
+#[test]
+fn an_unfixed_crash_report_is_ranked_as_open() {
+    let e = engine(Arc::new(HashEmbedder));
+    let crash = remember(
+        &e,
+        "The nightly export crashes with a null pointer in the CSV writer.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-15".into());
+        },
+    );
+    remember(
+        &e,
+        "The nightly export writes one CSV file per table to the export bucket.",
+        |i| {
+            i.kind = Some("fact".into());
+            i.valid_from = Some("2026-10-14".into());
+        },
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "what is still broken in the export".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert!(
+        has_reason(&out, crash, "status"),
+        "not ranked as open: {shown:?}"
+    );
+    assert_eq!(out.memories.first().map(|m| m.id), Some(crash), "{shown:?}");
+}
+
+#[test]
+fn a_why_question_renders_each_cause_fact_once() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(
+        &e,
+        "The 2026-08-14 outage was caused by a retry storm from the payments client.",
+        |i| {
+            i.entities = vec![service("payments client")];
+            i.relations = vec![relation(
+                "retry storm",
+                "caused",
+                "2026-08-14 outage",
+                "retry storm caused 2026-08-14 outage",
+            )];
+        },
+    );
+    remember(
+        &e,
+        "Mira Shah reviewed the incident report afterwards.",
+        |i| {
+            i.entities = vec![entity("Mira Shah")];
+        },
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "why did the retry storm cause the 2026-08-14 outage".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let lines: Vec<&str> = out.facts.iter().map(|f| f.fact.as_str()).collect();
+    let mut unique: Vec<i64> = out.facts.iter().map(|f| f.id).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        out.facts.len(),
+        "duplicate fact lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|f| f.contains("retry storm")),
+        "the cause fact must be rendered: {lines:?}"
+    );
+}
+
+#[test]
+fn a_why_question_ignores_a_cause_that_only_shares_a_hub_entity() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    let slow = remember(
+        &e,
+        "The search service got slow after the 2026-10-10 deploy; p99 latency went from 80 ms to 900 ms.",
+        |i| {
+            i.entities = vec![service("search service"), entity("Platform team")];
+        },
+    );
+    let storm = remember(
+        &e,
+        "The 2026-10-11 retry storm hit the payments client.",
+        |i| {
+            i.entities = vec![service("payments client"), entity("Platform team")];
+            i.relations = vec![relation(
+                "retry storm",
+                "caused",
+                "payments client outage",
+                "retry storm caused payments client outage",
+            )];
+        },
+    );
+    // The team is a hub: every standup note mentions it, so sharing it says
+    // nothing about what caused the search slowdown.
+    for day in 1..=6 {
+        remember(
+            &e,
+            &format!("Platform team standup on 2026-10-{day:02} covered the on-call rotation."),
+            |i| {
+                i.entities = vec![entity("Platform team")];
+            },
+        );
+    }
+    let out = e
+        .recall(&RecallInput {
+            query: "why is the search service slow".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert_eq!(out.memories.first().map(|m| m.id), Some(slow), "{shown:?}");
+    assert!(
+        !has_reason(&out, storm, "cause"),
+        "hub cause followed: {shown:?}"
+    );
+    // Nothing about the hub-only cause reaches the answer, facts included.
+    let facts_on: Vec<i64> = out.facts.iter().map(|f| f.id).collect();
+    e.cfg.cause_follow = false;
+    let base = e
+        .recall(&RecallInput {
+            query: "why is the search service slow".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    e.cfg.cause_follow = true;
+    assert_eq!(ids(&out), ids(&base), "{shown:?}");
+    assert_eq!(
+        facts_on,
+        base.facts.iter().map(|f| f.id).collect::<Vec<_>>(),
+        "{:?}",
+        out.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn a_why_question_without_causes_is_unchanged() {
     let mut e = engine(Arc::new(HashEmbedder));
     remember(

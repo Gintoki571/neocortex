@@ -306,8 +306,10 @@ pub fn causal_intent(query: &str) -> bool {
         || q.contains("how come")
 }
 
-/// H2-15: a question that asks which bugs are *unresolved* ("still open",
-/// "not fixed yet"). "open question" is not a bug status.
+/// H2-15: a question that asks which defects are *unresolved* ("still open",
+/// "not fixed yet"). The question must name a defect of its own: "is the API
+/// still open to the public" and "which PRs are outstanding" describe a
+/// state, not a bug. "open question" is not a bug status.
 pub fn status_intent(query: &str) -> bool {
     let q = text::fold(query);
     // An open question is a pending decision, not an open defect: the lexical
@@ -338,28 +340,87 @@ pub fn status_intent(query: &str) -> bool {
         "remaining bug",
         "remaining issue",
     ];
-    CUES.iter().any(|cue| q.contains(cue))
+    if !CUES.iter().any(|cue| q.contains(cue)) {
+        return false;
+    }
+    // A predicate that can only be about a defect asks for one on its own
+    // ("what is still broken", "what is left to fix").
+    const ASKS_DEFECT: &[&str] = &[
+        "still broken",
+        "still failing",
+        "still crashing",
+        "left to fix",
+        "unfixed",
+        "not fixed",
+        "not yet fixed",
+        "not been fixed",
+    ];
+    if ASKS_DEFECT.iter().any(|cue| q.contains(cue)) {
+        return true;
+    }
+    // Otherwise the question names the defect it asks about.
+    const DEFECT_NOUNS: &[&str] = &[
+        "bug",
+        "bugs",
+        "issue",
+        "issues",
+        "defect",
+        "defects",
+        "crash",
+        "crashes",
+        "regression",
+        "regressions",
+        "error",
+        "errors",
+        "failure",
+        "failures",
+    ];
+    let tokens = text::tokens(&q);
+    if tokens
+        .iter()
+        .any(|token| DEFECT_NOUNS.contains(&token.as_str()))
+    {
+        return true;
+    }
+    // A ticket or an incident is a defect only when the question says so too
+    // ("which incident tickets are still open for the 500 error").
+    const CONTAINERS: &[&str] = &["ticket", "tickets", "incident", "incidents"];
+    tokens
+        .iter()
+        .any(|token| CONTAINERS.contains(&token.as_str()))
+        && has_cue(&q, BUG_CUES)
 }
 
 /// Tokens that report a defect ("Bug on ...", "Error on ...", "the sync loop
-/// panicked").
+/// panicked", "the nightly export crashes"). Inflections matter: an agent
+/// writes "crashes", "fails" or "can't" far more often than "crashed".
 const BUG_CUES: &[&str] = &[
     "bug",
     "bugs",
     "broken",
     "regression",
+    "regressions",
     "panic",
     "panicked",
     "crash",
+    "crashes",
+    "crashing",
     "crashed",
     "error",
     "errors",
     "fail",
+    "fails",
     "failed",
     "failing",
     "failure",
+    "failures",
     "defect",
     "defects",
+    "hang",
+    "hangs",
+    "hanging",
+    "cannot",
+    "cant",
 ];
 
 /// Tokens that say a defect was dealt with ("Fix for ...", "resolved",
@@ -378,9 +439,10 @@ const STATUS_GENERIC: &[&str] = &[
 ];
 
 fn has_cue(text: &str, cues: &[&str]) -> bool {
-    text::tokens(text)
-        .iter()
-        .any(|token| cues.contains(&token.as_str()))
+    text::tokens(text).iter().any(|token| {
+        // "can't" and "can’t" are the same report as "cant".
+        cues.contains(&token.as_str()) || cues.contains(&bare_word(token).as_str())
+    })
 }
 
 /// A memory that reports a defect, not one that fixes or releases past it.
@@ -1306,15 +1368,53 @@ pub(crate) fn causal_memories(
     Ok(out)
 }
 
+/// An entity is a hub when many memories mention it *and* it is a large share
+/// of the database: a team, a product, the company. A cause that shares only
+/// a hub with the answer is about something else.
+const HUB_MENTIONS: i64 = 8;
+const HUB_SHARE: i64 = 8;
+
+/// The entities of the seeds that are specific to them. Everything a broad
+/// entity touches is connected to everything else through it, so a shared hub
+/// is no evidence of a shared cause.
+fn specific_entities(db: &Db, ids: &HashSet<i64>) -> Result<HashSet<i64>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let total: i64 = db
+        .sql()
+        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
+    let marks = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut st = db.sql().prepare(&format!(
+        "SELECT entity_id,COUNT(DISTINCT memory_id) FROM mentions
+         WHERE entity_id IN ({marks}) GROUP BY entity_id"
+    ))?;
+    let mut out = HashSet::new();
+    for row in st.query_map(params_from_iter(ids.iter()), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    })? {
+        let (id, mentions) = row?;
+        if mentions < HUB_MENTIONS || mentions * HUB_SHARE <= total {
+            out.insert(id);
+        }
+    }
+    Ok(out)
+}
+
 /// H2-16: the cause of what the first pass answered. A why-question is about
 /// the cause of the memory that answered it, and that memory rarely repeats
 /// the cause relation, so follow the stored causal facts one step out from the
-/// seeds: an evidence memory of a live `cause` relation that mentions one of
-/// their entities (or is a temporal memory link of one) is the cause.
+/// seeds: an evidence memory of a live `cause` relation is the cause when the
+/// relation ends at a question anchor, or when that memory mentions an entity
+/// the answer is specific about. A cause that shares only a hub entity (a
+/// team) is about something else.
 /// Returns the cause memories and the relations to render, in id order.
 pub(crate) fn cause_follow(
     db: &Db,
     seeds: &[i64],
+    anchors: &[i64],
     vis: Visibility,
     limit: usize,
 ) -> Result<(Vec<i64>, Vec<i64>)> {
@@ -1345,9 +1445,11 @@ pub(crate) fn cause_follow(
     if seed_entities.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    // Live cause relations and their evidence memories.
+    let specific = specific_entities(db, &seed_entities)?;
+    // Live cause relations and their evidence memories. A relation that ends
+    // at a question anchor is about the question by construction.
     let mut st = db.sql().prepare(
-        "SELECT r.id,r.valid_from,r.valid_to,r.expired_at,e.memory_id
+        "SELECT r.id,r.valid_from,r.valid_to,r.expired_at,e.memory_id,r.src,r.dst
          FROM relations r
          JOIN predicates p ON p.id=r.predicate_id
          JOIN relation_evidence e ON e.relation_id=r.id
@@ -1355,6 +1457,7 @@ pub(crate) fn cause_follow(
          ORDER BY r.id,e.memory_id",
     )?;
     let mut pairs: Vec<(i64, i64)> = Vec::new();
+    let mut anchored: HashSet<i64> = HashSet::new();
     for row in st.query_map([group], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -1362,11 +1465,16 @@ pub(crate) fn cause_follow(
             r.get::<_, Option<i64>>(2)?,
             r.get::<_, Option<i64>>(3)?,
             r.get::<_, i64>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, i64>(6)?,
         ))
     })? {
-        let (relation, from, to, expired, memory) = row?;
+        let (relation, from, to, expired, memory, src, dst) = row?;
         if vis.shows(from, to, expired) {
             pairs.push((relation, memory));
+            if anchors.contains(&src) || anchors.contains(&dst) {
+                anchored.insert(relation);
+            }
         }
     }
     if pairs.is_empty() {
@@ -1376,60 +1484,36 @@ pub(crate) fn cause_follow(
     // still render, it just does not need a channel entry.
     let memories: Vec<i64> = pairs.iter().map(|(_, memory)| *memory).collect();
     let mut mentioned: HashSet<i64> = HashSet::new();
-    let mut linked: HashSet<i64> = HashSet::new();
-    if !memories.is_empty() {
-        let marks = std::iter::repeat_n("?", memories.len())
-            .collect::<Vec<_>>()
-            .join(",");
+    if !specific.is_empty() && !memories.is_empty() {
+        // The cause memory must share a specific entity with a seed *other
+        // than itself*: an entity only the candidate mentions is not shared.
+        let marks = |n: usize| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
         let mut st = db.sql().prepare(&format!(
-            "SELECT DISTINCT memory_id FROM mentions
-             WHERE memory_id IN ({marks}) AND entity_id IN ({})",
-            std::iter::repeat_n("?", seed_entities.len())
-                .collect::<Vec<_>>()
-                .join(",")
+            "SELECT DISTINCT a.memory_id FROM mentions a
+             JOIN mentions b ON b.entity_id=a.entity_id
+             WHERE a.memory_id IN ({}) AND b.memory_id IN ({})
+               AND a.entity_id IN ({}) AND a.memory_id<>b.memory_id",
+            marks(memories.len()),
+            marks(seeds.len()),
+            marks(specific.len())
         ))?;
-        let mut p: Vec<Box<dyn rusqlite::ToSql>> = memories
+        let p: Vec<Box<dyn rusqlite::ToSql>> = memories
             .iter()
+            .chain(seeds.iter())
+            .chain(specific.iter())
             .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
             .collect();
-        p.extend(
-            seed_entities
-                .iter()
-                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-        );
         for id in st.query_map(
             rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
             |r| r.get::<_, i64>(0),
         )? {
             mentioned.insert(id?);
         }
-        // The same expansion E4a writes: a link means the two memories share an
-        // entity and happened within a day of each other.
-        let mut st = db.sql().prepare(&format!(
-            "SELECT a,b FROM memory_links WHERE a IN ({marks}) OR b IN ({marks})"
-        ))?;
-        for row in st.query_map(
-            rusqlite::params_from_iter(
-                memories
-                    .iter()
-                    .chain(memories.iter())
-                    .map(|id| id as &dyn rusqlite::ToSql),
-            ),
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-        )? {
-            let (a, b) = row?;
-            if seeds.contains(&a) {
-                linked.insert(b);
-            }
-            if seeds.contains(&b) {
-                linked.insert(a);
-            }
-        }
     }
     let mut out_memories = Vec::new();
     let mut out_relations = Vec::new();
     for (relation, memory) in pairs {
-        if !(mentioned.contains(&memory) || linked.contains(&memory)) {
+        if !(anchored.contains(&relation) || mentioned.contains(&memory)) {
             continue;
         }
         // The relation is rendered even when its evidence memory was already
@@ -2060,6 +2144,23 @@ mod tests {
             coverage: 1,
             score,
         }
+    }
+
+    #[test]
+    fn defect_cues_cover_report_inflections() {
+        for report in [
+            "The nightly export crashes with a null pointer in the CSV writer.",
+            "The export cannot finish when the CSV writer sees a null.",
+            "The export can't finish when the CSV writer sees a null.",
+            "The nightly export fails on the last row.",
+            "The sync loop hangs when two devices write at once.",
+            "The sync loop is broken on Windows.",
+        ] {
+            assert!(is_bug_memory(report), "{report:?}");
+        }
+        // A fix note is a bug memory with a fix cue, never an open report.
+        assert!(has_fix_cue("Fixed the export crash in the CSV writer."));
+        assert!(!is_bug_memory("Lumen is written in Rust."));
     }
 
     #[test]

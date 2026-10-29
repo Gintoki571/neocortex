@@ -1495,7 +1495,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             .take(CAUSE_SEEDS)
             .map(|f| f.id)
             .collect();
-        paths::cause_follow(&engine.db, &seeds, vis, 6)?
+        paths::cause_follow(&engine.db, &seeds, &anchors.all(), vis, 6)?
     } else {
         (Vec::new(), Vec::new())
     };
@@ -1549,6 +1549,20 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         HashMap::new()
     };
     let cutoff = as_of.unwrap_or(now);
+    // H2-15: a memory that matches the question better than every defect
+    // report is an answer, not a near miss, and is never demoted.
+    let best_bug = if status_query {
+        fused
+            .iter()
+            .filter(|f| {
+                rows.get(&f.id)
+                    .is_some_and(|row| paths::is_bug_memory(&row.1))
+            })
+            .map(|f| f.score)
+            .fold(0.0, f64::max)
+    } else {
+        0.0
+    };
     let mut candidates = Vec::new();
     for f in fused {
         let Some(row) = rows.get(&f.id) else { continue };
@@ -1577,10 +1591,14 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             score *= EXCLUSION_PENALTY;
         }
         if status_query {
-            if !paths::is_bug_memory(&row.1) {
+            if paths::is_bug_memory(&row.1) {
+                if status_closed.contains(&f.id) {
+                    score *= STATUS_CLOSED_PENALTY;
+                }
+            } else if f.score < best_bug {
+                // Only the memories that no defect report outranks: a plain
+                // answer the question matches better keeps its place.
                 score *= STATUS_NEUTRAL_PENALTY;
-            } else if status_closed.contains(&f.id) {
-                score *= STATUS_CLOSED_PENALTY;
             }
         }
         candidates.push((f.id, score, f.ranks));
@@ -1807,11 +1825,13 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         merged.truncate(8);
         merged
     };
-    // H2-16: the cause the first-pass answer points at leads the facts.
+    // H2-16: the cause the first-pass answer points at leads the facts. A
+    // relation already rendered by a chain stays where it is, once.
     if !cause_relations.is_empty() {
+        let known: HashSet<i64> = facts.iter().map(|fact| fact.id).collect();
         let mut extra: Vec<FactHit> = paths::facts_by_ids(&engine.db, &cause_relations, cutoff, 2)?
             .into_iter()
-            .filter(|fact| history || !fact.ended)
+            .filter(|fact| (history || !fact.ended) && !known.contains(&fact.id))
             .collect();
         if !extra.is_empty() {
             extra.extend(facts);

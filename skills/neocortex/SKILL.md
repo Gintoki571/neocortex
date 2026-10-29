@@ -147,12 +147,14 @@ and `next:` when present.
   property matches, it is answered like an ordinary question.
 - A status question ("what bug is still open", "which issues are unresolved")
   ranks the defect reports no later memory fixes first; a bug a later memory
-  fixes is still shown, after them. "Open question" is a pending decision, not
-  an open defect.
+  fixes is still shown, after them. The question has to name a defect ("is the
+  API still open to the public" and "which PRs are outstanding" are ordinary
+  questions), and "open question" is a pending decision, not an open defect.
 - A why-question also returns the cause: after the first pass, the stored
-  cause of the memory that answered it (a `cause` relation reached through the
-  entities it shares, or a memory link) is added to the memories and its fact
-  leads `facts:`.
+  cause of the memory that answered it (a `cause` relation that ends at an
+  entity of the question, or whose memory shares a specific entity with the
+  answer) is added to the memories and its fact leads `facts:`. A cause that
+  shares only a broad entity, such as a team every note mentions, is ignored.
 - History is automatic for past-tense wording ("used to", "before",
   "previously", "changed", "did ... use", "no longer"), so ended facts appear
   without `include_history`. Use `as_of` for "what was true then".

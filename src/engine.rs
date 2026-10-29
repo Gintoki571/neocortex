@@ -87,11 +87,13 @@ pub struct Config {
     /// RRF weight of the causal channel on why/intent questions (E4b).
     pub w_causal: f64,
     /// H2-16: on a why-question, follow the stored cause relations of the top
-    /// answering memories (shared entity or memory link) and add their cause
-    /// memory and fact. 0 disables the follow step.
+    /// answering memories (an anchored endpoint, or a specific entity shared
+    /// with another answer) and add their cause memory and fact. 0 disables
+    /// the follow step.
     pub cause_follow: bool,
-    /// H2-15: on a "still open / unresolved" question, rank open bug reports
-    /// above bugs a later memory fixes. Re-ranks, never hides.
+    /// H2-15: on a question that names a defect and asks whether it is still
+    /// open, rank open bug reports above bugs a later memory fixes. Re-ranks,
+    /// never hides, and never demotes a better-matching answer.
     pub status_rank: bool,
     /// Extract cause relations from in-memory text cues (E4b). Off by default:
     /// the calling agent is the reliable extractor.
