@@ -352,7 +352,11 @@ also render the interval with a computed duration ("3 years 2 months",
   brand new phrase joins a family when its vector is close enough. The seeded
   `cause` family (`causes`, `led to`, `resulted in`, with `caused by` and
   `because of` as inverses) makes why-questions follow causal evidence first
-  when `w_causal` is on.
+  when `w_causal` is on, and `mentor`/`mentored by` lets a mentee keep several
+  mentors. The hand-written seed set is reconciled on every open, so a database
+  written by an older build gains predicates and aliases added since (the
+  `mentor` pair, `accountable to`) without a re-import; a predicate or alias
+  the agent created itself is never taken over.
 
 ## Quality
 

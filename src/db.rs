@@ -301,28 +301,11 @@ impl Db {
         if empty == 1 {
             self.backfill_name_tokens()?;
         }
-        // New seeded families (the causal group) must reach existing v4
-        // databases too. Presence of the family anchor is the check: when it
-        // exists the whole current seed set does, so a normal open writes
-        // nothing.
-        let anchored: i64 = self.sql().query_row(
-            "SELECT EXISTS(SELECT 1 FROM predicates WHERE canonical='cause')",
-            [],
-            |r| r.get(0),
-        )?;
-        if anchored == 0 {
-            self.seed_predicates()?;
-        }
-        // A database built while `mentored by` was seeded exclusive carries the
-        // wrong policy: a mentee can have several mentors. The seed value owns
-        // seeded exclusivity (it is not agent-settable), so every open corrects
-        // stale rows this cheaply and idempotently (no row is touched once the
-        // value is right).
-        self.sql().execute(
-            "UPDATE predicates SET exclusive=0
-             WHERE canonical='mentored by' AND seeded=1 AND exclusive=1",
-            [],
-        )?;
+        // The seeded ontology is reconciled on every v4 open: a database first
+        // written by an older build gains the seeds and aliases added since
+        // (the `mentor` family, `accountable to`). A presence probe cannot tell:
+        // the causal family made an old database look complete.
+        self.seed_predicates(false)?;
         Ok(())
     }
 
@@ -360,7 +343,7 @@ impl Db {
     fn create_schema(&self, mode: VecMode) -> Result<()> {
         self.sql().execute_batch(include_str!("schema.sql"))?;
         self.create_vec_tables(mode)?;
-        self.seed_predicates()?;
+        self.seed_predicates(true)?;
         self.set_version(SCHEMA_VERSION)?;
         self.sql()
             .execute("UPDATE schema_meta SET vec_mode=?1", [mode.name()])?;
@@ -479,7 +462,29 @@ impl Db {
     /// conflicts key on it); `inverse` names the predicate that states the same
     /// relation from the other side. Seeded exclusivity is policy and is not
     /// cleared by `exclusive: false` writes.
-    fn seed_predicates(&self) -> Result<()> {
+    ///
+    /// Runs on every v4 open ([`Db::ensure_additive_tables`]), in one
+    /// transaction, and must stay idempotent: the current rows and aliases are
+    /// read once and only what is missing is written, so a complete ontology
+    /// costs no row write. `adopt` is the v3 -> v4 migration, where rows
+    /// predate the `seeded` marker and are taken into the seed set (the seed
+    /// re-applies its display/exclusivity/symmetric policy there). On a v4
+    /// open (`adopt = false`) a canonical or alias owned by a user-created row
+    /// is left alone: the user row wins and the seed is skipped.
+    fn seed_predicates(&self, adopt: bool) -> Result<()> {
+        self.write(|db| db.seed_rows(adopt))
+    }
+
+    fn seed_rows(&self, adopt: bool) -> Result<()> {
+        struct Row {
+            id: i64,
+            display: String,
+            exclusive: bool,
+            symmetric: bool,
+            group_id: i64,
+            inverse_of: Option<i64>,
+            seeded: bool,
+        }
         struct Seed {
             canonical: &'static str,
             display: &'static str,
@@ -712,69 +717,162 @@ impl Db {
                 inverse: Some("cause"),
             },
         ];
+        // Current ontology, read once: tens of rows, so a normal open does no
+        // SQL beyond these two scans and the map lookups below.
+        let mut rows: std::collections::HashMap<String, Row> = std::collections::HashMap::new();
+        {
+            let mut st = self.sql().prepare(
+                "SELECT id,canonical,display,exclusive,symmetric,group_id,inverse_of,seeded
+                 FROM predicates",
+            )?;
+            let it = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    Row {
+                        id: r.get(0)?,
+                        display: r.get(2)?,
+                        exclusive: r.get::<_, i64>(3)? != 0,
+                        symmetric: r.get::<_, i64>(4)? != 0,
+                        group_id: r.get(5)?,
+                        inverse_of: r.get(6)?,
+                        seeded: r.get::<_, i64>(7)? != 0,
+                    },
+                ))
+            })?;
+            for row in it {
+                let (canonical, row) = row?;
+                rows.insert(canonical, row);
+            }
+        }
+        let mut alias_norms: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut st = self
+                .sql()
+                .prepare("SELECT alias_norm FROM predicate_aliases")?;
+            let it = st.query_map([], |r| r.get::<_, String>(0))?;
+            for norm in it {
+                alias_norms.insert(norm?);
+            }
+        }
+        // Seeds this database owns. A canonical already taken by another row on
+        // a v4 open is the user's: it is skipped whole (no marker, no links, no
+        // aliases), so a seed never claims a predicate the agent created.
+        let mut owned: Vec<(&Seed, i64)> = Vec::new();
         for seed in SEEDS {
-            self.sql().execute(
-                "INSERT INTO predicates(canonical,display,exclusive,symmetric,seeded)
-                 VALUES (?1,?2,?3,?4,1)
-                 ON CONFLICT(canonical) DO UPDATE SET
-                   display=CASE WHEN predicates.display='' THEN excluded.display ELSE predicates.display END,
-                   symmetric=MAX(predicates.symmetric,excluded.symmetric),
-                   -- Migration re-applies the hand-written policy; a seeded
-                   -- predicate's exclusivity is not a user-settable flag.
-                   exclusive=excluded.exclusive,
-                   seeded=1",
-                rusqlite::params![
-                    seed.canonical,
-                    seed.display,
-                    i64::from(seed.exclusive),
-                    i64::from(seed.symmetric)
-                ],
-            )?;
-            let id: i64 = self.sql().query_row(
-                "SELECT id FROM predicates WHERE canonical=?1",
-                [seed.canonical],
-                |r| r.get(0),
-            )?;
-            for alias in seed.aliases {
-                let norm = crate::text::norm_predicate(alias);
+            let found = rows.get(seed.canonical).map(|r| (r.id, r.seeded));
+            let id = match found {
+                None => {
+                    self.sql().execute(
+                        "INSERT INTO predicates(canonical,display,exclusive,symmetric,seeded)
+                         VALUES (?1,?2,?3,?4,1)",
+                        rusqlite::params![
+                            seed.canonical,
+                            seed.display,
+                            i64::from(seed.exclusive),
+                            i64::from(seed.symmetric)
+                        ],
+                    )?;
+                    let id = self.sql().last_insert_rowid();
+                    rows.insert(
+                        seed.canonical.to_string(),
+                        Row {
+                            id,
+                            display: seed.display.to_string(),
+                            exclusive: seed.exclusive,
+                            symmetric: seed.symmetric,
+                            group_id: 0,
+                            inverse_of: None,
+                            seeded: true,
+                        },
+                    );
+                    id
+                }
+                Some((id, true)) => id,
+                Some((id, false)) if adopt => {
+                    // Pre-v4 rows carry no marker: the migration adopts them.
+                    self.sql()
+                        .execute("UPDATE predicates SET seeded=1 WHERE id=?1", [id])?;
+                    if let Some(row) = rows.get_mut(seed.canonical) {
+                        row.seeded = true;
+                    }
+                    id
+                }
+                Some(_) => continue,
+            };
+            owned.push((seed, id));
+        }
+        let id_of = |canonical: &str| -> Result<i64> {
+            rows.get(canonical)
+                .map(|r| r.id)
+                .ok_or_else(|| crate::err!("seed predicate '{canonical}' is missing"))
+        };
+        for (seed, id) in &owned {
+            let row = rows
+                .get(seed.canonical)
+                .ok_or_else(|| crate::err!("seed predicate '{}' is missing", seed.canonical))?;
+            // A blank display is repaired on any open; the rest of the
+            // hand-written policy (exclusivity, symmetry) is re-applied only by
+            // the v3 -> v4 migration, which takes the rows into the seed set.
+            if row.display.is_empty() && !seed.display.is_empty() {
                 self.sql().execute(
-                    "INSERT OR IGNORE INTO predicate_aliases(alias_norm,predicate_id) VALUES (?1,?2)",
-                    rusqlite::params![norm, id],
+                    "UPDATE predicates SET display=?1 WHERE id=?2",
+                    rusqlite::params![seed.display, id],
                 )?;
             }
-            // An alias whose canonical is different from the seed surface must
-            // still reach the seed row ("employed at" -> "work at").
-            let own_norm = crate::text::norm_predicate(seed.canonical);
-            self.sql().execute(
-                "INSERT OR IGNORE INTO predicate_aliases(alias_norm,predicate_id) VALUES (?1,?2)",
-                rusqlite::params![own_norm, id],
-            )?;
-        }
-        for seed in SEEDS {
-            let id: i64 = self.sql().query_row(
-                "SELECT id FROM predicates WHERE canonical=?1",
-                [seed.canonical],
-                |r| r.get(0),
-            )?;
-            let group: i64 = self.sql().query_row(
-                "SELECT id FROM predicates WHERE canonical=?1",
-                [seed.group],
-                |r| r.get(0),
-            )?;
-            self.sql()
-                .execute("UPDATE predicates SET group_id=?1 WHERE id=?2", [group, id])?;
+            if adopt && row.exclusive != seed.exclusive {
+                self.sql().execute(
+                    "UPDATE predicates SET exclusive=?1 WHERE id=?2",
+                    rusqlite::params![i64::from(seed.exclusive), id],
+                )?;
+            }
+            if adopt && seed.symmetric && !row.symmetric {
+                self.sql()
+                    .execute("UPDATE predicates SET symmetric=1 WHERE id=?1", [id])?;
+            }
+            let group = id_of(seed.group)?;
+            if row.group_id != group {
+                self.sql().execute(
+                    "UPDATE predicates SET group_id=?1 WHERE id=?2",
+                    rusqlite::params![group, id],
+                )?;
+            }
             if let Some(inverse) = seed.inverse {
-                let inverse_id: i64 = self.sql().query_row(
-                    "SELECT id FROM predicates WHERE canonical=?1",
-                    [inverse],
-                    |r| r.get(0),
-                )?;
-                self.sql().execute(
-                    "UPDATE predicates SET inverse_of=?1 WHERE id=?2",
-                    [inverse_id, id],
-                )?;
+                let inverse_id = id_of(inverse)?;
+                if row.inverse_of != Some(inverse_id) {
+                    self.sql().execute(
+                        "UPDATE predicates SET inverse_of=?1 WHERE id=?2",
+                        rusqlite::params![inverse_id, id],
+                    )?;
+                }
+            }
+            // An alias already owned by another predicate is the user's: it is
+            // never moved to a seed row.
+            for alias in seed
+                .aliases
+                .iter()
+                .copied()
+                .chain(std::iter::once(seed.canonical))
+            {
+                let norm = crate::text::norm_predicate(alias);
+                if alias_norms.insert(norm.clone()) {
+                    self.sql().execute(
+                        "INSERT OR IGNORE INTO predicate_aliases(alias_norm,predicate_id) VALUES (?1,?2)",
+                        rusqlite::params![norm, id],
+                    )?;
+                }
             }
         }
+        // A database built while `mentored by` was seeded exclusive carries the
+        // wrong policy: a mentee can have several mentors. The seed value owns
+        // seeded exclusivity (it is not agent-settable), so every open corrects
+        // stale rows this cheaply and idempotently (no row is touched once the
+        // value is right). This is the one exclusivity correction a v4 open
+        // applies to a seeded row.
+        self.sql().execute(
+            "UPDATE predicates SET exclusive=0
+             WHERE canonical='mentored by' AND seeded=1 AND exclusive=1",
+            [],
+        )?;
         Ok(())
     }
 
@@ -874,7 +972,7 @@ impl Db {
                 .execute("UPDATE relations SET subj=src WHERE subj=0", [])?;
             // v3 stored fact-sentence vectors; the phrase is the right signal.
             db.sql().execute("DELETE FROM predicates_vec", [])?;
-            db.seed_predicates()?;
+            db.seed_predicates(true)?;
             db.sql().execute(
                 "UPDATE relations SET predicate_text=COALESCE(
                      (SELECT NULLIF(display,'') FROM predicates p WHERE p.id=relations.predicate_id),
