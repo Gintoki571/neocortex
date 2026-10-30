@@ -158,7 +158,8 @@ pub struct TextDates {
 /// date, several unrelated dates, or only a vague phrase: a wrong date is
 /// worse than none.
 pub fn text_dates(text: &str, clock: &Clock) -> Option<TextDates> {
-    match find_range(text, clock) {
+    let mut text = text.to_string();
+    match find_range(&text, clock) {
         RangeScan::Found(start, end) => {
             let rest = text.replacen(&start.matched, " ", 1);
             if find_window(&rest, clock).is_some() {
@@ -171,10 +172,12 @@ pub fn text_dates(text: &str, clock: &Clock) -> Option<TextDates> {
             });
         }
         // A range-shaped phrase we declined must not date the memory through
-        // one of its ends: "Pages 1990 to 2010" is a list, not a period.
-        RangeScan::Declined => return None,
+        // one of its ends ("Pages 1990 to 2010" is a list, not a period), but
+        // it must not erase an independent date in the same sentence either.
+        RangeScan::Declined(spans) => text = blank_spans(&text, &spans),
         RangeScan::None => {}
     }
+    let text = text.as_str();
     if let Some((end, matched)) = find_until(text, clock) {
         let rest = text.replacen(&matched, " ", 1);
         if find_window(&rest, clock).is_some() {
@@ -253,7 +256,8 @@ pub fn find_window(text: &str, clock: &Clock) -> Option<Window> {
 /// must not date the memory through one of its ends either.
 enum RangeScan {
     None,
-    Declined,
+    /// Byte spans of every declined phrase.
+    Declined(Vec<(usize, usize)>),
     Found(Window, i64),
 }
 
@@ -262,7 +266,7 @@ enum RangeScan {
 fn find_range(text: &str, clock: &Clock) -> RangeScan {
     let words = words(text);
     let mut best: Option<(usize, usize, (i64, i64, i64))> = None;
-    let mut declined = false;
+    let mut declined: Vec<(usize, usize)> = Vec::new();
     for (i, &(start, _)) in words.iter().enumerate() {
         if let Some((best_start, _, _)) = &best {
             if start > *best_start {
@@ -275,7 +279,7 @@ fn find_range(text: &str, clock: &Clock) -> RangeScan {
                 continue;
             };
             if !range_allowed(text, start, end, &parts) {
-                declined = true;
+                declined.push((start, end));
                 continue;
             }
             let longer = match &best {
@@ -298,9 +302,31 @@ fn find_range(text: &str, clock: &Clock) -> RangeScan {
             },
             span_end,
         ),
-        None if declined => RangeScan::Declined,
+        None if !declined.is_empty() => RangeScan::Declined(declined),
         None => RangeScan::None,
     }
+}
+
+/// The text with every declined range phrase blanked out, so its ends cannot
+/// date the memory through the single-date scan.
+fn blank_spans(text: &str, spans: &[(usize, usize)]) -> String {
+    let mut spans = spans.to_vec();
+    spans.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (s, e) in spans {
+        let s = s.max(at);
+        if s >= e {
+            continue;
+        }
+        out.push_str(&text[at..s]);
+        for c in text[s..e].chars() {
+            out.push(if c.is_whitespace() { c } else { ' ' });
+        }
+        at = e;
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 /// "until Y": an end with no start. The start keeps the caller's rule.
@@ -341,6 +367,9 @@ struct RangeParts {
     weekdays: bool,
     /// The phrase itself names its period ("from X", "between X and Y").
     prefixed: bool,
+    /// Neither end names a year, and the start in the clock's year is still
+    /// ahead ("December 24 to January 2" written in October).
+    future_start: bool,
 }
 
 /// "from A to B" / "between A and B" / "A to B" / "A - B" as a resolved
@@ -373,6 +402,11 @@ fn span_pair(a: &str, b: &str, clock: &Clock, prefixed: bool) -> Option<RangePar
     // A written last day resolves to that whole day's window, so its end is
     // already the exclusive bound ("from July 6 to August 14" ends on the 15th).
     let (_, end) = resolve(b, clock)?;
+    // A yearless pair is read in the clock's year, not each end's most recent
+    // occurrence: "December 24 to January 2" written in October is the
+    // upcoming shutdown, not last year's.
+    let yearless = !names_year(a) && !names_year(b);
+    let future_start = yearless && current_year_start(a, clock).is_some_and(|s| s > clock.now);
     Some(RangeParts {
         start,
         start_end,
@@ -380,7 +414,31 @@ fn span_pair(a: &str, b: &str, clock: &Clock, prefixed: bool) -> Option<RangePar
         years: parse_year(a.trim()).is_some() && parse_year(b.trim()).is_some(),
         weekdays: weekday_end(a).is_some() && weekday_end(b).is_some(),
         prefixed,
+        future_start,
     })
+}
+
+/// True when the expression names its year ("2026-07-06", "July 6 2026").
+fn names_year(expr: &str) -> bool {
+    expr.split(|c: char| !c.is_ascii_digit())
+        .any(|run| run.len() == 4)
+}
+
+/// The start of a yearless month-day expression in the clock's year, so a
+/// range is judged by the dates it names rather than by `most_recent_day`.
+fn current_year_start(expr: &str, clock: &Clock) -> Option<i64> {
+    let toks: Vec<&str> = expr.split_whitespace().collect();
+    let (m, d) = match toks.as_slice() {
+        [mo] => (month_index(mo)?, 1),
+        [mo, dd] => match month_index(mo) {
+            Some(m) => (m, parse_day(dd)?),
+            None => (month_index(dd)?, parse_day(mo)?),
+        },
+        _ => return None,
+    };
+    let off = clock.tz_offset_secs;
+    let (y, _, _) = civil_from_days(local_days(clock.now, off));
+    month_day_window(y, m, d, off).map(|w| w.0)
 }
 
 /// The weekday an endpoint names, when naming a weekday is all it does
@@ -413,9 +471,15 @@ fn range_allowed(text: &str, start: usize, end: usize, parts: &RangeParts) -> bo
     if parts.years && !parts.prefixed && !period_cue_before(text, start) {
         return false;
     }
-    // A weekday pair is a weekly pattern, not one finished interval; with a
-    // recurrence cue the rule text carries it alone.
-    if parts.weekdays && (!parts.prefixed || recurrence(text)) {
+    // A weekday pair is a weekly pattern, not one finished interval, with or
+    // without "from" or "every": "from Monday to Friday" is the same standing
+    // schedule as "Monday to Friday every week".
+    if parts.weekdays {
+        return false;
+    }
+    // A yearless pair whose start is still ahead is not a finished interval:
+    // reading it through `most_recent_day` would record last year's dates.
+    if parts.future_start {
         return false;
     }
     true
@@ -2175,6 +2239,63 @@ mod tests {
         ] {
             assert_eq!(text_dates(text, &clock), None, "text_dates({text:?})");
         }
+    }
+
+    #[test]
+    fn a_prefixed_weekday_pair_is_still_a_schedule() {
+        // "from Monday to Friday" is the same standing schedule as
+        // "Monday to Friday every week": one finished week would mark it
+        // [ended] within days and hide it from later questions. Written on a
+        // Friday, the pair resolves forward and used to be accepted.
+        let clock = Clock {
+            now: 1_793_361_600, // 2026-10-30T12:00:00Z, a Friday
+            tz_offset_secs: 0,
+        };
+        for text in [
+            "The office is open from Monday to Friday.",
+            "Support is staffed from Monday to Friday.",
+        ] {
+            assert_eq!(text_dates(text, &clock), None, "text_dates({text:?})");
+        }
+    }
+
+    #[test]
+    fn a_future_yearless_range_dates_nothing() {
+        // NOW is 2026-10-21: "December 24 to January 2" is the upcoming
+        // shutdown, not last year's. A yearless range in the future of now
+        // is left undated instead of taking the previous year.
+        let clock = utc();
+        for text in [
+            "The holiday shutdown is December 24 to January 2.",
+            "The holiday shutdown runs from December 24 to January 2.",
+            "We close November 20 to November 30 for the move.",
+        ] {
+            assert_eq!(text_dates(text, &clock), None, "text_dates({text:?})");
+        }
+        // A yearless range that has already started keeps its dates.
+        assert!(
+            text_dates("We ran from July 6 to August 14.", &clock).is_some(),
+            "a past yearless range keeps its dates"
+        );
+    }
+
+    #[test]
+    fn a_declined_range_does_not_erase_a_single_date() {
+        // The "1990 - 2000" decoy must not date the memory, but it must not
+        // erase the independent "on 2026-07-06" either.
+        let clock = utc();
+        let d = text_dates(
+            "We migrated on 2026-07-06; the archive holds 1990 - 2000 data.",
+            &clock,
+        )
+        .expect("the independent date survives the declined range");
+        assert_eq!(d.start.as_ref().map(|w| w.start), Some(1_783_296_000));
+        assert_eq!(d.end, None);
+        // With no other date the declined phrase still dates nothing.
+        assert_eq!(
+            text_dates("The archive holds 1990 - 2000 data.", &clock),
+            None
+        );
     }
 
     #[test]

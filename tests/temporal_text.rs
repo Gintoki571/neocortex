@@ -1505,3 +1505,90 @@ fn h2_09_caller_dates_win_over_the_text() {
     assert_eq!(stored_interval(&e, rel_only.id), (NOW, None));
     assert!(rel_only.when_inferred.is_none());
 }
+
+#[test]
+fn h2_09_a_prefixed_weekday_schedule_dates_nothing() {
+    // "from Monday to Friday" is a standing schedule, not one finished week:
+    // dating it hides the memory from every question asked after that week.
+    let e = engine();
+    let office = e
+        .remember(RememberInput {
+            content: "The office is open from Monday to Friday.".into(),
+            kind: Some("note".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, office.id), (NOW, None));
+    assert_eq!(office.when_inferred, None);
+
+    let out = recall_as_of(&e, "when is the office open", "2026-11-05");
+    assert!(
+        out.memories.iter().any(|m| m.id == office.id),
+        "the schedule is hidden after its one finished week: {:?}",
+        out.memories.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn h2_09_a_future_yearless_range_dates_nothing() {
+    // Written on 2026-10-23, "December 24 to January 2" is the upcoming
+    // shutdown. Reading both ends as the most recent past occurrence records
+    // it as last year's and hides it on the question's own dates.
+    let e = engine();
+    let shutdown = e
+        .remember(RememberInput {
+            content: "The holiday shutdown is December 24 to January 2.".into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, shutdown.id), (NOW, None));
+    assert_eq!(shutdown.when_inferred, None);
+
+    let out = recall_as_of(&e, "when is the holiday shutdown", "2026-12-24");
+    assert!(
+        out.memories.iter().any(|m| m.id == shutdown.id),
+        "the upcoming shutdown is hidden on its own dates: {:?}",
+        out.memories.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+
+    // A yearless range that has already started still stores both ends.
+    let past = e
+        .remember(RememberInput {
+            content: "The audit ran from July 6 to August 14.".into(),
+            kind: Some("fact".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_interval(&e, past.id),
+        (day(2026, 7, 6), Some(day(2026, 8, 15)))
+    );
+}
+
+#[test]
+fn h2_09_a_declined_range_does_not_erase_a_single_date() {
+    // The "1990 - 2000" decoy must not date the memory, but the independent
+    // "on 2026-07-06" must still date it: main stored that date.
+    let e = engine();
+    let out = e
+        .remember(RememberInput {
+            content: "We migrated on 2026-07-06; the archive holds 1990 - 2000 data.".into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, out.id), (day(2026, 7, 6), None));
+    assert!(out
+        .when_inferred
+        .as_deref()
+        .is_some_and(|t| t.contains("2026-07-06")));
+
+    let migrated = out.id;
+    let out = recall_as_of(&e, "when did we migrate the archive", "2026-07-06");
+    assert!(
+        out.memories.iter().any(|m| m.id == migrated),
+        "the memory is hidden on the date it names: {:?}",
+        out.memories.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+}
