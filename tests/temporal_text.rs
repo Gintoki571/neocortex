@@ -1317,6 +1317,165 @@ fn h2_11_duration_uses_the_stored_range_and_ranks_the_offsite() {
 }
 
 #[test]
+fn h2_08_single_unit_ago_phrases_date_a_memory() {
+    // "N days|weeks|months ago" is that exact day for N = 1 too ("1 day ago",
+    // "one week ago"), not only for the plural forms.
+    let e = engine();
+    for (content, start) in [
+        ("We shipped 1 day ago after the review.", day(2026, 10, 22)),
+        (
+            "We shipped one day ago after the review.",
+            day(2026, 10, 22),
+        ),
+        ("We shipped 1 week ago after the review.", day(2026, 10, 16)),
+        (
+            "We shipped one week ago after the review.",
+            day(2026, 10, 16),
+        ),
+        ("We shipped 1 month ago after the review.", day(2026, 9, 23)),
+        (
+            "We shipped one month ago after the review.",
+            day(2026, 9, 23),
+        ),
+    ] {
+        let out = e
+            .remember(RememberInput {
+                content: content.into(),
+                kind: Some("event".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stored_interval(&e, out.id), (start, None), "{content:?}");
+        let phrase = out.when_inferred.clone().unwrap_or_default();
+        assert!(
+            phrase.contains("day ago")
+                || phrase.contains("week ago")
+                || phrase.contains("month ago"),
+            "when_inferred for {content:?}: {phrase:?}"
+        );
+    }
+}
+
+#[test]
+fn h2_09_bare_four_digit_pairs_are_not_periods() {
+    // Page numbers, serials and sample ids are a pair of four-digit numbers,
+    // not a year span: dating them marks a current fact [ended].
+    let e = engine();
+    for content in [
+        "The 1990 - 2000 data set was archived in the vault.",
+        "Pages 1990 to 2010 of the ledger were torn at the archive.",
+        "Serial numbers 2020 to 2030 were recalled by the vendor.",
+        "The sample covers 2019 to 2021 data for the survey.",
+    ] {
+        let out = e
+            .remember(RememberInput {
+                content: content.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stored_interval(&e, out.id), (NOW, None), "{content:?}");
+        assert_eq!(out.when_inferred, None, "{content:?}");
+    }
+    // A period cue, or the phrase's own "from X" / "between X and Y", still
+    // makes a year span a range.
+    for (content, start, end) in [
+        (
+            "The survey ran from 1990 to 2000.",
+            day(1990, 1, 1),
+            day(2001, 1, 1),
+        ),
+        (
+            "The project ran in 2019 to 2021.",
+            day(2019, 1, 1),
+            day(2022, 1, 1),
+        ),
+        (
+            "The freeze lasted between 2020 and 2022.",
+            day(2020, 1, 1),
+            day(2023, 1, 1),
+        ),
+    ] {
+        let out = e
+            .remember(RememberInput {
+                content: content.into(),
+                kind: Some("fact".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            stored_interval(&e, out.id),
+            (start, Some(end)),
+            "{content:?}"
+        );
+    }
+}
+
+#[test]
+fn h2_09_a_partitive_last_period_dates_nothing() {
+    // "the last week of the sprint" is the final week of it, not last week:
+    // dating it moves a current fact into the past.
+    let e = engine();
+    for content in [
+        "The last week of the sprint is for hardening only.",
+        "The last month of the lease is paid in advance.",
+        "The last year of the contract has a price cap.",
+    ] {
+        let out = e
+            .remember(RememberInput {
+                content: content.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stored_interval(&e, out.id), (NOW, None), "{content:?}");
+        assert_eq!(out.when_inferred, None, "{content:?}");
+    }
+    // The plain period phrase still dates the memory.
+    let plain = e
+        .remember(RememberInput {
+            content: "The last week was busy with onboarding.".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, plain.id), (day(2026, 10, 12), None));
+}
+
+#[test]
+fn h2_09_recurring_weekday_pairs_are_schedules() {
+    // A weekday-to-weekday span with a recurrence cue is a standing schedule;
+    // one finished interval would mark it [ended] within days.
+    let e = engine();
+    for content in [
+        "The clinic is open Tuesday to Thursday every week.",
+        "Office hours Monday to Wednesday for the helpdesk team.",
+    ] {
+        let out = e
+            .remember(RememberInput {
+                content: content.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stored_interval(&e, out.id), (NOW, None), "{content:?}");
+        assert_eq!(out.when_inferred, None, "{content:?}");
+    }
+}
+
+#[test]
+fn h2_09_an_inverted_range_dates_nothing() {
+    // The end must be a whole date: "to 2026-10" is the cut end of
+    // "to 2026-10-10", and the truncated parse would hide that the range is
+    // inverted.
+    let e = engine();
+    let out = e
+        .remember(RememberInput {
+            content: "Project Fenix ran from 2026-10-20 to 2026-10-10 oddly.".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, out.id), (NOW, None));
+    assert_eq!(out.when_inferred, None);
+}
+
+#[test]
 fn h2_09_caller_dates_win_over_the_text() {
     let e = engine();
     let out = e
