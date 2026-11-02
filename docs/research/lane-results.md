@@ -36,6 +36,7 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | nc-hunt2 (qoder) | dogfood bug hunt: 8 fictional agent scenarios, 178 probes, real model | 20 findings (8 wrong fact, 8 missing, 4 noise) in workspace `lanes/research/hunt2.md` | (no code) |
 | nc-fix2 (qoder) | negation/retraction scoped to the right subject and clause; first names via supplied entities; "A and B are no longer partners"; "I don't remember" is not negation; future-event questions see planned rows | hunt2 probes fixed; retraction table 27/27; private 0.867 and agent_sim 111/120 unchanged | 1caba99 |
 | nc-er08 (qoder) | ER-08: a typo-sized near-name merge needs transliteration-key equality or a person/org named in the same write that the candidate's memories also mention; otherwise a new entity reported `ambiguous` (root cause found by nc-hop3 (codebuddy): different people one surname edit apart merged, one person's write ended the other's exclusive facts) | world-3000 false merges 26 -> 0 (`examples/merge_audit.rs`), three-hop acc@10 0.897 -> 1.000; name_eval 0.964 unchanged; gates and private 0.867 / agent_sim 111/120 unchanged; real-model table: typed shared-org typo still merges, text-only typos now `ambiguous` | bf73846 |
+| nc-binvec (codebuddy) | research3 I4: opt-in `vec_prefilter=bit` keeps a sign-bit `memories_bits` table (sqlite-vec `bit[768]`), hamming top-N then exact rerank; default off | real-model 108k: acc@10 0.990, recall 0.966, MRR 0.859 identical off/on in every category; paired p50 -17..-34% (Sonnet verifier, loaded machine); first-open backfill 6.5 s, DB +5% (274 -> 288 MB); hash-embedder DBs: recall@50 0.617, do not enable; gates and private 0.867 / 111/120 unchanged | f97e1c2 |
 
 ## Killed (branch kept, not merged)
 
@@ -48,7 +49,7 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | nc-hoplast (qoder) | `hop_last_open`: the semantic beam's last hop opens low-degree entities beyond the question's 100-nearest relations | world-300 three-hop recall 0.761 -> 0.812 (MRR -0.006, acc@10 1.000 both); fixtures/holdout/mh1/mh2 identical; private mh3 identical in every category at 0 and 8: no transfer, not merged (branch e2f4b72) |
 | nc-hop3 | read-side `hop_ended` knob for three-hop misses at world-3000 | 0.897 -> 0.974, but the misses were ER-08 false merges; fixed at the write side by nc-er08 (1.000), knob not needed |
 
-## Where main stands (2ff7c81)
+## Where main stands (f97e1c2)
 
 | measure | value |
 |---|---|
@@ -59,6 +60,7 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | world-300 / world-1000 / world-3000 acc@10 | 0.992 / 0.992 / 0.997 (three-hop 1.000 / 1.000 / 1.000) |
 | world-10000 (108,667 memories, int8 DB, ingest 5e3e082) acc@10 / agent_sim | 0.977 / 0.987 (two-hop 0.892 / 0.942); recall p50 478 ms 1 core, 395 ms 2 cores; see `scale.md` section 6 |
 | cold-recall peak RSS | 612-633 MiB f32 model, ~237 MiB q8, flat in DB size up to 108k memories |
+| opt-in `vec_prefilter=bit` (real-model DBs only) | 108k: accuracy identical, recall p50 -17..-34%, DB +5% |
 | DB bytes per memory | ~5,950 f32 vectors, ~2,250 int8 |
 
 ## Lessons
