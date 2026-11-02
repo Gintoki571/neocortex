@@ -255,8 +255,13 @@ the world, `expired_at` says when neocortex retired it. Changed facts are kept
 as history and are never presented as current unless you ask for history or an
 `as_of` snapshot. A memory's `--until` or `invalidate m<id>` ends the facts only
 that memory states; `forget` retracts them without an end date. Without
-`--when`, one explicit date in the text (`March 5, 2025`, `2019`, `yesterday`)
-becomes the start; several dates, or none, leave it at today.
+`--when`, the date written in the text becomes the start: an absolute date
+(`March 5, 2025`, `2019`), a relative phrase (`yesterday`, `last Tuesday`,
+`two weeks ago`, `last month`, `this morning`), or a written range (`from
+2026-07-06 to 2026-08-14`, `between March 1 and March 5`, `until 2026-10-15`),
+which sets both ends and makes the written last day inclusive. Several
+unrelated dates, a vague phrase, or none leave it at today; `--when`/`--until`
+always win.
 
 The channel set is extensible: two measured experiments are built in but off by
 default (`--set w_tlink=…` temporal neighbours, `--set w_causal=…` why-question

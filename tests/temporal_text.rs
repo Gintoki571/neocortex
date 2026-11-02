@@ -1124,3 +1124,471 @@ fn tm13_real_names_survive_the_date_filter() {
         "date leaked: {names:?}"
     );
 }
+
+// ------------------------------------------- H2-08/09/11 (lane nc-dates)
+
+fn stored_interval(e: &Engine, id: i64) -> (i64, Option<i64>) {
+    e.db.sql()
+        .query_row(
+            "SELECT valid_from,valid_to FROM memories WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn h2_08_relative_phrases_resolve_against_the_write_clock() {
+    let e = engine();
+    // NOW is 2026-10-23 12:00 UTC, a Friday.
+    let standup = e
+        .remember(RememberInput {
+            content: "Standup was moved to 10:00 UTC last Tuesday after the 09:30 slot \
+                      clashed with school runs."
+                .into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_interval(&e, standup.id),
+        (day(2026, 10, 20), None),
+        "last Tuesday"
+    );
+    assert!(standup
+        .when_inferred
+        .is_some_and(|t| t.contains("last Tuesday")));
+
+    let fix = e
+        .remember(RememberInput {
+            content: "The billing fix shipped two weeks ago.".into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_interval(&e, fix.id),
+        (day(2026, 10, 9), None),
+        "two weeks ago is that day, not the start of its week"
+    );
+
+    let hired = e
+        .remember(RememberInput {
+            content: "Nia was hired three days ago.".into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, hired.id), (day(2026, 10, 20), None));
+
+    // Vague phrases still date nothing: a wrong date is worse than none.
+    let vague = e
+        .remember(RememberInput {
+            content: "We met a while back about the rollout.".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(vague.when_inferred.is_none());
+    assert_eq!(stored_interval(&e, vague.id), (NOW, None));
+}
+
+#[test]
+fn h2_09_written_ranges_set_both_ends() {
+    let e = engine();
+    let migration = e
+        .remember(RememberInput {
+            content: "The migration project ran for six weeks, from 2026-07-06 to 2026-08-14."
+                .into(),
+            kind: Some("fact".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_interval(&e, migration.id),
+        (day(2026, 7, 6), Some(day(2026, 8, 15))),
+        "from X to Y is inclusive of Y"
+    );
+    assert!(migration
+        .when_inferred
+        .is_some_and(|t| t.contains("from 2026-07-06")));
+
+    let freeze = e
+        .remember(RememberInput {
+            content: "We froze the API from 2026-10-01 until 2026-10-15.".into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_interval(&e, freeze.id),
+        (day(2026, 10, 1), Some(day(2026, 10, 16)))
+    );
+
+    let contract = e
+        .remember(RememberInput {
+            content: "The contract with Northwind runs from 2026-01-01 until 2026-12-31.".into(),
+            kind: Some("fact".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_interval(&e, contract.id),
+        (day(2026, 1, 1), Some(day(2027, 1, 1)))
+    );
+
+    // Month names without a year: the most recent occurrence not in the future.
+    let months = e
+        .remember(RememberInput {
+            content: "The migration ran from July 6 to August 14.".into(),
+            kind: Some("fact".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_interval(&e, months.id),
+        (day(2026, 7, 6), Some(day(2026, 8, 15)))
+    );
+
+    // "until Y" states only the end; the start keeps today's rule (now).
+    let until = e
+        .remember(RememberInput {
+            content: "We froze the API until 2026-11-15.".into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_interval(&e, until.id),
+        (NOW, Some(day(2026, 11, 16)))
+    );
+
+    // An end that already passed cannot bound a memory recorded now, and it
+    // does not get to pretend it dated the write.
+    let past = e
+        .remember(RememberInput {
+            content: "We froze the API until 2026-10-15.".into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, past.id), (NOW, None));
+    assert!(past.when_inferred.is_none());
+}
+
+#[test]
+fn h2_11_duration_uses_the_stored_range_and_ranks_the_offsite() {
+    let e = engine();
+    e.remember(RememberInput {
+        content: "Priya Raman left the payroll team on 2026-06-30.".into(),
+        kind: Some("event".into()),
+        valid_from: Some("2026-06-30".into()),
+        entities: vec![person("Priya Raman")],
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        content: "The outage on 2026-08-14 lasted 47 minutes.".into(),
+        kind: Some("event".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let offsite = e
+        .remember(RememberInput {
+            content: "The team offsite was three days long, 2026-09-07 to 2026-09-09.".into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let out = recall(&e, "how long was the team offsite");
+    assert_eq!(
+        out.memories.first().map(|m| m.id),
+        Some(offsite.id),
+        "offsite not first: {:?}",
+        out.memories
+            .iter()
+            .map(|m| (m.id, m.duration.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.memories[0].duration.as_deref(),
+        Some("3 days"),
+        "duration must come from the stored range"
+    );
+}
+
+#[test]
+fn h2_08_single_unit_ago_phrases_date_a_memory() {
+    // "N days|weeks|months ago" is that exact day for N = 1 too ("1 day ago",
+    // "one week ago"), not only for the plural forms.
+    let e = engine();
+    for (content, start) in [
+        ("We shipped 1 day ago after the review.", day(2026, 10, 22)),
+        (
+            "We shipped one day ago after the review.",
+            day(2026, 10, 22),
+        ),
+        ("We shipped 1 week ago after the review.", day(2026, 10, 16)),
+        (
+            "We shipped one week ago after the review.",
+            day(2026, 10, 16),
+        ),
+        ("We shipped 1 month ago after the review.", day(2026, 9, 23)),
+        (
+            "We shipped one month ago after the review.",
+            day(2026, 9, 23),
+        ),
+    ] {
+        let out = e
+            .remember(RememberInput {
+                content: content.into(),
+                kind: Some("event".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stored_interval(&e, out.id), (start, None), "{content:?}");
+        let phrase = out.when_inferred.clone().unwrap_or_default();
+        assert!(
+            phrase.contains("day ago")
+                || phrase.contains("week ago")
+                || phrase.contains("month ago"),
+            "when_inferred for {content:?}: {phrase:?}"
+        );
+    }
+}
+
+#[test]
+fn h2_09_bare_four_digit_pairs_are_not_periods() {
+    // Page numbers, serials and sample ids are a pair of four-digit numbers,
+    // not a year span: dating them marks a current fact [ended].
+    let e = engine();
+    for content in [
+        "The 1990 - 2000 data set was archived in the vault.",
+        "Pages 1990 to 2010 of the ledger were torn at the archive.",
+        "Serial numbers 2020 to 2030 were recalled by the vendor.",
+        "The sample covers 2019 to 2021 data for the survey.",
+    ] {
+        let out = e
+            .remember(RememberInput {
+                content: content.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stored_interval(&e, out.id), (NOW, None), "{content:?}");
+        assert_eq!(out.when_inferred, None, "{content:?}");
+    }
+    // A period cue, or the phrase's own "from X" / "between X and Y", still
+    // makes a year span a range.
+    for (content, start, end) in [
+        (
+            "The survey ran from 1990 to 2000.",
+            day(1990, 1, 1),
+            day(2001, 1, 1),
+        ),
+        (
+            "The project ran in 2019 to 2021.",
+            day(2019, 1, 1),
+            day(2022, 1, 1),
+        ),
+        (
+            "The freeze lasted between 2020 and 2022.",
+            day(2020, 1, 1),
+            day(2023, 1, 1),
+        ),
+    ] {
+        let out = e
+            .remember(RememberInput {
+                content: content.into(),
+                kind: Some("fact".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            stored_interval(&e, out.id),
+            (start, Some(end)),
+            "{content:?}"
+        );
+    }
+}
+
+#[test]
+fn h2_09_a_partitive_last_period_dates_nothing() {
+    // "the last week of the sprint" is the final week of it, not last week:
+    // dating it moves a current fact into the past.
+    let e = engine();
+    for content in [
+        "The last week of the sprint is for hardening only.",
+        "The last month of the lease is paid in advance.",
+        "The last year of the contract has a price cap.",
+    ] {
+        let out = e
+            .remember(RememberInput {
+                content: content.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stored_interval(&e, out.id), (NOW, None), "{content:?}");
+        assert_eq!(out.when_inferred, None, "{content:?}");
+    }
+    // The plain period phrase still dates the memory.
+    let plain = e
+        .remember(RememberInput {
+            content: "The last week was busy with onboarding.".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, plain.id), (day(2026, 10, 12), None));
+}
+
+#[test]
+fn h2_09_recurring_weekday_pairs_are_schedules() {
+    // A weekday-to-weekday span with a recurrence cue is a standing schedule;
+    // one finished interval would mark it [ended] within days.
+    let e = engine();
+    for content in [
+        "The clinic is open Tuesday to Thursday every week.",
+        "Office hours Monday to Wednesday for the helpdesk team.",
+    ] {
+        let out = e
+            .remember(RememberInput {
+                content: content.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(stored_interval(&e, out.id), (NOW, None), "{content:?}");
+        assert_eq!(out.when_inferred, None, "{content:?}");
+    }
+}
+
+#[test]
+fn h2_09_an_inverted_range_dates_nothing() {
+    // The end must be a whole date: "to 2026-10" is the cut end of
+    // "to 2026-10-10", and the truncated parse would hide that the range is
+    // inverted.
+    let e = engine();
+    let out = e
+        .remember(RememberInput {
+            content: "Project Fenix ran from 2026-10-20 to 2026-10-10 oddly.".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, out.id), (NOW, None));
+    assert_eq!(out.when_inferred, None);
+}
+
+#[test]
+fn h2_09_caller_dates_win_over_the_text() {
+    let e = engine();
+    let out = e
+        .remember(RememberInput {
+            content: "Alice worked at Acme from 2023-03-01 to 2025-08-31.".into(),
+            valid_from: Some("2020-05-01".into()),
+            valid_to: Some("2021-06-01".into()),
+            entities: vec![person("Alice"), org("Acme")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_interval(&e, out.id),
+        (day(2020, 5, 1), Some(day(2021, 6, 1)))
+    );
+    assert!(out.when_inferred.is_none());
+
+    // A relation-only write with no date in its text keeps the ingest time.
+    let rel_only = e
+        .remember(RememberInput {
+            content: "Maya Lin manages the Atlas project.".into(),
+            entities: vec![person("Maya Lin"), org("Atlas")],
+            relations: vec![rel("Maya Lin", "manages", "Atlas", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, rel_only.id), (NOW, None));
+    assert!(rel_only.when_inferred.is_none());
+}
+
+#[test]
+fn h2_09_a_prefixed_weekday_schedule_dates_nothing() {
+    // "from Monday to Friday" is a standing schedule, not one finished week:
+    // dating it hides the memory from every question asked after that week.
+    let e = engine();
+    let office = e
+        .remember(RememberInput {
+            content: "The office is open from Monday to Friday.".into(),
+            kind: Some("note".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, office.id), (NOW, None));
+    assert_eq!(office.when_inferred, None);
+
+    let out = recall_as_of(&e, "when is the office open", "2026-11-05");
+    assert!(
+        out.memories.iter().any(|m| m.id == office.id),
+        "the schedule is hidden after its one finished week: {:?}",
+        out.memories.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn h2_09_a_future_yearless_range_dates_nothing() {
+    // Written on 2026-10-23, "December 24 to January 2" is the upcoming
+    // shutdown. Reading both ends as the most recent past occurrence records
+    // it as last year's and hides it on the question's own dates.
+    let e = engine();
+    let shutdown = e
+        .remember(RememberInput {
+            content: "The holiday shutdown is December 24 to January 2.".into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, shutdown.id), (NOW, None));
+    assert_eq!(shutdown.when_inferred, None);
+
+    let out = recall_as_of(&e, "when is the holiday shutdown", "2026-12-24");
+    assert!(
+        out.memories.iter().any(|m| m.id == shutdown.id),
+        "the upcoming shutdown is hidden on its own dates: {:?}",
+        out.memories.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+
+    // A yearless range that has already started still stores both ends.
+    let past = e
+        .remember(RememberInput {
+            content: "The audit ran from July 6 to August 14.".into(),
+            kind: Some("fact".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        stored_interval(&e, past.id),
+        (day(2026, 7, 6), Some(day(2026, 8, 15)))
+    );
+}
+
+#[test]
+fn h2_09_a_declined_range_does_not_erase_a_single_date() {
+    // The "1990 - 2000" decoy must not date the memory, but the independent
+    // "on 2026-07-06" must still date it: main stored that date.
+    let e = engine();
+    let out = e
+        .remember(RememberInput {
+            content: "We migrated on 2026-07-06; the archive holds 1990 - 2000 data.".into(),
+            kind: Some("event".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stored_interval(&e, out.id), (day(2026, 7, 6), None));
+    assert!(out
+        .when_inferred
+        .as_deref()
+        .is_some_and(|t| t.contains("2026-07-06")));
+
+    let migrated = out.id;
+    let out = recall_as_of(&e, "when did we migrate the archive", "2026-07-06");
+    assert!(
+        out.memories.iter().any(|m| m.id == migrated),
+        "the memory is hidden on the date it names: {:?}",
+        out.memories.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+}
