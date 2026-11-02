@@ -1260,6 +1260,52 @@ fn sweep_ingests_once_and_reports_each_variant() {
 }
 
 #[test]
+fn entity_lookup_of_a_shared_first_name_lists_the_other_person() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(
+        &e,
+        "Maya Chen is a data engineer on the analytics pipeline.",
+        |i| {
+            i.entities = vec![EntityIn {
+                name: "Maya Chen".into(),
+                kind: Some("person".into()),
+                description: Some("data engineer".into()),
+                ..Default::default()
+            }];
+        },
+    );
+    remember(
+        &e,
+        "Maya Lindqvist is a product designer on the onboarding flow.",
+        |i| {
+            i.entities = vec![EntityIn {
+                name: "Maya Lindqvist".into(),
+                kind: Some("person".into()),
+                description: Some("product designer".into()),
+                ..Default::default()
+            }];
+        },
+    );
+    let out = e.entity("Maya", 10).unwrap();
+    assert!(
+        out.card.name == "Maya Chen" || out.card.name == "Maya Lindqvist",
+        "{}",
+        out.card.name
+    );
+    assert_eq!(out.candidates.len(), 1, "{out:#?}");
+    let other = &out.candidates[0];
+    assert_ne!(other.id, out.card.id);
+    assert!(other.name == "Maya Chen" || other.name == "Maya Lindqvist");
+    assert_eq!(other.kind, "person");
+    assert!(!other.description.is_empty());
+
+    // An exact full-name lookup stays unambiguous.
+    let exact = e.entity("Maya Chen", 10).unwrap();
+    assert_eq!(exact.card.name, "Maya Chen");
+    assert!(exact.candidates.is_empty(), "{exact:#?}");
+}
+
+#[test]
 fn entity_lookup_falls_back_to_prefix_and_suggests_closest() {
     let engine = engine(Arc::new(HashEmbedder));
     remember(&engine, "The lab runs UltraBERT-Embed-150M on CPU.", |m| {

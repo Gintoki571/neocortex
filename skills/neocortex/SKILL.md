@@ -181,7 +181,7 @@ CLI; the installed binary is `~/.neocortex/bin/neocortex` (DB
 | `recall` | `neocortex recall <query>` | retrieve (defaults: k 8, budget 1200 tokens) |
 | `follow` | — (MCP only) | walk relations hop by hop, from one entity (optionally to another) |
 | `aggregate` | — (MCP only) | count and list the entities one relation reaches |
-| `entity` | `neocortex entity <name\|eID>` | profile of one entity |
+| `entity` | `neocortex entity <name\|eID>` | profile of one entity; a first name several people share lists the others as `candidates` |
 | `invalidate` | `neocortex invalidate <mID\|rID> --at <date>` | end a fact, keep history |
 | `forget` | `neocortex forget <mID> [--hard]` | retire a memory (soft) or delete it (hard) |
 | `merge_entities` | `neocortex merge <keep> <merge> [--force]` / `alias <entity> <alias>` | fix names; `distinct_from` on a `remember` entity splits a homonym |
@@ -197,7 +197,10 @@ When to use each:
 - `aggregate`: how-many, which-ones and list questions over one relation ("who
   works at Acme", "how many pets"). `source` or `target` fixes one end. Negated
   facts come back under `negative`, not in the count.
-- `entity`: everything known about one person, place or project.
+- `entity`: everything known about one person, place or project. A bare first
+  name shared by several people returns the best card plus `candidates` (and an
+  `also:` line in text output): ask again with the full name before answering
+  about that person.
 - `overview`: orienting in an unfamiliar knowledge base, or `query` to see one
   topic's neighbourhood. Not a source of individual facts.
 - `invalidate`: a fact stopped being true at a time (`at`, default now). Prefer

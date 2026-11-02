@@ -2,8 +2,8 @@ use crate::db::Db;
 use crate::embed::Mode;
 use crate::engine::Engine;
 use crate::engine::{
-    Community, CommunityRef, EntityCard, EntityOutput, FactHit, MemoryHit, NextHop, OverviewOutput,
-    RecallInput, RecallOutput,
+    Community, CommunityRef, EntityCandidate, EntityCard, EntityOutput, FactHit, MemoryHit,
+    NextHop, OverviewOutput, RecallInput, RecallOutput,
 };
 use crate::{extract, graph, kg, paths, rank, rerank, temporal, text, Result};
 use rusqlite::{params, params_from_iter, OptionalExtension};
@@ -2661,6 +2661,7 @@ pub(crate) fn resolve_entity(engine: &Engine, name: &str) -> Result<i64> {
 pub fn entity(engine: &Engine, name: &str, limit: usize) -> Result<EntityOutput> {
     let limit = limit.min(200);
     let id = resolve_entity(engine, name)?;
+    let candidates = entity_candidates(engine, name, id)?;
     let now = engine.clock().now;
     let mut card = card(engine, id)?;
     card.community = community_ref(engine, id)?;
@@ -2725,8 +2726,46 @@ pub fn entity(engine: &Engine, name: &str, limit: usize) -> Result<EntityOutput>
         current_facts: current,
         past_facts: past.into_iter().take(limit).collect(),
         similar,
+        candidates,
         timeline,
     })
+}
+
+/// H2-13: the other people a name can mean. A bare first name (`Maya`) or a
+/// name prefix (`Maya L`) that is not the exact alias of one entity matches
+/// every entity whose name starts with the same token; the best card still
+/// wins, but the others must be visible so the caller does not answer about
+/// the wrong person. Exact full-name lookups return nothing.
+fn entity_candidates(engine: &Engine, name: &str, chosen: i64) -> Result<Vec<EntityCandidate>> {
+    let n = text::norm_name(name);
+    if n.is_empty() {
+        return Ok(Vec::new());
+    }
+    let exact: i64 = engine.db.sql().query_row(
+        "SELECT COUNT(DISTINCT entity_id) FROM entity_aliases WHERE alias_norm=?1",
+        [&n],
+        |r| r.get(0),
+    )?;
+    if exact == 1 {
+        return Ok(Vec::new());
+    }
+    let mut st = engine.db.sql().prepare(
+        "SELECT DISTINCT e.id, e.name, e.type, e.description
+         FROM entity_aliases a JOIN entities e ON e.id=a.entity_id
+         WHERE (a.alias_norm=?1 OR substr(a.alias_norm,1,length(?1)+1)=?1||' ')
+           AND e.id<>?2
+         ORDER BY e.mention_count DESC, e.id LIMIT 5",
+    )?;
+    let rows = st.query_map(params![n, chosen], |r| {
+        Ok(EntityCandidate {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            kind: r.get(2)?,
+            description: r.get(3)?,
+            score: None,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Fallbacks after an exact alias miss: the unique-best alias prefix
