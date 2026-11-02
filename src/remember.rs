@@ -1515,13 +1515,7 @@ fn write_prepared(
             Ok(_) => {
                 let id = db.sql().last_insert_rowid();
                 crate::wtiming::begin(crate::wtiming::VEC_INSERT);
-                db.sql().execute(
-                    &format!(
-                        "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,{},1)",
-                        db.vec_sql("?2")
-                    ),
-                    params![id, db.vec_blob(&vectors[0])],
-                )?;
+                db.insert_memory_vec(id, &vectors[0])?;
                 crate::wtiming::end(crate::wtiming::VEC_INSERT);
                 crate::wtiming::begin(crate::wtiming::GRAPH);
                 kg::project_memory(db, id, &kind, &content)?;
@@ -2050,8 +2044,7 @@ fn write_prepared(
             "UPDATE memories SET valid_to=COALESCE(valid_to,?1),expired_at=?2,superseded_by=?3 WHERE id=?4",
             params![valid_from, now, id, target],
         )?;
-        db.sql()
-            .execute("UPDATE memories_vec SET live=0 WHERE rowid=?1", [target])?;
+        db.set_memory_vec_live(*target, 0)?;
     }
     let touched: Vec<i64> = invalidated
         .iter()
