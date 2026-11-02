@@ -46,6 +46,16 @@ pub fn project_memory(db: &Db, id: i64, kind: &str, content: &str) -> Result<()>
     )
 }
 
+/// Project a memory using its stored kind and text.
+fn project_memory_from_db(db: &Db, id: i64) -> Result<()> {
+    let (kind, content): (String, String) =
+        db.sql()
+            .query_row("SELECT kind,content FROM memories WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+    project_memory(db, id, &kind, &content)
+}
+
 pub fn project_entity(db: &Db, id: i64, name: &str, kind: &str) -> Result<()> {
     run(
         db,
@@ -79,9 +89,44 @@ pub fn bump_gen(db: &Db) -> Result<()> {
     Ok(())
 }
 
+const MEMORY_PROBE: &str = "MATCH (n:Memory {id:$id}) RETURN n.name AS name";
+const ENTITY_PROBE: &str = "MATCH (n:Entity {id:$id}) RETURN n.name AS name";
+
+/// True when the node carries its `name`. An edge MERGE run before its endpoint
+/// was projected leaves a node with only `id`, which no label query can name.
+fn node_named(db: &Db, probe: &str, id: &str) -> Result<bool> {
+    let mut q = db.graph().cypher_builder(probe);
+    q = q.param("id", id.to_string());
+    let rows = q.run()?;
+    let named = rows
+        .iter()
+        .next()
+        .and_then(|r| r.get::<String>("name").ok())
+        .is_some_and(|name| !name.is_empty());
+    Ok(named)
+}
+
+/// Project an endpoint missing from the projection before the edge that needs
+/// it, from its relational row.
+fn ensure_memory_node(db: &Db, id: i64) -> Result<()> {
+    if !node_named(db, MEMORY_PROBE, &format!("m:{id}"))? {
+        project_memory_from_db(db, id)?;
+    }
+    Ok(())
+}
+
+fn ensure_entity_node(db: &Db, id: i64) -> Result<()> {
+    if !node_named(db, ENTITY_PROBE, &format!("e:{id}"))? {
+        project_entity_from_db(db, id)?;
+    }
+    Ok(())
+}
+
 pub fn project_mention(db: &Db, memory: i64, entity: i64) -> Result<()> {
     // One MERGE statement: the two-`MATCH` form made graphqlite plan a
     // cartesian product and cost O(edges) per call on a grown graph.
+    ensure_memory_node(db, memory)?;
+    ensure_entity_node(db, entity)?;
     run(
         db,
         "MERGE (m:Memory {id:$m})-[:MENTIONS]->(e:Entity {id:$e})",
@@ -93,6 +138,8 @@ pub fn project_mention(db: &Db, memory: i64, entity: i64) -> Result<()> {
 }
 
 pub fn project_similar(db: &Db, a: i64, b: i64, score: f32) -> Result<()> {
+    ensure_entity_node(db, a)?;
+    ensure_entity_node(db, b)?;
     run(
         db,
         "MERGE (a:Entity {id:$a})-[r:SIMILAR]->(b:Entity {id:$b}) SET r.score=$score",
@@ -107,6 +154,8 @@ pub fn project_similar(db: &Db, a: i64, b: i64, score: f32) -> Result<()> {
 /// B5: a name-containment edge ("Cascais marina" contains "Cascais"), the
 /// weak hop the semantic beam and PPR walk.
 pub fn project_name_part(db: &Db, a: i64, b: i64, weight: f32) -> Result<()> {
+    ensure_entity_node(db, a)?;
+    ensure_entity_node(db, b)?;
     run(
         db,
         "MERGE (a:Entity {id:$a})-[r:CONTAINS]->(b:Entity {id:$b}) SET r.weight=$weight",
@@ -118,9 +167,7 @@ pub fn project_name_part(db: &Db, a: i64, b: i64, weight: f32) -> Result<()> {
     )
 }
 
-/// Project the containment edges of one entity. The caller must have
-/// projected the entity's node first: the edge MERGE matches both endpoints,
-/// and the write path links a new entity before its node exists.
+/// Project the containment edges of one entity.
 pub fn project_name_parts(db: &Db, entity: i64) -> Result<()> {
     let rows: Vec<(i64, i64, f32)> = {
         let mut st = db
@@ -136,6 +183,8 @@ pub fn project_name_parts(db: &Db, entity: i64) -> Result<()> {
 }
 
 pub fn project_relation(db: &Db, id: i64, src: i64, dst: i64, predicate: &str) -> Result<()> {
+    ensure_entity_node(db, src)?;
+    ensure_entity_node(db, dst)?;
     run(db, "MERGE (a:Entity {id:$a})-[r:REL {rid:$rid}]->(b:Entity {id:$b}) SET r.predicate=$predicate", &[
         ("a", format!("e:{src}").into()), ("b", format!("e:{dst}").into()),
         ("rid", id.into()), ("predicate", predicate.into()),
