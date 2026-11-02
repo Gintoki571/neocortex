@@ -497,3 +497,173 @@ fn scale_er07_exact_duplicate_has_no_near_duplicate() {
     assert_eq!(again.duplicate_of, Some(1));
     assert!(again.near_duplicate.is_none(), "{:?}", again.near_duplicate);
 }
+
+// H2-10: a calendar window in the question filters the memories whose own
+// interval is known and does not overlap it. A row whose valid_from is only
+// the ingest time has no stated interval and stays, ranked as before.
+#[test]
+fn h2_10_calendar_window_filters_rows_with_known_dates() {
+    let e = engine();
+    e.remember(RememberInput {
+        content: "The CRM was decommissioned on 2026-08-01.".into(),
+        kind: Some("event".into()),
+        valid_from: Some("2026-08-01".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        content: "The CRM freeze ran from 2026-10-01 until 2026-10-15.".into(),
+        kind: Some("event".into()),
+        valid_from: Some("2026-10-01".into()),
+        valid_to: Some("2026-10-15".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    memory(&e, "The CRM sprint ran for two weeks.", None);
+
+    let august = e
+        .recall(&RecallInput {
+            query: "what happened to the CRM in August 2026".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let ids: Vec<i64> = august.memories.iter().map(|m| m.id).collect();
+    assert!(ids.contains(&1), "August row dropped: {ids:?}");
+    assert!(
+        !ids.contains(&2),
+        "an October row is not an August answer: {ids:?}"
+    );
+    assert!(
+        ids.contains(&3),
+        "a row with no stated interval must stay: {ids:?}"
+    );
+
+    let october = e
+        .recall(&RecallInput {
+            query: "what did we freeze in October".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let ids: Vec<i64> = october.memories.iter().map(|m| m.id).collect();
+    assert!(ids.contains(&2), "October row dropped: {ids:?}");
+    assert!(
+        !ids.contains(&1),
+        "an August row is not an October answer: {ids:?}"
+    );
+}
+
+// H2-10: the filter is a window, not an as-of cut: a row that started before
+// the window and is still open overlaps it and stays.
+#[test]
+fn h2_10_window_keeps_open_intervals_starting_earlier() {
+    let e = engine();
+    e.remember(RememberInput {
+        content: "Robert Okafor has lived in Lisbon since 2025-11-01.".into(),
+        valid_from: Some("2025-11-01".into()),
+        entities: vec![person("Robert Okafor")],
+        ..Default::default()
+    })
+    .unwrap();
+    let out = e
+        .recall(&RecallInput {
+            query: "where did Robert Okafor live in August 2026".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let ids: Vec<i64> = out.memories.iter().map(|m| m.id).collect();
+    assert!(ids.contains(&1), "open interval overlaps August: {ids:?}");
+}
+
+// H2-10: a bare month that modifies a noun ("the December conference") dates
+// the subject, not the search: it stays a ranking boost, not a filter.
+#[test]
+fn h2_10_bare_month_does_not_filter() {
+    let e = engine();
+    e.remember(RememberInput {
+        content: "The EMBO workshop accepted the lab's talk on Lon.".into(),
+        kind: Some("event".into()),
+        valid_from: Some("2026-10-07".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let out = e
+        .recall(&RecallInput {
+            query: "which talk got the nod for the December conference".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let ids: Vec<i64> = out.memories.iter().map(|m| m.id).collect();
+    assert!(
+        ids.contains(&1),
+        "a date on the subject must not filter the answer: {ids:?}"
+    );
+}
+
+// H2-10: a memory whose text states a range ("from X to Y") keeps only its
+// start in the row, but the interval it states reaches into the window: an
+// event that runs into November is a November answer even though it started in
+// October.
+#[test]
+fn h2_10_window_keeps_event_whose_stated_range_reaches_into_it() {
+    let e = engine();
+    e.remember(RememberInput {
+        content: "Sprint 27 runs from 2026-10-26 to 2026-11-06.".into(),
+        kind: Some("event".into()),
+        valid_from: Some("2026-10-26".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    // "in" scopes the search to November, so the window filter is live; the
+    // row starts in October and must survive on the end its text states.
+    for query in [
+        "what is scheduled for November 2026",
+        "what happened in November 2026",
+    ] {
+        let out = e
+            .recall(&RecallInput {
+                query: query.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<i64> = out.memories.iter().map(|m| m.id).collect();
+        assert!(
+            ids.contains(&1),
+            "{query}: a stated range that reaches November is a November answer: {ids:?}"
+        );
+        assert!(
+            !out.window_empty,
+            "{query}: the November row is in view, so the window is not empty"
+        );
+    }
+}
+
+// H2-10: a month with an explicit year that still modifies a noun ("the
+// December 2026 conference") dates the subject, not the search: the year does
+// not turn a bare-month modifier into a scoping window.
+#[test]
+fn h2_10_year_on_a_noun_modifier_does_not_filter() {
+    let e = engine();
+    e.remember(RememberInput {
+        content: "The EMBO workshop accepted the lab's talk on Lon.".into(),
+        kind: Some("event".into()),
+        valid_from: Some("2026-10-07".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    for query in [
+        "which talk got the nod for the December 2026 conference",
+        "what happened at the December 2026 conference",
+    ] {
+        let out = e
+            .recall(&RecallInput {
+                query: query.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let ids: Vec<i64> = out.memories.iter().map(|m| m.id).collect();
+        assert!(
+            ids.contains(&1),
+            "{query}: a year on the subject must not filter the answer: {ids:?}"
+        );
+    }
+}

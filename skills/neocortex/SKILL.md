@@ -157,6 +157,15 @@ and `next:` when present.
   plans ("upcoming", "planned", "scheduled"), names a future window, or asks
   about that event ("when does the deploy freeze start", "is the v1 API
   deprecated").
+- A month, year or date range in the question is a window when the question
+  scopes itself to it ("in August 2026", "during 2025", "on 2026-08-01"):
+  memories whose stored dates fall outside it are dropped, while memories with
+  no stated date still appear (their `valid_from` is only when they were
+  written), so check the date on each line before answering "what happened in
+  August". An event whose text states a range ("from 2026-10-26 to 2026-11-06")
+  counts as spanning it. A month that names the subject ("the December 2026
+  conference") is not a window: the question is about that event, not about
+  December.
 - A memory-lapse phrasing ("I don't remember ...", "I forgot ...", "remind me
   ...") is a request, not a negation: pass the question itself to recall.
 - An exclusion question ("which service is not in Rust", "what database does

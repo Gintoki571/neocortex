@@ -1,6 +1,9 @@
 //! Community quality probe: Leiden (this crate) versus graphqlite louvain on
 //! the same database. Modularity is scored on the weighted snapshot graph for
-//! both partitions, so only the partitions differ.
+//! both partitions, so only the partitions differ. The last line scores the
+//! partition the engine actually serves (`kg::communities`, what `overview` and
+//! entity cards show) on the entity-induced subgraph, which is where a hub's
+//! membership shows up.
 //!
 //!   cargo run --release --example community_eval -- <db>
 
@@ -69,15 +72,16 @@ fn louvain(db: &Db, snap: &kg::Snapshot) -> neocortex::Result<Vec<u32>> {
     Ok(comm)
 }
 
-fn report(name: &str, csr: &graph::Csr, comm: &[u32], ms: f64) {
+fn report(name: &str, csr: &graph::Csr, comm: &[u32], ms: Option<f64>) {
     let q = graph::modularity(csr, comm, 1.0);
     let mut sizes: HashMap<u32, usize> = HashMap::new();
     for &c in comm {
         *sizes.entry(c).or_default() += 1;
     }
     let singletons = sizes.values().filter(|n| **n == 1).count();
+    let timing = ms.map(|ms| format!(", {ms:.1} ms")).unwrap_or_default();
     println!(
-        "{name}: Q {q:.4}, {} communities, {singletons} singletons, {ms:.1} ms",
+        "{name}: Q {q:.4}, {} communities, {singletons} singletons{timing}",
         sizes.len()
     );
 }
@@ -103,12 +107,34 @@ fn main() -> neocortex::Result<()> {
     let new = graph::leiden(&snap.csr, 7, 1.0);
     let new_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    report("louvain (graphqlite, projection)", &snap.csr, &old, old_ms);
+    report(
+        "louvain (graphqlite, projection)",
+        &snap.csr,
+        &old,
+        Some(old_ms),
+    );
     report(
         "leiden  (crate, weighted snapshot)",
         &snap.csr,
         &new,
-        new_ms,
+        Some(new_ms),
+    );
+
+    // Where entity grouping is visible: the entity-induced subgraph. The flat
+    // Leiden partition is the "before" number (it is what an H2-19-less build
+    // serves), the served partition is what `overview` shows now.
+    let (csr, entities) = kg::entity_subgraph(&snap);
+    let comm: Vec<u32> = entities
+        .iter()
+        .map(|e| new[snap.ent_node[e] as usize])
+        .collect();
+    report("flat    (leiden, entity subgraph)", &csr, &comm, None);
+    let t = Instant::now();
+    let served = kg::community_quality(&db)?;
+    let served_ms = t.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "served  (kg::communities, entity subgraph): Q {:.4}, {} communities, {} singletons, {served_ms:.1} ms",
+        served.modularity, served.communities, served.singletons
     );
     Ok(())
 }
