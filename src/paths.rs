@@ -640,16 +640,27 @@ fn query_terms(query: &str, anchor_names: &[String]) -> Vec<HashSet<String>> {
     let mut out: Vec<HashSet<String>> = Vec::new();
     for token in text::tokens(query) {
         let bare: String = token.chars().filter(|c| *c != '\'').collect();
-        if token.chars().count() < 2
-            || text::is_stopword(&token)
-            || ANSWER_WORDS.contains(&bare.as_str())
-        {
+        if token.chars().count() < 2 || text::is_stopword(&token) {
             continue;
         }
-        let mut forms = token_forms(&token);
-        if let Some((_, extra)) = TERM_SYNONYMS.iter().find(|(word, _)| *word == token) {
-            forms.extend(extra.iter().map(|word| (*word).to_string()));
-        }
+        let synonyms: HashSet<String> = TERM_SYNONYMS
+            .iter()
+            .filter(|(word, _)| *word == token)
+            .flat_map(|(_, extra)| extra.iter().map(|word| (*word).to_string()))
+            .collect();
+        // An answer-type word ("language", "city") says what the answer is,
+        // not which relation a hop states; it steers the path only through
+        // its relation synonyms ("language" -> use).
+        let forms = if ANSWER_WORDS.contains(&bare.as_str()) {
+            if synonyms.is_empty() {
+                continue;
+            }
+            synonyms
+        } else {
+            let mut forms = token_forms(&token);
+            forms.extend(synonyms);
+            forms
+        };
         if !forms.is_disjoint(&anchors) || out.iter().any(|existing| !existing.is_disjoint(&forms))
         {
             continue;
@@ -784,6 +795,97 @@ fn incident(
     Ok(out)
 }
 
+/// "<word>'s <noun>" pairs of a question. `text::fold` drops the apostrophe
+/// inside a word, so the possessive is read from the raw query, not `tokens`.
+fn possessive_pairs(query: &str) -> Vec<(String, String)> {
+    let raw: Vec<&str> = query.split_whitespace().collect();
+    let mut out = Vec::new();
+    for (i, word) in raw.iter().enumerate() {
+        let lower = word.to_lowercase();
+        let Some(stem) = lower
+            .strip_suffix("'s")
+            .or_else(|| lower.strip_suffix("\u{2019}s"))
+        else {
+            continue;
+        };
+        let Some(noun) = raw.get(i + 1) else {
+            continue;
+        };
+        let (stem, noun) = (text::fold(stem), text::fold(noun));
+        if stem.is_empty() || noun.is_empty() {
+            continue;
+        }
+        out.push((stem, noun));
+    }
+    out
+}
+
+/// The term a possessive head noun spends, when the question names one.
+fn possessive_noun_bit(terms: &[HashSet<String>], noun: &str) -> Option<usize> {
+    let forms = token_forms(noun);
+    terms.iter().position(|term| !term.is_disjoint(&forms))
+}
+
+/// "<Person>'s project" names the entity of that type the person holds: the
+/// possessive is itself the hop, so path search starts at that entity with the
+/// noun's term already covered. One clear entity only, like an anchor's role
+/// noun; an untyped or ambiguous holder leaves the beam as it was.
+fn possessive_starts(
+    db: &Db,
+    query: &str,
+    terms: &[HashSet<String>],
+    seeds: &[i64],
+    vis: Visibility,
+) -> Result<Vec<(i64, u64)>> {
+    let mut out: Vec<(i64, u64)> = Vec::new();
+    for (stem, noun) in possessive_pairs(query) {
+        let Some(index) = possessive_noun_bit(terms, &noun) else {
+            continue;
+        };
+        let want = text::singularize(&noun);
+        for id in seeds {
+            if out.iter().any(|(entity, _)| entity == id) {
+                continue;
+            }
+            let name: String = db
+                .sql()
+                .query_row("SELECT name FROM entities WHERE id=?1", [id], |r| r.get(0))
+                .unwrap_or_default();
+            if !text::tokens(&name).contains(&stem) {
+                continue;
+            }
+            let mut st = db.sql().prepare_cached(
+                "SELECT r.dst,e.type,r.valid_from,r.valid_to,r.expired_at
+                   FROM relations r JOIN entities e ON e.id=r.dst
+                  WHERE r.src=?1 AND r.polarity=1",
+            )?;
+            let rows = st.query_map([id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                ))
+            })?;
+            let mut found: Vec<i64> = Vec::new();
+            for row in rows {
+                let (dst, kind, from, to, expired) = row?;
+                if !vis.shows(from, to, expired) || text::norm_name(&kind) != want {
+                    continue;
+                }
+                if !found.contains(&dst) {
+                    found.push(dst);
+                }
+            }
+            if found.len() == 1 && !out.iter().any(|(entity, _)| *entity == found[0]) {
+                out.push((found[0], 1u64 << index));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Ranked paths that start at one of `seeds` and add at least one new question
 /// term per hop.
 pub(crate) fn search(db: &Db, query: &str, seeds: &[i64], vis: Visibility) -> Result<Vec<PathHit>> {
@@ -815,6 +917,20 @@ pub(crate) fn search(db: &Db, query: &str, seeds: &[i64], vis: Visibility) -> Re
             steps: Vec::new(),
         })
         .collect();
+    // "<Person>'s project" already names the entity of that type the person
+    // holds: start there with the noun's own term spent, so the next hop is
+    // the one the question actually asks.
+    for (entity, covered) in possessive_starts(db, query, &terms, seeds, vis)? {
+        match frontier.iter_mut().find(|state| state.entity == entity) {
+            Some(state) => state.covered |= covered,
+            None => frontier.push(State {
+                entity,
+                covered,
+                score: 1.0,
+                steps: Vec::new(),
+            }),
+        }
+    }
     frontier.sort_by_key(|state| state.entity);
     frontier.dedup_by_key(|state| state.entity);
 
@@ -2628,5 +2744,159 @@ mod name_part_tests {
         );
         const { assert!(NAME_PART_HOP < super::PROSE_HOP) };
         const { assert!(super::PROSE_HOP < 1.0) };
+    }
+}
+
+/// nc-passive: "which language is used by <person>'s project" and "the main
+/// language of the project led by <person>" ask the same two hops as the
+/// active shape. The passive verb must read as its active predicate ("used" /
+/// "led" -> use / lead), an answer-type noun must still steer through its
+/// relation synonym ("language" -> use), and "<person>'s project" must start
+/// the walk at the project the person leads. Before that the beams left the
+/// person and rendered hop 1 only (world-300: five two-hop misses).
+#[cfg(test)]
+mod passive_query_tests {
+    use super::{evidence, search, Visibility};
+    use crate::embed::HashEmbedder;
+    use crate::engine::{Engine, EntityIn, RelationIn, RememberInput};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn remember(
+        engine: &Engine,
+        content: &str,
+        entities: &[(&str, &str)],
+        (source, predicate, target, fact): (&str, &str, &str, &str),
+    ) -> i64 {
+        engine
+            .remember(RememberInput {
+                content: content.into(),
+                entities: entities
+                    .iter()
+                    .map(|(name, kind)| EntityIn {
+                        name: (*name).into(),
+                        kind: Some((*kind).into()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                relations: vec![RelationIn {
+                    source: source.into(),
+                    predicate: predicate.into(),
+                    target: target.into(),
+                    fact: Some(fact.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .id
+    }
+
+    /// Two people, two projects, two languages.
+    fn fixture() -> (Engine, i64, i64) {
+        let engine = Engine::open_in_memory(Arc::new(HashEmbedder)).unwrap();
+        remember(
+            &engine,
+            "Cedric Narmani leads the Vesper Monitor project.",
+            &[("Cedric Narmani", "person"), ("Vesper Monitor", "project")],
+            (
+                "Cedric Narmani",
+                "leads",
+                "Vesper Monitor",
+                "Cedric Narmani leads Vesper Monitor",
+            ),
+        );
+        let ruby = remember(
+            &engine,
+            "Vesper Monitor is written in Ruby.",
+            &[("Vesper Monitor", "project"), ("Ruby", "tool")],
+            ("Vesper Monitor", "uses", "Ruby", "Vesper Monitor uses Ruby"),
+        );
+        remember(
+            &engine,
+            "Ruby Chanyya leads the Borealis Inbox project.",
+            &[("Ruby Chanyya", "person"), ("Borealis Inbox", "project")],
+            (
+                "Ruby Chanyya",
+                "leads",
+                "Borealis Inbox",
+                "Ruby Chanyya leads Borealis Inbox",
+            ),
+        );
+        let scala = remember(
+            &engine,
+            "Borealis Inbox is written in Scala.",
+            &[("Borealis Inbox", "project"), ("Scala", "tool")],
+            (
+                "Borealis Inbox",
+                "uses",
+                "Scala",
+                "Borealis Inbox uses Scala",
+            ),
+        );
+        (engine, ruby, scala)
+    }
+
+    fn today() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn reached(engine: &Engine, query: &str, person: &str, memory: i64) -> bool {
+        let seed: i64 = engine
+            .db
+            .sql()
+            .query_row("SELECT id FROM entities WHERE name=?1", [person], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let vis = Visibility {
+            now: today(),
+            as_of: None,
+            history: false,
+        };
+        let hits = search(&engine.db, query, &[seed], vis).unwrap();
+        evidence(&engine.db, &hits).unwrap().contains(&memory)
+    }
+
+    #[test]
+    fn a_possessive_passive_question_walks_to_the_language() {
+        let (engine, ruby, _) = fixture();
+        assert!(
+            reached(
+                &engine,
+                "which language is used by Cedric Narmani's project",
+                "Cedric Narmani",
+                ruby
+            ),
+            "hop 2 (project -> language) was not walked"
+        );
+    }
+
+    #[test]
+    fn a_passive_relative_clause_walks_to_the_language() {
+        let (engine, _, scala) = fixture();
+        assert!(
+            reached(
+                &engine,
+                "what is the main language of the project led by Ruby Chanyya",
+                "Ruby Chanyya",
+                scala
+            ),
+            "hop 2 (project -> language) was not walked"
+        );
+    }
+
+    #[test]
+    fn the_active_shape_still_walks_both_hops() {
+        let (engine, ruby, _) = fixture();
+        assert!(reached(
+            &engine,
+            "what language does the project Cedric Narmani leads use",
+            "Cedric Narmani",
+            ruby
+        ));
     }
 }
