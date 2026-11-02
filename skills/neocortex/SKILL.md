@@ -75,9 +75,10 @@ Store something when it will still matter next week:
 - **Causes are relations too**: `{"source": "disk full", "predicate": "caused",
   "target": "deploy failed"}`. `causes`, `led to`, `resulted in`, `caused by`
   and `because of` share one seeded family, and the inverse is stored from the
-  cause side. Why-questions then surface the cause evidence first. The
-  `causal_extract` text-cue extractor is an eval-only knob (off); a cause you
-  do not pass is not stored.
+  cause side. A why-question follows the cause one step out from the memory
+  that answered it (the cause memory and its fact come back even when that
+  memory never names the cause). The `causal_extract` text-cue extractor is an
+  eval-only knob (off); a cause you do not pass is not stored.
 - **Negation**: pass `negated: true` for "does not support Y"; it renders as
   `—NOT→` and ends the matching positive interval. JSON facts carry `"polarity": 0`
   next to the explicit negative `fact` text.
@@ -157,6 +158,20 @@ and `next:` when present.
   the memories of the items that lack it come first, and the facts that give
   the property to the other items are kept last. When no stored entity type or
   property matches, it is answered like an ordinary question.
+- A status question ("what bug is still open", "which issues are unresolved")
+  ranks the defect reports no later memory fixes first; a bug a later memory
+  fixes is still shown, after them. A report that says it is not fixed yet
+  ("not fixed yet", "no fix yet", "needs a fix") is an open report. When the
+  question names one defect ("is the login bug still open"), only that
+  defect's report is re-ranked and it keeps its place against unrelated bugs.
+  The question has to name a defect ("is the API still open to the public" and
+  "which PRs are outstanding" are ordinary questions), and "open question" is
+  a pending decision, not an open defect.
+- A why-question also returns the cause: after the first pass, the stored
+  cause of the memory that answered it (a `cause` relation that ends at an
+  entity of the question, or whose memory shares a specific entity with the
+  answer) is added to the memories and its fact leads `facts:`. A cause that
+  shares only a broad entity, such as a team every note mentions, is ignored.
 - History is automatic for past-tense wording ("used to", "before",
   "previously", "changed", "did ... use", "no longer"), so ended facts appear
   without `include_history`. Use `as_of` for "what was true then".

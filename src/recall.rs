@@ -21,6 +21,32 @@ const EXCLUSION_WEIGHT: f64 = 2.5;
 /// Score multiplier for memories of the typed items that do have the
 /// excluded property: they are the wrong answer to that question.
 const EXCLUSION_PENALTY: f64 = 0.5;
+/// Weight of the status channel: bug reports no later memory fixes answer a
+/// "what is still open" question (H2-15).
+const STATUS_WEIGHT: f64 = 4.0;
+/// Score multiplier for a bug a later memory fixes: still shown, ranked after
+/// the open ones.
+const STATUS_CLOSED_PENALTY: f64 = 0.5;
+/// Score multiplier for a memory that reports no defect at all on a status
+/// question: "Lumen is written in Rust" is not an open bug.
+const STATUS_NEUTRAL_PENALTY: f64 = 0.7;
+/// How many first-pass answers seed the cause follow (H2-16).
+const CAUSE_SEEDS: usize = 2;
+/// Weight of the followed cause memory: it explains the answer, it is not the
+/// answer (the memory that names the fix stays first).
+const CAUSE_WEIGHT: f64 = 1.5;
+/// Most "is a later memory a fix" lookups one status question may run.
+const STATUS_LOOKUPS: usize = 20;
+/// How many FTS hits one "is a later memory a fix" lookup reads: enough to
+/// find the live candidates for a bug from any point in the timeline.
+const STATUS_FTS_HITS: usize = 200;
+/// How many live candidates one lookup examines, in bm25 order.
+const STATUS_FIX_CANDIDATES: usize = 30;
+/// The status lookup's candidate query. The FTS table is the only source, so
+/// the MATCH runs once per lookup; a join that starts from `memories` makes
+/// SQLite evaluate it once per stored memory.
+const STATUS_FTS_SQL: &str = "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1
+     ORDER BY bm25(memories_fts) LIMIT ?2";
 /// Top dense-retrieval cosine below which a query with no lexical or entity
 /// support is treated as "nothing relevant is stored".
 const ABSTAIN_COSINE: f64 = 0.18;
@@ -225,6 +251,95 @@ fn top_by_cosine(db: &Db, ids: &[i64], query_vec: &[f32], keep: usize) -> Result
     scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.truncate(keep);
     Ok(scored.into_iter().map(|(_, id)| id).collect())
+}
+
+/// H2-15: the bug reports among the candidates, split into the ones no later
+/// memory fixes (the answer to "what is still open") and the ones a later
+/// memory fixes. A report that carries a fix cue itself is already closed
+/// unless the cue is negated ("not fixed yet").
+///
+/// A question that names a defect ("is the login bug still open") only ranks
+/// the reports about that defect; a general question ("what bug is still
+/// open") ranks every open report. Reports are ranked by query cosine before
+/// the lookup budget, so which ones are classified never depends on the order
+/// they were stored in.
+fn status_channels(
+    engine: &Engine,
+    want: &HashSet<String>,
+    query_vec: &[f32],
+    rows: &HashMap<i64, MemoryRow>,
+    now: i64,
+) -> Result<(Vec<i64>, HashSet<i64>)> {
+    let mut closed = HashSet::new();
+    let mut bugs = Vec::new();
+    for (id, row) in rows {
+        if !paths::is_bug_memory(&row.1) {
+            continue;
+        }
+        if paths::has_fix_cue(&row.1) {
+            closed.insert(*id);
+        } else if want.is_empty()
+            || paths::status_terms(&row.1)
+                .iter()
+                .any(|term| want.contains(term))
+        {
+            bugs.push(*id);
+        }
+    }
+    let ranked = top_by_cosine(&engine.db, &bugs, query_vec, STATUS_LOOKUPS)?;
+    let mut open = Vec::new();
+    for id in ranked {
+        let Some(row) = rows.get(&id) else { continue };
+        if fixed_later(&engine.db, id, &row.1, row.9, now)? {
+            closed.insert(id);
+        } else {
+            open.push(id);
+        }
+    }
+    let open = top_by_cosine(&engine.db, &open, query_vec, 30)?;
+    Ok((open, closed))
+}
+
+/// A memory written at or after `from` and still live at `now` that fixes the
+/// defect `content` reports: it carries a fix cue and shares a date and a
+/// content word, or two content words.
+///
+/// The lookup is driven by the FTS index (`STATUS_FTS_SQL`) and filters the
+/// hits in bm25 order, so a status question costs one MATCH per lookup, not
+/// one per stored memory.
+fn fixed_later(db: &Db, id: i64, content: &str, from: i64, now: i64) -> Result<bool> {
+    let mut terms: Vec<String> = paths::status_terms(content).into_iter().collect();
+    terms.sort();
+    terms.truncate(12);
+    let Some(q) = text::fts_query(&terms.join(" "), &[]) else {
+        return Ok(false);
+    };
+    let hits: Vec<i64> = db
+        .sql()
+        .prepare_cached(STATUS_FTS_SQL)?
+        .query_map(params![q, STATUS_FTS_HITS as i64], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let rows = fetch_rows(db, &hits)?;
+    let mut live = 0;
+    for other in hits {
+        if other == id {
+            continue;
+        }
+        let Some(row) = rows.get(&other) else {
+            continue;
+        };
+        if row.9 < from || is_ended(row, now) {
+            continue;
+        }
+        live += 1;
+        if paths::has_fix_cue(&row.1) && paths::same_bug(content, &row.1) {
+            return Ok(true);
+        }
+        if live >= STATUS_FIX_CANDIDATES {
+            break;
+        }
+    }
+    Ok(false)
 }
 
 /// World-time end of a memory (valid_to reached) or system retirement.
@@ -880,6 +995,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         paths::exclusion_entities(&engine.db, &input.query, now)?
     };
     let causal_query = paths::causal_intent(&input.query);
+    let status_query = engine.cfg.status_rank && paths::status_intent(&input.query);
     let query_text = input
         .query
         .split_whitespace()
@@ -1340,7 +1456,28 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     });
     excl_ids.truncate(depth);
 
-    let channels = [
+    // ---------------------------------------------------------- status
+    // H2-15: "what is still open" asks for the defects no later memory fixes.
+    // Only the candidate rows are classified; the rule re-ranks, never hides.
+    // A question that names a defect (`want` is not empty) is about that
+    // defect: only its reports are ranked, and its own fix is not demoted.
+    let status_want: HashSet<String> = if status_query {
+        paths::status_question_terms(&input.query)
+    } else {
+        HashSet::new()
+    };
+    let status_specific = !status_want.is_empty();
+    let (mut status_ids, status_closed) = if status_query {
+        status_channels(engine, &status_want, &query_vec, &rows, now)?
+    } else {
+        (Vec::new(), HashSet::new())
+    };
+    status_ids.retain(|id| {
+        rows.get(id)
+            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
+    });
+
+    let mut channels = vec![
         rank::Channel {
             name: "bm25",
             weight: engine.cfg.w_bm25,
@@ -1386,7 +1523,41 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             weight: EXCLUSION_WEIGHT,
             ids: &excl_ids,
         },
+        rank::Channel {
+            name: "status",
+            weight: STATUS_WEIGHT,
+            ids: &status_ids,
+        },
     ];
+    // H2-16: a why-question asks for the cause of what answered the first
+    // pass, so the seeds are the first-pass head, not the query.
+    let (mut cause_ids, cause_relations) = if engine.cfg.cause_follow && causal_query {
+        let seeds: Vec<i64> = rank::rrf(&channels, engine.cfg.rrf_k)
+            .into_iter()
+            .take(CAUSE_SEEDS)
+            .map(|f| f.id)
+            .collect();
+        paths::cause_follow(&engine.db, &seeds, &anchors.all(), vis, 6)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let missing: Vec<i64> = cause_ids
+        .iter()
+        .copied()
+        .filter(|id| !rows.contains_key(id))
+        .collect();
+    rows.extend(fetch_rows(&engine.db, &missing)?);
+    cause_ids.retain(|id| {
+        rows.get(id)
+            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
+    });
+    if !cause_ids.is_empty() {
+        channels.push(rank::Channel {
+            name: "cause",
+            weight: CAUSE_WEIGHT,
+            ids: &cause_ids,
+        });
+    }
     let fused = rank::rrf(&channels, engine.cfg.rrf_k);
     // E5: retention only nudges scores when the knob is on. Reads are batched
     // once for the whole candidate set; a zero weight never queries the table.
@@ -1420,6 +1591,20 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         HashMap::new()
     };
     let cutoff = as_of.unwrap_or(now);
+    // H2-15: a memory that matches the question better than every defect
+    // report is an answer, not a near miss, and is never demoted.
+    let best_bug = if status_query {
+        fused
+            .iter()
+            .filter(|f| {
+                rows.get(&f.id)
+                    .is_some_and(|row| paths::is_bug_memory(&row.1))
+            })
+            .map(|f| f.score)
+            .fold(0.0, f64::max)
+    } else {
+        0.0
+    };
     let mut candidates = Vec::new();
     for f in fused {
         let Some(row) = rows.get(&f.id) else { continue };
@@ -1446,6 +1631,21 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         }
         if blocked_ids.contains(&f.id) {
             score *= EXCLUSION_PENALTY;
+        }
+        if status_query {
+            if paths::is_bug_memory(&row.1) {
+                // A general "what is still open" ranks fixed reports after the
+                // open ones. A question that names one defect keeps its report
+                // and its fix where the ordinary channels put them: halving
+                // them would let unrelated open bugs answer for it.
+                if !status_specific && status_closed.contains(&f.id) {
+                    score *= STATUS_CLOSED_PENALTY;
+                }
+            } else if f.score < best_bug {
+                // Only the memories that no defect report outranks: a plain
+                // answer the question matches better keeps its place.
+                score *= STATUS_NEUTRAL_PENALTY;
+            }
         }
         candidates.push((f.id, score, f.ranks));
     }
@@ -1671,6 +1871,20 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         merged.truncate(8);
         merged
     };
+    // H2-16: the cause the first-pass answer points at leads the facts. A
+    // relation already rendered by a chain stays where it is, once.
+    if !cause_relations.is_empty() {
+        let known: HashSet<i64> = facts.iter().map(|fact| fact.id).collect();
+        let mut extra: Vec<FactHit> = paths::facts_by_ids(&engine.db, &cause_relations, cutoff, 2)?
+            .into_iter()
+            .filter(|fact| (history || !fact.ended) && !known.contains(&fact.id))
+            .collect();
+        if !extra.is_empty() {
+            extra.extend(facts);
+            extra.truncate(8);
+            facts = extra;
+        }
+    }
     // The facts that give the excluded property to a typed item are the wrong
     // answers ("auth-service is written in Rust" for "which service is not in
     // Rust"): keep them, but after the facts that answer the question.
@@ -3333,5 +3547,46 @@ mod hint_tests {
         let f = fixture();
         let chain = chain(f.step_to_mira.clone());
         assert!(hint(&f, &[&chain], &[(f.mira, 0.9)], &[], &[], 0.0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query_plan(db: &Db, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Vec<String> {
+        let mut st = db
+            .sql()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let mut out = Vec::new();
+        for row in st
+            .query_map(params_from_iter(params.iter()), |r| r.get::<_, String>(3))
+            .unwrap()
+        {
+            out.push(row.unwrap());
+        }
+        out
+    }
+
+    /// D2: the status lookup must run the FTS MATCH once, not once per stored
+    /// memory. The old query joined `memories`, so its plan had two data
+    /// sources (the plan SQLite picked on a vault with stats was `SCAN m` then
+    /// a virtual-table lookup per row) and a status question runs up to
+    /// STATUS_LOOKUPS of these lookups. One source is the FTS table alone.
+    #[test]
+    fn the_status_lookup_is_driven_by_the_fts_index_alone() {
+        let db = Db::open_in_memory().unwrap();
+        let plan = query_plan(&db, STATUS_FTS_SQL, &[&"\"export\"*", &10i64]);
+        let sources: Vec<&String> = plan
+            .iter()
+            .filter(|step| step.contains("SCAN") || step.contains("SEARCH"))
+            .collect();
+        assert_eq!(
+            sources.len(),
+            1,
+            "the lookup reads more than the FTS index: {plan:?}"
+        );
+        assert!(sources[0].contains("memories_fts"), "{plan:?}");
     }
 }
