@@ -183,6 +183,50 @@ fn temporal_link_ids(db: &Db, seeds: &[(i64, f64)], keep: usize, depth: usize) -
     Ok(ranked.into_iter().map(|(id, _)| id).collect())
 }
 
+/// Memory KNN over `memories_vec`: the exact vec0 scan, or — when
+/// `Config.vec_prefilter = "bit"` — the `memories_bits` Hamming scan followed
+/// by an exact cosine rerank of the candidates. Both return `(id, cosine)` in
+/// descending order (ties on id) truncated to `k`. The bit table is derived:
+/// the first use creates and backfills it, and a database that cannot be
+/// written (read-only, no table) falls back to the exact scan.
+fn memory_knn(engine: &Engine, query: &[f32], k: usize, history: bool) -> Result<Vec<(i64, f32)>> {
+    if engine.cfg.vec_prefilter == "bit" && engine.db.ensure_bits().is_ok() {
+        let n = engine
+            .cfg
+            .vec_prefilter_n
+            .max(1)
+            .saturating_mul(k)
+            .clamp(k, 5000);
+        let ids = engine.db.bits_knn(query, n, !history)?;
+        let vectors = fetch_vectors(&engine.db, &ids)?;
+        let mut scored: Vec<(i64, f32)> = ids
+            .iter()
+            .filter_map(|id| vectors.get(id).map(|v| (*id, rank::cosine(query, v))))
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(k);
+        return Ok(scored);
+    }
+    let knn_sql = if history {
+        "SELECT rowid,1-distance FROM memories_vec
+         WHERE embedding MATCH {} AND k=?2 ORDER BY distance"
+    } else {
+        "SELECT rowid,1-distance FROM memories_vec
+         WHERE embedding MATCH {} AND k=?2 AND live=1 ORDER BY distance"
+    };
+    let mut st = engine
+        .db
+        .sql()
+        .prepare(&knn_sql.replace("{}", &engine.db.vec_sql("?1")))?;
+    // At least SEM_FACTS neighbours: the semantic beam uses them as prose hops.
+    let knn = st
+        .query_map(params![engine.db.vec_blob(query), k as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f32>(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(knn)
+}
+
 fn fetch_vectors(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<f32>>> {
     // vec0 serves `rowid = ?` as a point lookup but `rowid IN (...)` as a full
     // scan of the table, so fetch one row at a time.
@@ -936,27 +980,12 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         .collect();
 
     // ---------------------------------------------------------- vector
-    let knn_sql = if history {
-        "SELECT rowid,1-distance FROM memories_vec
-         WHERE embedding MATCH {} AND k=?2 ORDER BY distance"
-    } else {
-        "SELECT rowid,1-distance FROM memories_vec
-         WHERE embedding MATCH {} AND k=?2 AND live=1 ORDER BY distance"
-    };
-    let mut st = engine
-        .db
-        .sql()
-        .prepare(&knn_sql.replace("{}", &engine.db.vec_sql("?1")))?;
-    // At least SEM_FACTS neighbours: the semantic beam uses them as prose hops.
-    let mut knn: Vec<(i64, f32)> = st
-        .query_map(
-            params![
-                engine.db.vec_blob(&query_vec),
-                fetch_depth.max(paths::SEM_FACTS) as i64
-            ],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f32>(1)?)),
-        )?
-        .collect::<rusqlite::Result<_>>()?;
+    let mut knn = memory_knn(
+        engine,
+        &query_vec,
+        fetch_depth.max(paths::SEM_FACTS),
+        history,
+    )?;
     let nearest_memories: Vec<i64> = knn.iter().map(|(id, _)| *id).collect();
     knn.truncate(fetch_depth);
     let knn_ids: Vec<i64> = knn.iter().map(|(id, _)| *id).collect();

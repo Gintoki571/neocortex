@@ -118,6 +118,28 @@ const VEC_TABLES: [&str; 4] = [
     "relations_vec",
 ];
 
+/// Binary prefilter over memory vectors (lane nc-binvec): one sign bit per
+/// dimension, packed LSB-first, plus the `live` filter column of
+/// `memories_vec`. Derived from the stored vectors, so it is created on demand
+/// (never by `create_schema`) and only used when `Config.vec_prefilter = "bit"`.
+pub const BITS_TABLE: &str = "memories_bits";
+
+/// Rows per backfill batch: 1024 x 3 KiB keeps a batch small on the low-RAM target.
+const BITS_BATCH: i64 = 1024;
+
+/// Sign bits of `v`, LSB-first (96 bytes for 768 dims). Hamming distance over
+/// two of these estimates the angle between the vectors (d/768 ~ theta/pi), so
+/// the table only generates candidates; the exact rerank orders them.
+pub fn sign_bits(v: &[f32]) -> Vec<u8> {
+    let mut out = vec![0u8; DIMS.div_ceil(8)];
+    for (i, x) in v.iter().take(DIMS).enumerate() {
+        if *x > 0.0 {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
+}
+
 /// One connection for everything (relational, FTS5, vec0, Cypher), so a
 /// write is one transaction.
 pub struct Db {
@@ -252,6 +274,16 @@ impl Db {
         // v4 database instead of renumbering the schema. Idempotent by design.
         db.ensure_additive_tables()?;
         db.vec = db.stored_vec_mode()?;
+        // Opt-in binary prefilter (`NEOCORTEX_VEC_PREFILTER=bit`): fill the
+        // derived table on the first open that asks for it, so writes keep it
+        // in sync from then on. Best-effort: a read-only database opens without
+        // it, and the read path ensures it again (or falls back to the scan).
+        if matches!(
+            std::env::var("NEOCORTEX_VEC_PREFILTER").as_deref(),
+            Ok("bit")
+        ) {
+            let _ = db.ensure_bits();
+        }
         Ok(db)
     }
 
@@ -404,6 +436,246 @@ impl Db {
     /// SQL argument for a vec0 vector bound to `arg` (see [`VecMode::bind_sql`]).
     pub fn vec_sql(&self, arg: &str) -> String {
         self.vec.bind_sql(arg)
+    }
+
+    /// Sign bits of every stored memory vector, `BITS_TABLE` created if needed
+    /// and backfilled once. Idempotent and resumable: `meta.vec_bits` marks a
+    /// complete backfill, so a process killed mid-way fills the missing rows on
+    /// the next call instead of leaving a silent hole; a complete table is one
+    /// probe and a database that already has it needs no write.
+    pub fn ensure_bits(&self) -> Result<()> {
+        let created = if self.table_exists(BITS_TABLE)? {
+            false
+        } else {
+            self.sql().execute_batch(&format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS {BITS_TABLE} \
+                 USING vec0(embedding bit[{DIMS}], live integer, chunk_size=1024)"
+            ))?;
+            true
+        };
+        if !created {
+            let done: bool = self.sql().query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='vec_bits')",
+                [],
+                |r| r.get(0),
+            )?;
+            if done {
+                return Ok(());
+            }
+        }
+        self.backfill_bits()?;
+        self.sql().execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('vec_bits','1')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Fill `BITS_TABLE` from `memories_vec` in rowid batches (never holds more
+    /// than one batch of vectors); rows already present are skipped, so a
+    /// partial table is completed rather than trusted.
+    fn backfill_bits(&self) -> Result<()> {
+        let have: std::collections::HashSet<i64> = {
+            let mut st = self
+                .sql()
+                .prepare(&format!("SELECT rowid FROM {BITS_TABLE}"))?;
+            let rows = st.query_map([], |r| r.get::<_, i64>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut last = 0i64;
+        loop {
+            let rows: Vec<(i64, Vec<u8>, i64)> = {
+                let mut st = self.sql().prepare(&format!(
+                    "SELECT rowid, embedding, live FROM memories_vec \
+                     WHERE rowid > ?1 ORDER BY rowid LIMIT {BITS_BATCH}"
+                ))?;
+                let rows = st.query_map([last], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            if rows.is_empty() {
+                return Ok(());
+            }
+            last = rows.last().map(|r| r.0).unwrap_or(last);
+            self.write(|db| {
+                let mut st = db.sql().prepare(&format!(
+                    "INSERT INTO {BITS_TABLE}(rowid,embedding,live) VALUES (?1,vec_bit(?2),?3)"
+                ))?;
+                for (id, blob, live) in &rows {
+                    if have.contains(id) {
+                        continue;
+                    }
+                    let v = db
+                        .vec
+                        .decode(blob)
+                        .ok_or_else(|| crate::err!("memories_vec row {id} is not a vector"))?;
+                    st.execute(rusqlite::params![id, sign_bits(&v), live])?;
+                }
+                Ok(())
+            })?;
+        }
+    }
+
+    /// Whether the bit table exists (never creates it).
+    pub fn has_bits(&self) -> bool {
+        self.table_exists(BITS_TABLE).unwrap_or(false)
+    }
+
+    /// Ids of the `k` memories nearest `query` by Hamming distance over the
+    /// sign bits, `live_only` applying the `live=1` filter (history queries
+    /// keep expired rows). Empty when the table does not exist.
+    pub fn bits_knn(&self, query: &[f32], k: usize, live_only: bool) -> Result<Vec<i64>> {
+        match self.bits_scan(query, k, live_only) {
+            Ok(ids) => Ok(ids),
+            // A shadow layout this build does not know (a different
+            // sqlite-vec) still answers through the module's own KNN.
+            Err(_) => self.bits_knn_vec0(query, k, live_only),
+        }
+    }
+
+    /// Top-`k` by Hamming distance read straight from the vec0 chunk shadow
+    /// tables: one validity, rowid and vector blob per 1024-row chunk, one
+    /// popcount loop in Rust. The module's KNN is O(rows x k) in its top-k
+    /// selection (50 ms for k=1000 on 32k rows), as expensive as the exact
+    /// cosine scan it replaces; this scan is ~6 ms / 32k rows and ~21 ms /
+    /// 108k. sqlite-vec is pinned to 0.1.9, whose shadow layout is
+    /// `_chunks(validity,rowids)` + `_vector_chunks00(vectors)` +
+    /// `_metadatachunks00` (i64 per row for `live`); any other shape errors and
+    /// the caller falls back to [`Db::bits_knn_vec0`].
+    fn bits_scan(&self, query: &[f32], k: usize, live_only: bool) -> Result<Vec<i64>> {
+        let stride = DIMS / 8;
+        let sql = if live_only {
+            "SELECT c.validity, c.rowids, v.vectors, m.data
+               FROM memories_bits_chunks c
+               JOIN memories_bits_vector_chunks00 v ON v.rowid = c.chunk_id
+               JOIN memories_bits_metadatachunks00 m ON m.rowid = c.chunk_id
+              ORDER BY c.chunk_id"
+        } else {
+            "SELECT c.validity, c.rowids, v.vectors, NULL
+               FROM memories_bits_chunks c
+               JOIN memories_bits_vector_chunks00 v ON v.rowid = c.chunk_id
+              ORDER BY c.chunk_id"
+        };
+        let qb = sign_bits(query);
+        let mut st = self.sql().prepare(sql)?;
+        let mut heap: std::collections::BinaryHeap<(u32, i64)> =
+            std::collections::BinaryHeap::new();
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Option<Vec<u8>>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (validity, rowids, vectors, live) = row?;
+            let count = rowids.len() / 8;
+            if rowids.len() % 8 != 0 || vectors.len() != count * stride {
+                return Err(crate::err!("memories_bits chunk layout changed"));
+            }
+            for i in 0..count {
+                if validity.get(i / 8).is_none_or(|b| b >> (i % 8) & 1 == 0) {
+                    continue;
+                }
+                if live_only {
+                    let Some(l) = &live else {
+                        return Err(crate::err!("memories_bits has no live metadata"));
+                    };
+                    let Some(bytes) = l.get(i * 8..i * 8 + 8) else {
+                        return Err(crate::err!("memories_bits live metadata is short"));
+                    };
+                    if i64::from_le_bytes(bytes.try_into().expect("8 bytes")) != 1 {
+                        continue;
+                    }
+                }
+                let Some(id) = rowids.get(i * 8..i * 8 + 8) else {
+                    continue;
+                };
+                let id = i64::from_le_bytes(id.try_into().expect("8 bytes"));
+                let d = qb
+                    .iter()
+                    .zip(&vectors[i * stride..(i + 1) * stride])
+                    .map(|(a, b)| (a ^ b).count_ones())
+                    .sum::<u32>();
+                if heap.len() < k {
+                    heap.push((d, id));
+                } else if heap.peek().is_some_and(|top| (d, id) < *top) {
+                    heap.pop();
+                    heap.push((d, id));
+                }
+            }
+        }
+        let mut out: Vec<(u32, i64)> = heap.into_vec();
+        out.sort_unstable();
+        Ok(out.into_iter().map(|(_, id)| id).collect())
+    }
+
+    /// The vec0 KNN fallback of [`Db::bits_knn`] (`ORDER BY distance`).
+    fn bits_knn_vec0(&self, query: &[f32], k: usize, live_only: bool) -> Result<Vec<i64>> {
+        let live = if live_only { " AND live=1" } else { "" };
+        let sql = format!(
+            "SELECT rowid FROM {BITS_TABLE} WHERE embedding MATCH vec_bit(?1) AND k=?2{live} ORDER BY distance"
+        );
+        let mut st = self.sql().prepare(&sql)?;
+        let ids = st
+            .query_map(rusqlite::params![sign_bits(query), k as i64], |r| {
+                r.get::<_, i64>(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    /// Store a memory vector (rowid = memory id, live = 1) and its sign bits
+    /// when the prefilter table exists.
+    pub fn insert_memory_vec(&self, id: i64, v: &[f32]) -> Result<()> {
+        self.sql().execute(
+            &format!(
+                "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,{},1)",
+                self.vec_sql("?2")
+            ),
+            rusqlite::params![id, self.vec_blob(v)],
+        )?;
+        if self.has_bits() {
+            self.sql().execute(
+                &format!(
+                    "INSERT INTO {BITS_TABLE}(rowid,embedding,live) VALUES (?1,vec_bit(?2),1)"
+                ),
+                rusqlite::params![id, sign_bits(v)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Flip the `live` flag of a memory vector (soft forget, supersede).
+    pub fn set_memory_vec_live(&self, id: i64, live: i64) -> Result<()> {
+        self.sql().execute(
+            "UPDATE memories_vec SET live=?1 WHERE rowid=?2",
+            rusqlite::params![live, id],
+        )?;
+        if self.has_bits() {
+            self.sql().execute(
+                &format!("UPDATE {BITS_TABLE} SET live=?1 WHERE rowid=?2"),
+                rusqlite::params![live, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Drop a memory vector (hard forget).
+    pub fn delete_memory_vec(&self, id: i64) -> Result<()> {
+        self.sql()
+            .execute("DELETE FROM memories_vec WHERE rowid=?1", [id])?;
+        if self.has_bits() {
+            self.sql()
+                .execute(&format!("DELETE FROM {BITS_TABLE} WHERE rowid=?1"), [id])?;
+        }
+        Ok(())
     }
 
     /// Rewrite the vector tables into `to` in one transaction, then VACUUM.

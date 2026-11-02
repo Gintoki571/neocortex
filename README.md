@@ -393,6 +393,7 @@ of supporting-hop memories on the multi-hop world (0.965 -> 0.816), and adds
 | `NEOCORTEX_MAX_TOKENS` | `1024` | max tokens per embedding |
 | `NEOCORTEX_EMBEDDER` | unset | `hash` selects the deterministic test embedder |
 | `NEOCORTEX_VEC` | `f32` | vector storage of a **new** database: `f32` or `int8` (one byte per element, scale 127); an existing database keeps the mode in `schema_meta.vec_mode` |
+| `NEOCORTEX_VEC_PREFILTER` | unset | `bit` creates and backfills the `memories_bits` sign-bit table on open (memory KNN prefilter, exact rerank); unset = exact scan |
 | `NEOCORTEX_RERANK_MODEL` | `~/.neocortex/models/ms-marco-MiniLM-L-6-v2` | reranker model directory (optional) |
 | `NEOCORTEX_RERANK` | unset | `<N>` reranks the top N fused candidates, `off` disables; unset = built-in default |
 

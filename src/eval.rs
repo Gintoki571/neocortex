@@ -609,6 +609,8 @@ pub const CONFIG_KEYS: &[&str] = &[
     "w_rerank",
     "hint_tau",
     "anchor_tiers",
+    "vec_prefilter",
+    "vec_prefilter_n",
 ];
 
 fn boolean(key: &str, value: &str) -> Result<bool> {
@@ -670,6 +672,13 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "access_keep" => cfg.access_keep = number(key, value)? as usize,
         "rerank_top" => cfg.rerank_top = number(key, value)? as usize,
         "w_rerank" => cfg.w_rerank = number(key, value)?,
+        "vec_prefilter" => {
+            if value != "off" && value != "bit" {
+                return Err(crate::err!("vec_prefilter takes off or bit, got '{value}'"));
+            }
+            cfg.vec_prefilter = value.to_string()
+        }
+        "vec_prefilter_n" => cfg.vec_prefilter_n = number(key, value)?.max(1.0) as usize,
         other => {
             return Err(crate::err!(
                 "unknown config key '{other}'; valid: {}",

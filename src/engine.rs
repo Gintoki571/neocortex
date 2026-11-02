@@ -141,6 +141,13 @@ pub struct Config {
     /// `1` unique first/last name word, `2` role noun via a relation; `b` / `x`
     /// / `p` let weak anchors block pass-through / enable prose hops / both. Empty or `0` = exact aliases only.
     pub anchor_tiers: String,
+    /// Memory KNN candidate generator: "off" (exact vec0 scan) or "bit"
+    /// (`memories_bits` Hamming scan, then an exact rerank of the top
+    /// `vec_prefilter_n` x depth candidates). The bit table is created and
+    /// backfilled on first use; writes keep it in sync.
+    pub vec_prefilter: String,
+    /// Candidate depth multiplier of the bit prefilter (`N = n * k`).
+    pub vec_prefilter_n: usize,
 }
 
 impl Default for Config {
@@ -186,6 +193,8 @@ impl Default for Config {
             w_rerank: 0.5,
             hint_tau: 0.40,
             anchor_tiers: String::new(),
+            vec_prefilter: "off".to_string(),
+            vec_prefilter_n: 10,
         }
     }
 }
@@ -777,8 +786,7 @@ impl Engine {
                     "UPDATE memories SET superseded_by=NULL WHERE superseded_by=?1",
                     [id],
                 )?;
-                db.sql()
-                    .execute("DELETE FROM memories_vec WHERE rowid=?1", [id])?;
+                db.delete_memory_vec(id)?;
                 // Cascades mentions and relation_evidence.
                 db.sql().execute("DELETE FROM memories WHERE id=?1", [id])?;
                 // Incremental projection: only this node and the edges of the
@@ -792,8 +800,7 @@ impl Engine {
                 // snapshot/validate exclude it from the live graph.
                 db.sql()
                     .execute("UPDATE memories SET expired_at=?1 WHERE id=?2", [now, id])?;
-                db.sql()
-                    .execute("UPDATE memories_vec SET live=0 WHERE rowid=?1", [id])?;
+                db.set_memory_vec_live(id, 0)?;
             }
             crate::kg::bump_gen(db)?;
             Ok(ChangeOutput {
