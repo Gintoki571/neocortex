@@ -406,9 +406,10 @@ fn follow_text(out: &paths::FollowOutput, clock: &crate::temporal::Clock) -> Str
     };
     for fact in &out.facts {
         s.push_str(&format!(
-            "[{}] {} —{}→ {} (since {}, {} hop{}{})\n",
+            "[{}] {} {}{}→ {} (since {}, {} hop{}{})\n",
             fact.relation,
             fact.source,
+            if fact.polarity == 0 { "—NOT " } else { "—" },
             fact.predicate,
             fact.target,
             date(fact.valid_from),
@@ -649,7 +650,7 @@ fn tool_defs() -> Vec<Value> {
     vec![
         json!({
             "name": "remember",
-            "description": "Store one durable memory. Use atomic facts, events, decisions, preferences, mistakes, procedures and outcomes. Pass every stated fact as a relation {source, predicate, target}: text alone never becomes a graph fact, so unstructured facts are invisible to multi-hop and conflict handling. For relations, exclusive=true ends competing values, false keeps this write without conflict reporting, and omission returns candidates unless the predicate is seeded single-valued. A relation whose source and target resolve to the same entity is not stored; with a naming predicate (nickname, alias, aka, also known as, goes by) the target becomes another alias of that entity, and hints report how many self-relations were dropped. Pass negated=true for a retraction; a retraction sentence ends the one live relation it names at valid_from and reports it in invalidated, or returns conflicts and ends nothing when several match. This also runs when you supply relations of your own, but never retracts them; first names resolve through your entities and stored people, and a coordinated pair (\"A and B are no longer partners\") ends the pair relation. Only the whole object of the cue counts: \"left the Acme office\" or \"left Acme a voicemail\" ends nothing, and a hedged or reported sentence (\"almost quit\", \"thinks Bob left\") returns a conflict candidate instead. A future plan (\"we will move next spring\") gets the resolved future valid_from, or the tag planned when no date resolves; a recurring sentence (\"standup every Monday\") keeps its rule text and gets the tag recurring. Act on conflicts/related with invalidate or supersedes; history is never deleted. Never store secrets, credentials or transient chatter.",
+            "description": "Store one durable memory. Use atomic facts, events, decisions, preferences, mistakes, procedures and outcomes. Pass every stated fact as a relation {source, predicate, target}: text alone never becomes a graph fact, so unstructured facts are invisible to multi-hop and conflict handling. For relations, exclusive=true ends competing values, false keeps this write without conflict reporting, and omission returns candidates unless the predicate is seeded single-valued. A relation whose source and target resolve to the same entity is not stored; with a naming predicate (nickname, alias, aka, also known as, goes by) the target becomes another alias of that entity, and hints name each dropped self-relation (and the alias kept). Pass negated=true for a retraction; a retraction sentence ends the one live relation it names at valid_from and reports it in invalidated, or returns conflicts and ends nothing when several match. This also runs when you supply relations of your own, but never retracts them; first names resolve through your entities and stored people, and a coordinated pair (\"A and B are no longer partners\") ends the pair relation. Only the whole object of the cue counts: \"left the Acme office\" or \"left Acme a voicemail\" ends nothing, and a hedged or reported sentence (\"almost quit\", \"thinks Bob left\") returns a conflict candidate instead. A future plan (\"we will move next spring\") gets the resolved future valid_from, or the tag planned when no date resolves; a recurring sentence (\"standup every Monday\") keeps its rule text and gets the tag recurring. Act on conflicts/related with invalidate or supersedes; history is never deleted. Never store secrets, credentials or transient chatter.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -768,7 +769,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "follow",
-            "description": "Walk relations hop by hop from one entity (optionally toward another). Use it when recall names the neighbourhood but not the answer: follow \"Noah Tansen\" to \"Mira Shah\" to the city. Returns each relation with direction, hop count and the memories that evidence it.",
+            "description": "Walk relations hop by hop from one entity (optionally toward another). Use it when recall names the neighbourhood but not the answer: follow \"Noah Tansen\" to \"Mira Shah\" to the city. Returns each relation with predicate, polarity (0 marks a negative fact, drawn —NOT in text), direction, hop count and the memories that evidence it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

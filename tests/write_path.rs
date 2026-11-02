@@ -700,6 +700,16 @@ fn a_nickname_relation_to_the_same_entity_becomes_an_alias() {
     );
     assert_eq!(self_loops(&engine), 0, "{:?}", out.relations);
     assert!(out.relations.is_empty(), "{:?}", out.relations);
+    // The hint names the dropped fact, not only its count.
+    let hint = out
+        .hints
+        .iter()
+        .find(|h| h.contains("self-relation"))
+        .unwrap_or_else(|| panic!("no self-relation hint in {:?}", out.hints));
+    assert_eq!(
+        hint,
+        "dropped self-relation: Robert Okafor nickname Bob (kept \"Bob\" as an alias)"
+    );
     // The nickname is still a name of the person, not a relation.
     let card = engine.entity("Bob", 10).unwrap();
     assert_eq!(card.card.id, out.entities[0].id);
@@ -725,6 +735,15 @@ fn a_relation_whose_target_resolves_to_the_source_is_not_stored() {
     );
     assert_eq!(self_loops(&engine), 0, "{:?}", out.relations);
     assert!(out.relations.is_empty(), "{:?}", out.relations);
+    let hint = out
+        .hints
+        .iter()
+        .find(|h| h.contains("self-relation"))
+        .unwrap_or_else(|| panic!("no self-relation hint in {:?}", out.hints));
+    assert_eq!(
+        hint,
+        "dropped self-relation: Robert Okafor works with Bob Okafor"
+    );
 }
 
 #[test]
@@ -2937,4 +2956,33 @@ fn a_shared_short_alias_never_merges_two_different_full_names() {
         vec![],
     );
     assert_eq!(short.entities[0].id, mota.entities[0].id);
+}
+
+#[test]
+fn remember_reply_for_negated_relation_states_negation() {
+    let e = engine();
+    let out = remember(
+        &e,
+        "Kepler does not use Redis.",
+        vec![
+            EntityIn {
+                name: "Kepler".into(),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Redis".into(),
+                ..Default::default()
+            },
+        ],
+        vec![RelationIn {
+            source: "Kepler".into(),
+            predicate: "uses".into(),
+            target: "Redis".into(),
+            negated: Some(true),
+            ..Default::default()
+        }],
+    );
+    assert_eq!(out.relations.len(), 1);
+    assert_eq!(out.relations[0].fact, "Kepler NOT uses Redis");
+    assert_eq!(out.relations[0].status, "new");
 }

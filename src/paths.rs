@@ -1214,7 +1214,8 @@ pub(crate) fn evidence(db: &Db, hits: &[PathHit]) -> Result<Vec<i64>> {
 /// next to the retrieved memories.
 pub(crate) fn facts(db: &Db, hits: &[PathHit], cutoff: i64, limit: usize) -> Result<Vec<FactHit>> {
     let mut st = db.sql().prepare_cached(
-        "SELECT p.canonical,r.fact,r.valid_from,r.valid_to,r.expired_at,s.name,d.name,r.polarity
+        "SELECT COALESCE(NULLIF(r.predicate_text,''),NULLIF(p.display,''),p.canonical),
+                r.fact,r.valid_from,r.valid_to,r.expired_at,s.name,d.name,r.polarity
          FROM relations r
          JOIN predicates p ON p.id=r.predicate_id
          JOIN entities s ON s.id=r.src
@@ -1401,6 +1402,8 @@ pub struct FollowFact {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_to: Option<i64>,
     pub ended: bool,
+    /// 1 positive, 0 negative (rendered `—NOT→` in text).
+    pub polarity: i64,
     /// "out" when the relation points away from the reached entity.
     pub direction: String,
     /// Hops from `from` (1 = direct).
@@ -1465,13 +1468,14 @@ pub fn follow(engine: &Engine, follow: &FollowInput) -> Result<FollowOutput> {
         let mut next = Vec::new();
         for entity in &frontier {
             let mut st = db.sql().prepare_cached(
-                "SELECT r.id,r.src,r.dst,p.canonical,r.fact,r.valid_from,r.valid_to,r.expired_at,
-                        s.name,d.name
+                "SELECT r.id,r.src,r.dst,
+                        COALESCE(NULLIF(r.predicate_text,''),NULLIF(p.display,''),p.canonical),
+                        r.fact,r.valid_from,r.valid_to,r.expired_at,s.name,d.name,r.polarity
                  FROM relations r
                  JOIN predicates p ON p.id=r.predicate_id
                  JOIN entities s ON s.id=r.src
                  JOIN entities d ON d.id=r.dst
-                 WHERE r.src=?1 OR r.dst=?2",
+                 WHERE (r.src=?1 OR r.dst=?2) AND r.src != r.dst",
             )?;
             let rows = st.query_map(params![entity, entity], |r| {
                 Ok((
@@ -1485,11 +1489,23 @@ pub fn follow(engine: &Engine, follow: &FollowInput) -> Result<FollowOutput> {
                     r.get::<_, Option<i64>>(7)?,
                     r.get::<_, String>(8)?,
                     r.get::<_, String>(9)?,
+                    r.get::<_, i64>(10)?,
                 ))
             })?;
             for row in rows {
-                let (id, src, dst, predicate, fact, valid_from, valid_to, expired, sname, dname) =
-                    row?;
+                let (
+                    id,
+                    src,
+                    dst,
+                    predicate,
+                    fact,
+                    valid_from,
+                    valid_to,
+                    expired,
+                    sname,
+                    dname,
+                    polarity,
+                ) = row?;
                 if !vis.shows(valid_from, valid_to, expired) || !seen_relations.insert(id) {
                     continue;
                 }
@@ -1518,6 +1534,7 @@ pub fn follow(engine: &Engine, follow: &FollowInput) -> Result<FollowOutput> {
                     valid_from,
                     valid_to,
                     ended: expired.is_some() || valid_to.is_some_and(|v| v <= vis.now),
+                    polarity,
                     direction: direction.to_string(),
                     hops: hop,
                     memories,
@@ -1631,12 +1648,13 @@ pub fn aggregate(engine: &Engine, input: &AggregateInput) -> Result<AggregateOut
     let limit = input.limit.unwrap_or(50).clamp(1, 200);
     let mut st = db.sql().prepare_cached(
         "SELECT r.id,r.src,r.dst,p.canonical,r.fact,r.valid_from,r.valid_to,r.expired_at,
-                s.name,d.name
+                s.name,d.name,r.polarity
          FROM relations r
          JOIN predicates p ON p.id=r.predicate_id
          JOIN entities s ON s.id=r.src
          JOIN entities d ON d.id=r.dst
          WHERE (?1 IS NULL OR r.src=?1) AND (?2 IS NULL OR r.dst=?2)
+           AND r.src != r.dst
          ORDER BY r.id",
     )?;
     let rows = st.query_map(params![source, target], |r| {
@@ -1651,13 +1669,15 @@ pub fn aggregate(engine: &Engine, input: &AggregateInput) -> Result<AggregateOut
             r.get::<_, Option<i64>>(7)?,
             r.get::<_, String>(8)?,
             r.get::<_, String>(9)?,
+            r.get::<_, i64>(10)?,
         ))
     })?;
     let mut items: HashMap<i64, AggregateItem> = HashMap::new();
     let mut negative: HashMap<i64, AggregateItem> = HashMap::new();
     let mut memories: Vec<i64> = Vec::new();
     for row in rows {
-        let (id, src, dst, predicate, fact, valid_from, valid_to, expired, sname, dname) = row?;
+        let (id, src, dst, predicate, fact, valid_from, valid_to, expired, sname, dname, polarity) =
+            row?;
         if !vis.shows(valid_from, valid_to, expired) {
             continue;
         }
@@ -1673,7 +1693,7 @@ pub fn aggregate(engine: &Engine, input: &AggregateInput) -> Result<AggregateOut
         } else {
             (src, sname)
         };
-        let bucket = if has_negation_cue(&fact) {
+        let bucket = if polarity == 0 || has_negation_cue(&fact) {
             &mut negative
         } else {
             &mut items
@@ -1753,6 +1773,63 @@ mod residual_tests {
         let r = residual_after(&[0.6, 0.8, 0.0], &[1.0, 0.0, 0.0]);
         assert!(r[0].abs() < 1e-6, "{r:?}");
         assert!((r[1] - 1.0).abs() < 1e-6, "{r:?}");
+    }
+}
+
+#[cfg(test)]
+mod fact_render_tests {
+    use super::{facts, PathHit, Step};
+    use crate::db::Db;
+    use rusqlite::params;
+
+    #[test]
+    fn path_facts_use_the_same_predicate_spelling_as_the_db_channel() {
+        let db = Db::open_in_memory().unwrap();
+        db.sql()
+            .execute(
+                "INSERT INTO entities(name,norm,type,homonym,created_at,updated_at)
+                 VALUES ('platform team','platform team','org',0,0,0),
+                        ('Jenkins','jenkins','tool',0,0,0)",
+                [],
+            )
+            .unwrap();
+        let src = 1;
+        let dst = 2;
+        db.sql()
+            .execute(
+                "INSERT INTO predicates(canonical,display,exclusive,group_id,symmetric,seeded)
+                 VALUES ('use','uses',0,0,0,0)",
+                [],
+            )
+            .unwrap();
+        let pid = db.sql().last_insert_rowid();
+        db.sql()
+            .execute("UPDATE predicates SET group_id=?1 WHERE id=?1", [pid])
+            .unwrap();
+        db.sql()
+            .execute(
+                "INSERT INTO relations(src,dst,predicate_id,predicate_text,subj,fact,valid_from,created_at)
+                 VALUES (?1,?2,?3,'uses',?1,'platform team uses Jenkins',0,0)",
+                params![src, dst, pid],
+            )
+            .unwrap();
+        let hit = PathHit {
+            steps: vec![Step {
+                relation_id: 1,
+                src,
+                dst,
+                predicate: "use".into(),
+                fact: "platform team uses Jenkins".into(),
+                reverse: false,
+                matched: 1,
+                memory: None,
+            }],
+            coverage: 1,
+            score: 1.0,
+        };
+        let out = facts(&db, &[hit], 10, 8).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].predicate, "uses");
     }
 }
 
