@@ -72,8 +72,11 @@ fn push_ascii(out: &mut String, c: char) {
 /// Canonical entity key: fold, drop leading articles/possessive determiners
 /// (the, a, an, my, our, your, his, her, their), drop trailing "'s",
 /// singularise the last token. "The Houses" -> "house", "my bros" -> "bro".
+/// Symbol suffixes keep their meaning: "C#" -> "c sharp", "C++" ->
+/// "c plus plus" (see `expand_symbols`), so a tool named "C#" never shares a
+/// card with "C", "C++" or "F#".
 pub fn norm_name(s: &str) -> String {
-    let folded = fold(strip_possessive(s));
+    let folded = fold(&expand_symbols(strip_possessive(s)));
     let mut words = name_words(&folded);
     if words.is_empty() {
         return folded;
@@ -87,10 +90,45 @@ pub fn norm_name(s: &str) -> String {
 /// Sorted token set of a raw name with no singularising: "Novak Labs" never
 /// contains "Novak Lab Supplies". The B5 containment key.
 pub fn exact_name_tokens(name: &str) -> Vec<String> {
-    let mut words = name_words(&fold(strip_possessive(name)));
+    let mut words = name_words(&fold(&expand_symbols(strip_possessive(name))));
     words.sort();
     words.dedup();
     words
+}
+
+/// Spelling out the symbol suffixes that carry meaning inside a short name,
+/// before `fold` turns them into a space: "C#" -> "C sharp", "F#" ->
+/// "F sharp", "C++" -> "C plus plus", "A+" -> "A plus". Punctuation is
+/// otherwise erased ("C#", "C++", "C" all fold to "c"), which merged distinct
+/// tools onto one entity. Only a 1-3 character alphanumeric core (with at
+/// least one letter) and a suffix made purely of `#` or of `+` qualify, so
+/// ordinary names, "AT&T", "Node.js" and "Objective-C" keep their keys.
+fn expand_symbols(s: &str) -> String {
+    s.split_whitespace()
+        .map(expand_symbol_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn expand_symbol_word(word: &str) -> String {
+    let chars: Vec<char> = word.chars().collect();
+    let core_len = chars.iter().take_while(|c| c.is_alphanumeric()).count();
+    if core_len == 0 || core_len > 3 || !chars[..core_len].iter().any(|c| c.is_alphabetic()) {
+        return word.to_string();
+    }
+    let suffix = &chars[core_len..];
+    let mut out: String = chars[..core_len].iter().collect();
+    if !suffix.is_empty() && suffix.iter().all(|&c| c == '#') {
+        out.push_str(" sharp");
+        return out;
+    }
+    if !suffix.is_empty() && suffix.iter().all(|&c| c == '+') {
+        for _ in suffix {
+            out.push_str(" plus");
+        }
+        return out;
+    }
+    word.to_string()
 }
 
 /// Folded words of a name with leading determiners removed.
@@ -956,6 +994,11 @@ mod tests {
             ("knives", "knife"),
             ("class", "class"),
             ("glasses", "glass"),
+            // Symbols in short names keep their meaning (TOOL-NAMES).
+            ("C#", "c sharp"),
+            ("C++", "c plus plus"),
+            ("F#", "f sharp"),
+            ("Node.js", "node js"),
         ] {
             assert_eq!(norm_name(input), want, "input {input:?}");
         }
