@@ -861,7 +861,7 @@ fn lemma_verb(w: &str) -> String {
     if w == "married" {
         return w.to_string();
     }
-    const IRREGULAR: [(&str, &str); 24] = [
+    const IRREGULAR: [(&str, &str); 25] = [
         ("is", "be"),
         ("are", "be"),
         ("was", "be"),
@@ -881,6 +881,7 @@ fn lemma_verb(w: &str) -> String {
         ("knew", "know"),
         ("met", "meet"),
         ("bought", "buy"),
+        ("led", "lead"),
         ("left", "leave"),
         ("built", "build"),
         ("ran", "run"),

@@ -14,7 +14,7 @@ use crate::db::Db;
 use crate::engine::{Engine, FactHit};
 use crate::text;
 use crate::Result;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, params_from_iter, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -306,6 +306,276 @@ pub fn causal_intent(query: &str) -> bool {
         || q.contains("how come")
 }
 
+/// H2-15: a question that asks which defects are *unresolved* ("still open",
+/// "not fixed yet"). The question must name a defect of its own: "is the API
+/// still open to the public" and "which PRs are outstanding" describe a
+/// state, not a bug. "open question" is not a bug status.
+pub fn status_intent(query: &str) -> bool {
+    let q = text::fold(query);
+    // An open question is a pending decision, not an open defect: the lexical
+    // "open" must not turn it into a status word.
+    if q.contains("open question") {
+        return false;
+    }
+    const CUES: &[&str] = &[
+        "still open",
+        "still broken",
+        "still failing",
+        "still unresolved",
+        "unresolved",
+        "unfixed",
+        "not fixed",
+        "not yet fixed",
+        "not been fixed",
+        "open bug",
+        "open bugs",
+        "open issue",
+        "open issues",
+        "open defect",
+        "open defects",
+        "open ticket",
+        "open tickets",
+        "outstanding",
+        "left to fix",
+        "remaining bug",
+        "remaining issue",
+    ];
+    if !CUES.iter().any(|cue| q.contains(cue)) {
+        return false;
+    }
+    // A predicate that can only be about a defect asks for one on its own
+    // ("what is still broken", "what is left to fix").
+    const ASKS_DEFECT: &[&str] = &[
+        "still broken",
+        "still failing",
+        "still crashing",
+        "left to fix",
+        "unfixed",
+        "not fixed",
+        "not yet fixed",
+        "not been fixed",
+    ];
+    if ASKS_DEFECT.iter().any(|cue| q.contains(cue)) {
+        return true;
+    }
+    // Otherwise the question names the defect it asks about.
+    const DEFECT_NOUNS: &[&str] = &[
+        "bug",
+        "bugs",
+        "issue",
+        "issues",
+        "defect",
+        "defects",
+        "crash",
+        "crashes",
+        "regression",
+        "regressions",
+        "error",
+        "errors",
+        "failure",
+        "failures",
+    ];
+    let tokens = text::tokens(&q);
+    if tokens
+        .iter()
+        .any(|token| DEFECT_NOUNS.contains(&token.as_str()))
+    {
+        return true;
+    }
+    // A ticket or an incident is a defect only when the question says so too
+    // ("which incident tickets are still open for the 500 error").
+    const CONTAINERS: &[&str] = &["ticket", "tickets", "incident", "incidents"];
+    tokens
+        .iter()
+        .any(|token| CONTAINERS.contains(&token.as_str()))
+        && has_cue(&q, BUG_CUES)
+}
+
+/// Tokens that report a defect ("Bug on ...", "Error on ...", "the sync loop
+/// panicked", "the nightly export crashes"). Inflections matter: an agent
+/// writes "crashes", "fails" or "can't" far more often than "crashed".
+const BUG_CUES: &[&str] = &[
+    "bug",
+    "bugs",
+    "broken",
+    "regression",
+    "regressions",
+    "panic",
+    "panicked",
+    "crash",
+    "crashes",
+    "crashing",
+    "crashed",
+    "error",
+    "errors",
+    "fail",
+    "fails",
+    "failed",
+    "failing",
+    "failure",
+    "failures",
+    "defect",
+    "defects",
+    "hang",
+    "hangs",
+    "hanging",
+    "cannot",
+    "cant",
+];
+
+/// Tokens that say a defect was dealt with ("Fix for ...", "resolved",
+/// "released", "merged"). "merge" is not one: `merge_note_versions` is a
+/// function name.
+const FIX_CUES: &[&str] = &[
+    "fix", "fixed", "fixes", "fixing", "resolved", "resolve", "resolves", "closed", "merged",
+    "patched", "hotfix", "released", "shipped", "bump", "bumped",
+];
+
+/// Words that say the work is still to be done ("needs a fix", "pending").
+const FIX_PENDING: &[&str] = &[
+    "await", "awaiting", "need", "needed", "needing", "needs", "pending", "require", "required",
+    "requires",
+];
+
+/// Noun forms of a fix: only these also take the negation right after them
+/// ("the fix is not deployed").
+const FIX_NOUNS: &[&str] = &["fix", "fixes", "fixing", "hotfix", "patch"];
+
+/// True when the fix cue at `words[i]` is negated or still pending, so the
+/// sentence reports an *unfixed* defect ("not fixed yet", "no fix yet",
+/// "needs a fix", "the fix is not deployed").
+fn fix_cue_negated(words: &[String], i: usize) -> bool {
+    let lo = i.saturating_sub(3);
+    if words[lo..i]
+        .iter()
+        .any(|w| NEGATION_WORDS.contains(&w.as_str()) || FIX_PENDING.contains(&w.as_str()))
+    {
+        return true;
+    }
+    FIX_NOUNS.contains(&words[i].as_str())
+        && i + 2 < words.len()
+        && AUXILIARIES.contains(&words[i + 1].as_str())
+        && matches!(
+            words[i + 2].as_str(),
+            "not" | "never" | "no" | "needed" | "pending" | "required" | "awaited"
+        )
+}
+
+/// Generic words that say nothing about *which* bug a memory is about.
+const STATUS_GENERIC: &[&str] = &[
+    "bug", "bugs", "issue", "issues", "error", "errors", "defect", "defects", "fix", "fixed",
+    "fixes", "fixing", "lumen", "project", "reported", "report", "release", "released", "shipped",
+    "still", "open", "question", "closed", "merged", "resolved", "patched",
+];
+
+fn has_cue(text: &str, cues: &[&str]) -> bool {
+    text::tokens(text).iter().any(|token| {
+        // "can't" and "can’t" are the same report as "cant".
+        cues.contains(&token.as_str()) || cues.contains(&bare_word(token).as_str())
+    })
+}
+
+/// A memory that reports a defect, not one that fixes or releases past it.
+pub(crate) fn is_bug_memory(text: &str) -> bool {
+    has_cue(text, BUG_CUES)
+}
+
+pub(crate) fn has_fix_cue(text: &str) -> bool {
+    // A sentence boundary ends a negation's scope: "Fixed the crash. No
+    // regressions since." reports a fix.
+    text.split(['.', ';', '!', '?', '\n']).any(|clause| {
+        let words = bare_words(&text::fold(clause));
+        words
+            .iter()
+            .enumerate()
+            .any(|(i, w)| FIX_CUES.contains(&w.as_str()) && !fix_cue_negated(&words, i))
+    })
+}
+
+/// The words two memories must share to be about the same bug.
+pub(crate) fn status_terms(text: &str) -> HashSet<String> {
+    text::tokens(text)
+        .into_iter()
+        .filter(|token| {
+            token.chars().count() >= 3
+                // A year says nothing about which defect a memory is about;
+                // two bugs filed the same day share it and nothing else.
+                && !token.chars().all(|c| c.is_ascii_digit())
+                && !text::is_stopword(token)
+                && !STATUS_GENERIC.contains(&token.as_str())
+        })
+        .collect()
+}
+
+/// The specific defect a status question names ("nightly", "export" in "is
+/// the nightly export bug still open"), without the status scaffolding.
+/// Empty when the question asks about defects in general ("what bug is still
+/// open"), in which case every open report is an answer.
+pub(crate) fn status_question_terms(query: &str) -> HashSet<String> {
+    const SCAFFOLD: &[&str] = &[
+        "any",
+        "broken",
+        "crash",
+        "crashes",
+        "crashing",
+        "failing",
+        "incident",
+        "incidents",
+        "known",
+        "left",
+        "list",
+        "open",
+        "outstanding",
+        "remaining",
+        "show",
+        "status",
+        "still",
+        "ticket",
+        "tickets",
+        "unfixed",
+        "unresolved",
+        "yet",
+    ];
+    status_terms(query)
+        .into_iter()
+        .filter(|token| !SCAFFOLD.contains(&token.as_str()))
+        .collect()
+}
+
+/// `YYYY-MM-DD` literals: the strongest "same bug" signal a report carries.
+fn date_literals(text: &str) -> HashSet<String> {
+    let bytes = text.as_bytes();
+    let mut out = HashSet::new();
+    let mut i = 0;
+    while i + 10 <= bytes.len() {
+        let window = &bytes[i..i + 10];
+        let date = window[4] == b'-'
+            && window[7] == b'-'
+            && window
+                .iter()
+                .enumerate()
+                .all(|(k, b)| k == 4 || k == 7 || b.is_ascii_digit());
+        if date {
+            out.insert(text[i..i + 10].to_string());
+            i += 10;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// True when `fix` is about the same defect as `bug`: two content words, or a
+/// shared date plus one. A date alone is a coincidence: a release note dated
+/// the day a bug was filed says nothing about that bug.
+pub(crate) fn same_bug(bug: &str, fix: &str) -> bool {
+    let shared = status_terms(bug).intersection(&status_terms(fix)).count();
+    if !date_literals(bug).is_disjoint(&date_literals(fix)) {
+        return shared >= 1;
+    }
+    shared >= 2
+}
+
 /// Every surface form a word may take in a stored fact.
 fn token_forms(token: &str) -> HashSet<String> {
     let mut out = HashSet::new();
@@ -370,16 +640,27 @@ fn query_terms(query: &str, anchor_names: &[String]) -> Vec<HashSet<String>> {
     let mut out: Vec<HashSet<String>> = Vec::new();
     for token in text::tokens(query) {
         let bare: String = token.chars().filter(|c| *c != '\'').collect();
-        if token.chars().count() < 2
-            || text::is_stopword(&token)
-            || ANSWER_WORDS.contains(&bare.as_str())
-        {
+        if token.chars().count() < 2 || text::is_stopword(&token) {
             continue;
         }
-        let mut forms = token_forms(&token);
-        if let Some((_, extra)) = TERM_SYNONYMS.iter().find(|(word, _)| *word == token) {
-            forms.extend(extra.iter().map(|word| (*word).to_string()));
-        }
+        let synonyms: HashSet<String> = TERM_SYNONYMS
+            .iter()
+            .filter(|(word, _)| *word == token)
+            .flat_map(|(_, extra)| extra.iter().map(|word| (*word).to_string()))
+            .collect();
+        // An answer-type word ("language", "city") says what the answer is,
+        // not which relation a hop states; it steers the path only through
+        // its relation synonyms ("language" -> use).
+        let forms = if ANSWER_WORDS.contains(&bare.as_str()) {
+            if synonyms.is_empty() {
+                continue;
+            }
+            synonyms
+        } else {
+            let mut forms = token_forms(&token);
+            forms.extend(synonyms);
+            forms
+        };
         if !forms.is_disjoint(&anchors) || out.iter().any(|existing| !existing.is_disjoint(&forms))
         {
             continue;
@@ -514,6 +795,97 @@ fn incident(
     Ok(out)
 }
 
+/// "<word>'s <noun>" pairs of a question. `text::fold` drops the apostrophe
+/// inside a word, so the possessive is read from the raw query, not `tokens`.
+fn possessive_pairs(query: &str) -> Vec<(String, String)> {
+    let raw: Vec<&str> = query.split_whitespace().collect();
+    let mut out = Vec::new();
+    for (i, word) in raw.iter().enumerate() {
+        let lower = word.to_lowercase();
+        let Some(stem) = lower
+            .strip_suffix("'s")
+            .or_else(|| lower.strip_suffix("\u{2019}s"))
+        else {
+            continue;
+        };
+        let Some(noun) = raw.get(i + 1) else {
+            continue;
+        };
+        let (stem, noun) = (text::fold(stem), text::fold(noun));
+        if stem.is_empty() || noun.is_empty() {
+            continue;
+        }
+        out.push((stem, noun));
+    }
+    out
+}
+
+/// The term a possessive head noun spends, when the question names one.
+fn possessive_noun_bit(terms: &[HashSet<String>], noun: &str) -> Option<usize> {
+    let forms = token_forms(noun);
+    terms.iter().position(|term| !term.is_disjoint(&forms))
+}
+
+/// "<Person>'s project" names the entity of that type the person holds: the
+/// possessive is itself the hop, so path search starts at that entity with the
+/// noun's term already covered. One clear entity only, like an anchor's role
+/// noun; an untyped or ambiguous holder leaves the beam as it was.
+fn possessive_starts(
+    db: &Db,
+    query: &str,
+    terms: &[HashSet<String>],
+    seeds: &[i64],
+    vis: Visibility,
+) -> Result<Vec<(i64, u64)>> {
+    let mut out: Vec<(i64, u64)> = Vec::new();
+    for (stem, noun) in possessive_pairs(query) {
+        let Some(index) = possessive_noun_bit(terms, &noun) else {
+            continue;
+        };
+        let want = text::singularize(&noun);
+        for id in seeds {
+            if out.iter().any(|(entity, _)| entity == id) {
+                continue;
+            }
+            let name: String = db
+                .sql()
+                .query_row("SELECT name FROM entities WHERE id=?1", [id], |r| r.get(0))
+                .unwrap_or_default();
+            if !text::tokens(&name).contains(&stem) {
+                continue;
+            }
+            let mut st = db.sql().prepare_cached(
+                "SELECT r.dst,e.type,r.valid_from,r.valid_to,r.expired_at
+                   FROM relations r JOIN entities e ON e.id=r.dst
+                  WHERE r.src=?1 AND r.polarity=1",
+            )?;
+            let rows = st.query_map([id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                ))
+            })?;
+            let mut found: Vec<i64> = Vec::new();
+            for row in rows {
+                let (dst, kind, from, to, expired) = row?;
+                if !vis.shows(from, to, expired) || text::norm_name(&kind) != want {
+                    continue;
+                }
+                if !found.contains(&dst) {
+                    found.push(dst);
+                }
+            }
+            if found.len() == 1 && !out.iter().any(|(entity, _)| *entity == found[0]) {
+                out.push((found[0], 1u64 << index));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Ranked paths that start at one of `seeds` and add at least one new question
 /// term per hop.
 pub(crate) fn search(db: &Db, query: &str, seeds: &[i64], vis: Visibility) -> Result<Vec<PathHit>> {
@@ -545,6 +917,20 @@ pub(crate) fn search(db: &Db, query: &str, seeds: &[i64], vis: Visibility) -> Re
             steps: Vec::new(),
         })
         .collect();
+    // "<Person>'s project" already names the entity of that type the person
+    // holds: start there with the noun's own term spent, so the next hop is
+    // the one the question actually asks.
+    for (entity, covered) in possessive_starts(db, query, &terms, seeds, vis)? {
+        match frontier.iter_mut().find(|state| state.entity == entity) {
+            Some(state) => state.covered |= covered,
+            None => frontier.push(State {
+                entity,
+                covered,
+                score: 1.0,
+                steps: Vec::new(),
+            }),
+        }
+    }
     frontier.sort_by_key(|state| state.entity);
     frontier.dedup_by_key(|state| state.entity);
 
@@ -1176,6 +1562,227 @@ pub(crate) fn causal_memories(
     Ok(out)
 }
 
+/// An entity is a hub when many memories mention it *and* it is a large share
+/// of the database: a team, a product, the company. A cause that shares only
+/// a hub with the answer is about something else.
+const HUB_MENTIONS: i64 = 8;
+const HUB_SHARE: i64 = 8;
+
+/// The entities of the seeds that are specific to them. Everything a broad
+/// entity touches is connected to everything else through it, so a shared hub
+/// is no evidence of a shared cause.
+fn specific_entities(db: &Db, ids: &HashSet<i64>) -> Result<HashSet<i64>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let total: i64 = db
+        .sql()
+        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
+    let marks = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut st = db.sql().prepare(&format!(
+        "SELECT entity_id,COUNT(DISTINCT memory_id) FROM mentions
+         WHERE entity_id IN ({marks}) GROUP BY entity_id"
+    ))?;
+    let mut out = HashSet::new();
+    for row in st.query_map(params_from_iter(ids.iter()), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+    })? {
+        let (id, mentions) = row?;
+        if mentions < HUB_MENTIONS || mentions * HUB_SHARE <= total {
+            out.insert(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Memories that share a specific entity with a seed, the seeds themselves
+/// excluded: the only ones whose cause can be about the same thing as the
+/// answer.
+fn related_memories(db: &Db, seeds: &[i64], specific: &HashSet<i64>) -> Result<HashSet<i64>> {
+    if specific.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let marks = |n: usize| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
+    let mut st = db.sql().prepare(&format!(
+        "SELECT DISTINCT a.memory_id FROM mentions a
+         JOIN mentions b ON b.entity_id=a.entity_id
+         WHERE b.memory_id IN ({}) AND a.memory_id NOT IN ({}) AND a.entity_id IN ({})",
+        marks(seeds.len()),
+        marks(seeds.len()),
+        marks(specific.len())
+    ))?;
+    let p: Vec<Box<dyn rusqlite::ToSql>> = seeds
+        .iter()
+        .chain(seeds.iter())
+        .chain(specific.iter())
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    let mut out = HashSet::new();
+    for id in st.query_map(params_from_iter(p.iter().map(|x| x.as_ref())), |r| {
+        r.get::<_, i64>(0)
+    })? {
+        out.insert(id?);
+    }
+    Ok(out)
+}
+
+/// The live cause relations that can explain the answer: those evidenced by
+/// one of `candidates`, plus those that end at a question anchor. The endpoint
+/// lists are literal placeholders so the plan is driven by `idx_relev_memory`
+/// and `idx_rel_src`/`idx_rel_dst` instead of a scan of every stored relation.
+fn cause_relation_query(
+    group: i64,
+    candidates: &[i64],
+    anchors: &[i64],
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let marks = |n: usize| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
+    let mut branches = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(group)];
+    if !candidates.is_empty() {
+        branches.push(format!(
+            "SELECT relation_id FROM relation_evidence WHERE memory_id IN ({})",
+            marks(candidates.len())
+        ));
+        params.extend(
+            candidates
+                .iter()
+                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
+        );
+    }
+    if !anchors.is_empty() {
+        branches.push(format!(
+            "SELECT id FROM relations WHERE src IN ({0}) OR dst IN ({0})",
+            marks(anchors.len())
+        ));
+        params.extend(
+            anchors
+                .iter()
+                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
+        );
+        params.extend(
+            anchors
+                .iter()
+                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
+        );
+    }
+    let sql = format!(
+        "SELECT r.id,r.valid_from,r.valid_to,r.expired_at,e.memory_id,r.src,r.dst
+         FROM relations r
+         JOIN predicates p ON p.id=r.predicate_id
+         JOIN relation_evidence e ON e.relation_id=r.id
+         WHERE COALESCE(NULLIF(p.group_id,0),p.id)=? AND r.polarity=1
+           AND r.id IN ({})
+         ORDER BY r.id,e.memory_id",
+        branches.join(" UNION ")
+    );
+    (sql, params)
+}
+
+/// H2-16: the cause of what the first pass answered. A why-question is about
+/// the cause of the memory that answered it, and that memory rarely repeats
+/// the cause relation, so follow the stored causal facts one step out from the
+/// seeds: an evidence memory of a live `cause` relation is the cause when the
+/// relation ends at a question anchor, or when that memory mentions an entity
+/// the answer is specific about. A cause that shares only a hub entity (a
+/// team) is about something else.
+/// Returns the cause memories and the relations to render, in id order.
+pub(crate) fn cause_follow(
+    db: &Db,
+    seeds: &[i64],
+    anchors: &[i64],
+    vis: Visibility,
+    limit: usize,
+) -> Result<(Vec<i64>, Vec<i64>)> {
+    if seeds.is_empty() || limit == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let group: Option<i64> = db
+        .sql()
+        .query_row(
+            "SELECT COALESCE(NULLIF(group_id,0),id) FROM predicates WHERE canonical='cause'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(group) = group else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let marks = std::iter::repeat_n("?", seeds.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut seed_entities: HashSet<i64> = HashSet::new();
+    let mut st = db.sql().prepare(&format!(
+        "SELECT entity_id FROM mentions WHERE memory_id IN ({marks})"
+    ))?;
+    for id in st.query_map(params_from_iter(seeds.iter()), |r| r.get::<_, i64>(0))? {
+        seed_entities.insert(id?);
+    }
+    if seed_entities.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let specific = specific_entities(db, &seed_entities)?;
+    // Only a cause evidenced by a memory that shares a specific entity with a
+    // seed, or a relation that ends at a question anchor, can explain the
+    // answer. Seeding the query with those two sets keeps its cost with the
+    // seeds instead of every relation ever stored.
+    let mut candidates: Vec<i64> = related_memories(db, seeds, &specific)?
+        .into_iter()
+        .collect();
+    candidates.sort_unstable();
+    if candidates.is_empty() && anchors.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let (sql, params) = cause_relation_query(group, &candidates, anchors);
+    let mut st = db.sql().prepare(&sql)?;
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    let mut anchored: HashSet<i64> = HashSet::new();
+    for row in st.query_map(params_from_iter(params.iter().map(|x| x.as_ref())), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, i64>(6)?,
+        ))
+    })? {
+        let (relation, from, to, expired, memory, src, dst) = row?;
+        if vis.shows(from, to, expired) {
+            pairs.push((relation, memory));
+            if anchors.contains(&src) || anchors.contains(&dst) {
+                anchored.insert(relation);
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // The seeds stay in: a cause relation the answer itself evidences must
+    // still render, it just does not need a channel entry.
+    let mut out_memories = Vec::new();
+    let mut out_relations = Vec::new();
+    for (relation, memory) in pairs {
+        if !(anchored.contains(&relation) || candidates.binary_search(&memory).is_ok()) {
+            continue;
+        }
+        // The relation is rendered even when its evidence memory was already
+        // the answer; only the channel skips the seeds themselves.
+        if !out_relations.contains(&relation) {
+            out_relations.push(relation);
+        }
+        if !seeds.contains(&memory) && !out_memories.contains(&memory) {
+            out_memories.push(memory);
+        }
+        if out_memories.len() >= limit {
+            break;
+        }
+    }
+    Ok((out_memories, out_relations))
+}
+
 /// Evidence memories for ranked paths: the destination first, then the links.
 /// Deeper coverage wins: a three-hop chain that explains the whole question
 /// outranks a two-hop fragment with a slightly better edge score.
@@ -1213,61 +1820,76 @@ pub(crate) fn evidence(db: &Db, hits: &[PathHit]) -> Result<Vec<i64>> {
 /// The relations along the best paths, destination hop first, ready to render
 /// next to the retrieved memories.
 pub(crate) fn facts(db: &Db, hits: &[PathHit], cutoff: i64, limit: usize) -> Result<Vec<FactHit>> {
-    let mut st = db.sql().prepare_cached(
-        "SELECT p.canonical,r.fact,r.valid_from,r.valid_to,r.expired_at,s.name,d.name,r.polarity
-         FROM relations r
-         JOIN predicates p ON p.id=r.predicate_id
-         JOIN entities s ON s.id=r.src
-         JOIN entities d ON d.id=r.dst
-         WHERE r.id=?1",
-    )?;
+    let mut ids = Vec::new();
     let mut seen: HashSet<i64> = HashSet::new();
-    let mut out = Vec::new();
     for hit in hits {
         for step in hit.steps.iter().rev() {
             // Prose and containment hops carry no relation to render.
             if step.relation_id == 0 {
                 continue;
             }
-            if !seen.insert(step.relation_id) {
-                continue;
+            if seen.insert(step.relation_id) {
+                ids.push(step.relation_id);
             }
-            let Ok(mut rows) = st.query(params![step.relation_id]) else {
-                continue;
-            };
-            let Some(row) = rows.next()? else { continue };
-            let (predicate, fact, valid_from, valid_to, expired, source, target, polarity) = (
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, i64>(7)?,
-            );
-            if valid_from > cutoff {
-                continue;
-            }
-            out.push(FactHit {
-                id: step.relation_id,
-                source,
-                predicate,
-                target,
-                fact,
-                valid_from,
-                valid_to,
-                ended: expired.is_some() || valid_to.is_some_and(|v| v <= cutoff),
-                retracted: expired.is_some() && valid_to.is_none(),
-                polarity,
-                memory: false,
-                current_values: None,
-                replaced_by: None,
-                duration: None,
-            });
-            if out.len() >= limit {
-                return Ok(out);
-            }
+        }
+    }
+    facts_by_ids(db, &ids, cutoff, limit)
+}
+
+/// The facts of specific relations, in the order given: what a path ends on,
+/// or what a why-question's cause follow found.
+pub(crate) fn facts_by_ids(
+    db: &Db,
+    ids: &[i64],
+    cutoff: i64,
+    limit: usize,
+) -> Result<Vec<FactHit>> {
+    let mut st = db.sql().prepare_cached(
+        "SELECT COALESCE(NULLIF(r.predicate_text,''),NULLIF(p.display,''),p.canonical),
+                r.fact,r.valid_from,r.valid_to,r.expired_at,s.name,d.name,r.polarity
+         FROM relations r
+         JOIN predicates p ON p.id=r.predicate_id
+         JOIN entities s ON s.id=r.src
+         JOIN entities d ON d.id=r.dst
+         WHERE r.id=?1",
+    )?;
+    let mut out = Vec::new();
+    for relation_id in ids {
+        let Ok(mut rows) = st.query(params![relation_id]) else {
+            continue;
+        };
+        let Some(row) = rows.next()? else { continue };
+        let (predicate, fact, valid_from, valid_to, expired, source, target, polarity) = (
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+        );
+        if valid_from > cutoff {
+            continue;
+        }
+        out.push(FactHit {
+            id: *relation_id,
+            source,
+            predicate,
+            target,
+            fact,
+            valid_from,
+            valid_to,
+            ended: expired.is_some() || valid_to.is_some_and(|v| v <= cutoff),
+            retracted: expired.is_some() && valid_to.is_none(),
+            polarity,
+            memory: false,
+            current_values: None,
+            replaced_by: None,
+            duration: None,
+        });
+        if out.len() >= limit {
+            break;
         }
     }
     Ok(out)
@@ -1401,6 +2023,8 @@ pub struct FollowFact {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_to: Option<i64>,
     pub ended: bool,
+    /// 1 positive, 0 negative (rendered `—NOT→` in text).
+    pub polarity: i64,
     /// "out" when the relation points away from the reached entity.
     pub direction: String,
     /// Hops from `from` (1 = direct).
@@ -1465,13 +2089,14 @@ pub fn follow(engine: &Engine, follow: &FollowInput) -> Result<FollowOutput> {
         let mut next = Vec::new();
         for entity in &frontier {
             let mut st = db.sql().prepare_cached(
-                "SELECT r.id,r.src,r.dst,p.canonical,r.fact,r.valid_from,r.valid_to,r.expired_at,
-                        s.name,d.name
+                "SELECT r.id,r.src,r.dst,
+                        COALESCE(NULLIF(r.predicate_text,''),NULLIF(p.display,''),p.canonical),
+                        r.fact,r.valid_from,r.valid_to,r.expired_at,s.name,d.name,r.polarity
                  FROM relations r
                  JOIN predicates p ON p.id=r.predicate_id
                  JOIN entities s ON s.id=r.src
                  JOIN entities d ON d.id=r.dst
-                 WHERE r.src=?1 OR r.dst=?2",
+                 WHERE (r.src=?1 OR r.dst=?2) AND r.src != r.dst",
             )?;
             let rows = st.query_map(params![entity, entity], |r| {
                 Ok((
@@ -1485,11 +2110,23 @@ pub fn follow(engine: &Engine, follow: &FollowInput) -> Result<FollowOutput> {
                     r.get::<_, Option<i64>>(7)?,
                     r.get::<_, String>(8)?,
                     r.get::<_, String>(9)?,
+                    r.get::<_, i64>(10)?,
                 ))
             })?;
             for row in rows {
-                let (id, src, dst, predicate, fact, valid_from, valid_to, expired, sname, dname) =
-                    row?;
+                let (
+                    id,
+                    src,
+                    dst,
+                    predicate,
+                    fact,
+                    valid_from,
+                    valid_to,
+                    expired,
+                    sname,
+                    dname,
+                    polarity,
+                ) = row?;
                 if !vis.shows(valid_from, valid_to, expired) || !seen_relations.insert(id) {
                     continue;
                 }
@@ -1518,6 +2155,7 @@ pub fn follow(engine: &Engine, follow: &FollowInput) -> Result<FollowOutput> {
                     valid_from,
                     valid_to,
                     ended: expired.is_some() || valid_to.is_some_and(|v| v <= vis.now),
+                    polarity,
                     direction: direction.to_string(),
                     hops: hop,
                     memories,
@@ -1631,12 +2269,13 @@ pub fn aggregate(engine: &Engine, input: &AggregateInput) -> Result<AggregateOut
     let limit = input.limit.unwrap_or(50).clamp(1, 200);
     let mut st = db.sql().prepare_cached(
         "SELECT r.id,r.src,r.dst,p.canonical,r.fact,r.valid_from,r.valid_to,r.expired_at,
-                s.name,d.name
+                s.name,d.name,r.polarity
          FROM relations r
          JOIN predicates p ON p.id=r.predicate_id
          JOIN entities s ON s.id=r.src
          JOIN entities d ON d.id=r.dst
          WHERE (?1 IS NULL OR r.src=?1) AND (?2 IS NULL OR r.dst=?2)
+           AND r.src != r.dst
          ORDER BY r.id",
     )?;
     let rows = st.query_map(params![source, target], |r| {
@@ -1651,13 +2290,15 @@ pub fn aggregate(engine: &Engine, input: &AggregateInput) -> Result<AggregateOut
             r.get::<_, Option<i64>>(7)?,
             r.get::<_, String>(8)?,
             r.get::<_, String>(9)?,
+            r.get::<_, i64>(10)?,
         ))
     })?;
     let mut items: HashMap<i64, AggregateItem> = HashMap::new();
     let mut negative: HashMap<i64, AggregateItem> = HashMap::new();
     let mut memories: Vec<i64> = Vec::new();
     for row in rows {
-        let (id, src, dst, predicate, fact, valid_from, valid_to, expired, sname, dname) = row?;
+        let (id, src, dst, predicate, fact, valid_from, valid_to, expired, sname, dname, polarity) =
+            row?;
         if !vis.shows(valid_from, valid_to, expired) {
             continue;
         }
@@ -1673,7 +2314,7 @@ pub fn aggregate(engine: &Engine, input: &AggregateInput) -> Result<AggregateOut
         } else {
             (src, sname)
         };
-        let bucket = if has_negation_cue(&fact) {
+        let bucket = if polarity == 0 || has_negation_cue(&fact) {
             &mut negative
         } else {
             &mut items
@@ -1757,6 +2398,63 @@ mod residual_tests {
 }
 
 #[cfg(test)]
+mod fact_render_tests {
+    use super::{facts, PathHit, Step};
+    use crate::db::Db;
+    use rusqlite::params;
+
+    #[test]
+    fn path_facts_use_the_same_predicate_spelling_as_the_db_channel() {
+        let db = Db::open_in_memory().unwrap();
+        db.sql()
+            .execute(
+                "INSERT INTO entities(name,norm,type,homonym,created_at,updated_at)
+                 VALUES ('platform team','platform team','org',0,0,0),
+                        ('Jenkins','jenkins','tool',0,0,0)",
+                [],
+            )
+            .unwrap();
+        let src = 1;
+        let dst = 2;
+        db.sql()
+            .execute(
+                "INSERT INTO predicates(canonical,display,exclusive,group_id,symmetric,seeded)
+                 VALUES ('use','uses',0,0,0,0)",
+                [],
+            )
+            .unwrap();
+        let pid = db.sql().last_insert_rowid();
+        db.sql()
+            .execute("UPDATE predicates SET group_id=?1 WHERE id=?1", [pid])
+            .unwrap();
+        db.sql()
+            .execute(
+                "INSERT INTO relations(src,dst,predicate_id,predicate_text,subj,fact,valid_from,created_at)
+                 VALUES (?1,?2,?3,'uses',?1,'platform team uses Jenkins',0,0)",
+                params![src, dst, pid],
+            )
+            .unwrap();
+        let hit = PathHit {
+            steps: vec![Step {
+                relation_id: 1,
+                src,
+                dst,
+                predicate: "use".into(),
+                fact: "platform team uses Jenkins".into(),
+                reverse: false,
+                matched: 1,
+                memory: None,
+            }],
+            coverage: 1,
+            score: 1.0,
+        };
+        let out = facts(&db, &[hit], 10, 8).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].predicate, "uses");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1778,6 +2476,46 @@ mod tests {
     }
 
     #[test]
+    fn defect_cues_cover_report_inflections() {
+        for report in [
+            "The nightly export crashes with a null pointer in the CSV writer.",
+            "The export cannot finish when the CSV writer sees a null.",
+            "The export can't finish when the CSV writer sees a null.",
+            "The nightly export fails on the last row.",
+            "The sync loop hangs when two devices write at once.",
+            "The sync loop is broken on Windows.",
+        ] {
+            assert!(is_bug_memory(report), "{report:?}");
+        }
+        // A fix note is a bug memory with a fix cue, never an open report.
+        assert!(has_fix_cue("Fixed the export crash in the CSV writer."));
+        assert!(!is_bug_memory("Lumen is written in Rust."));
+    }
+
+    #[test]
+    fn a_negated_or_pending_fix_is_not_a_fix() {
+        for report in [
+            "Bug 2026-10-27: the nightly export crashes; it is not fixed yet.",
+            "The nightly export crashes with a null pointer; no fix yet.",
+            "The sync loop still hangs when two devices write at once and needs a fix.",
+            "The nightly export crash is known; the fix is not deployed.",
+            "The login bug is unresolved: it was never fixed.",
+            "The export crash has not been fixed.",
+        ] {
+            assert!(!has_fix_cue(report), "{report:?}");
+            assert!(is_bug_memory(report), "{report:?}");
+        }
+        for note in [
+            "Fixed the export crash in the CSV writer.",
+            "Fix for the 2026-10-25 login bug: the cookie is signed now.",
+            "The login bug was resolved and released in v0.3.2.",
+            "The sync loop panic is closed; no more DatabaseBusy errors.",
+        ] {
+            assert!(has_fix_cue(note), "{note:?}");
+        }
+    }
+
+    #[test]
     fn lexical_hits_do_not_crowd_out_the_best_semantic_chain() {
         let lexical = [chain(9.0, 1), chain(8.0, 2), chain(7.0, 3)];
         let semantic = [chain(0.6, 10), chain(0.5, 11)];
@@ -1792,6 +2530,34 @@ mod tests {
             .map(|h| h.steps[0].relation_id)
             .collect();
         assert_eq!(only, vec![1, 2]);
+    }
+
+    /// D3: the cause follow must not scan every stored relation. The query is
+    /// seeded with the answer's related memories and the question's anchors,
+    /// so its cost follows the seeds, not the vault.
+    #[test]
+    fn the_cause_follow_does_not_scan_every_relation() {
+        let db = Db::open_in_memory().unwrap();
+        let (sql, params) = cause_relation_query(1, &[2, 3], &[4, 5]);
+        let mut st = db
+            .sql()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let plan: Vec<String> = st
+            .query_map(params_from_iter(params.iter().map(|x| x.as_ref())), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !plan.iter().any(|step| step.contains("SCAN r")),
+            "every relation is scanned: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|step| step.contains("idx_relev_memory")),
+            "the seed index is not used: {plan:?}"
+        );
     }
 }
 
@@ -1978,5 +2744,159 @@ mod name_part_tests {
         );
         const { assert!(NAME_PART_HOP < super::PROSE_HOP) };
         const { assert!(super::PROSE_HOP < 1.0) };
+    }
+}
+
+/// nc-passive: "which language is used by <person>'s project" and "the main
+/// language of the project led by <person>" ask the same two hops as the
+/// active shape. The passive verb must read as its active predicate ("used" /
+/// "led" -> use / lead), an answer-type noun must still steer through its
+/// relation synonym ("language" -> use), and "<person>'s project" must start
+/// the walk at the project the person leads. Before that the beams left the
+/// person and rendered hop 1 only (world-300: five two-hop misses).
+#[cfg(test)]
+mod passive_query_tests {
+    use super::{evidence, search, Visibility};
+    use crate::embed::HashEmbedder;
+    use crate::engine::{Engine, EntityIn, RelationIn, RememberInput};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn remember(
+        engine: &Engine,
+        content: &str,
+        entities: &[(&str, &str)],
+        (source, predicate, target, fact): (&str, &str, &str, &str),
+    ) -> i64 {
+        engine
+            .remember(RememberInput {
+                content: content.into(),
+                entities: entities
+                    .iter()
+                    .map(|(name, kind)| EntityIn {
+                        name: (*name).into(),
+                        kind: Some((*kind).into()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                relations: vec![RelationIn {
+                    source: source.into(),
+                    predicate: predicate.into(),
+                    target: target.into(),
+                    fact: Some(fact.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .id
+    }
+
+    /// Two people, two projects, two languages.
+    fn fixture() -> (Engine, i64, i64) {
+        let engine = Engine::open_in_memory(Arc::new(HashEmbedder)).unwrap();
+        remember(
+            &engine,
+            "Cedric Narmani leads the Vesper Monitor project.",
+            &[("Cedric Narmani", "person"), ("Vesper Monitor", "project")],
+            (
+                "Cedric Narmani",
+                "leads",
+                "Vesper Monitor",
+                "Cedric Narmani leads Vesper Monitor",
+            ),
+        );
+        let ruby = remember(
+            &engine,
+            "Vesper Monitor is written in Ruby.",
+            &[("Vesper Monitor", "project"), ("Ruby", "tool")],
+            ("Vesper Monitor", "uses", "Ruby", "Vesper Monitor uses Ruby"),
+        );
+        remember(
+            &engine,
+            "Ruby Chanyya leads the Borealis Inbox project.",
+            &[("Ruby Chanyya", "person"), ("Borealis Inbox", "project")],
+            (
+                "Ruby Chanyya",
+                "leads",
+                "Borealis Inbox",
+                "Ruby Chanyya leads Borealis Inbox",
+            ),
+        );
+        let scala = remember(
+            &engine,
+            "Borealis Inbox is written in Scala.",
+            &[("Borealis Inbox", "project"), ("Scala", "tool")],
+            (
+                "Borealis Inbox",
+                "uses",
+                "Scala",
+                "Borealis Inbox uses Scala",
+            ),
+        );
+        (engine, ruby, scala)
+    }
+
+    fn today() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn reached(engine: &Engine, query: &str, person: &str, memory: i64) -> bool {
+        let seed: i64 = engine
+            .db
+            .sql()
+            .query_row("SELECT id FROM entities WHERE name=?1", [person], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let vis = Visibility {
+            now: today(),
+            as_of: None,
+            history: false,
+        };
+        let hits = search(&engine.db, query, &[seed], vis).unwrap();
+        evidence(&engine.db, &hits).unwrap().contains(&memory)
+    }
+
+    #[test]
+    fn a_possessive_passive_question_walks_to_the_language() {
+        let (engine, ruby, _) = fixture();
+        assert!(
+            reached(
+                &engine,
+                "which language is used by Cedric Narmani's project",
+                "Cedric Narmani",
+                ruby
+            ),
+            "hop 2 (project -> language) was not walked"
+        );
+    }
+
+    #[test]
+    fn a_passive_relative_clause_walks_to_the_language() {
+        let (engine, _, scala) = fixture();
+        assert!(
+            reached(
+                &engine,
+                "what is the main language of the project led by Ruby Chanyya",
+                "Ruby Chanyya",
+                scala
+            ),
+            "hop 2 (project -> language) was not walked"
+        );
+    }
+
+    #[test]
+    fn the_active_shape_still_walks_both_hops() {
+        let (engine, ruby, _) = fixture();
+        assert!(reached(
+            &engine,
+            "what language does the project Cedric Narmani leads use",
+            "Cedric Narmani",
+            ruby
+        ));
     }
 }

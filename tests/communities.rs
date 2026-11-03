@@ -214,3 +214,92 @@ fn entity_card_carries_its_community() {
         .iter()
         .all(|e| e.community.is_none()));
 }
+
+// H2-19: the strongest hub used to become a singleton community of its own
+// because every memory that mentions it pulls it with a full-weight edge,
+// while its entity-entity relations weigh less. A hub must land in the
+// community that holds its relations.
+fn hub(engine: &Engine) {
+    let chatter = [
+        "The Lumen backlog grew again this week.",
+        "A Lumen user reported a slow screen.",
+        "Lumen release notes are due on Friday.",
+        "The Lumen dashboard needs a new colour.",
+        "Someone asked about Lumen pricing.",
+        "Lumen onboarding copy is too long.",
+        "The Lumen logo needs a vector version.",
+        "Lumen support hours move to CET.",
+        "A Lumen demo is booked for Thursday.",
+        "The Lumen roadmap slide is out of date.",
+        "Lumen documentation misses a glossary.",
+        "The Lumen newsletter goes out monthly.",
+    ];
+    for content in chatter {
+        engine
+            .remember(RememberInput {
+                content: content.into(),
+                entities: vec![named("Lumen")],
+                valid_from: Some(EARLIER.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    for (tool, content) in [
+        ("tokio", "Lumen runs its background jobs on tokio."),
+        ("axum", "Lumen serves HTTP through axum."),
+        ("SQLite", "Lumen stores its state in SQLite."),
+    ] {
+        engine
+            .remember(RememberInput {
+                content: content.into(),
+                entities: vec![named("Lumen"), named(tool)],
+                relations: vec![rel("Lumen", "depends on", tool)],
+                valid_from: Some(EARLIER.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn hub_joins_the_community_of_its_relations() {
+    let engine = engine();
+    hub(&engine);
+    let out = engine.overview(None, 10).unwrap();
+    let map = mapping(&engine);
+    let hub = map["Lumen"];
+    let with_tool = ["tokio", "axum", "SQLite"]
+        .iter()
+        .filter(|t| map[**t] == hub)
+        .count();
+    assert!(
+        with_tool >= 2,
+        "hub is not with its relations: {map:?} ({out:?})"
+    );
+}
+
+// H2-19 reporting: the brief's modularity number must come from the partition
+// the engine serves, scored where it means something (entity-entity edges).
+// The old probe scored Leiden on the flat mixed snapshot, which the lane does
+// not touch, so it printed the same number before and after.
+#[test]
+fn community_quality_scores_the_served_partition() {
+    let engine = engine();
+    hub(&engine);
+    let served = neocortex::kg::community_quality(&engine.db).unwrap();
+
+    let snap = neocortex::kg::snapshot(&engine.db, None, false).unwrap();
+    let (csr, entities) = neocortex::kg::entity_subgraph(&snap);
+    let flat = neocortex::graph::leiden(&snap.csr, 7, 1.0);
+    let comm: Vec<u32> = entities
+        .iter()
+        .map(|e| flat[snap.ent_node[e] as usize])
+        .collect();
+    let flat_q = neocortex::graph::modularity(&csr, &comm, 1.0);
+
+    assert_eq!(served.singletons, 0, "hub left alone: {served:?}");
+    assert!(
+        served.modularity > flat_q,
+        "served {served:?} is not better grouped than the flat partition ({flat_q:.4})"
+    );
+}

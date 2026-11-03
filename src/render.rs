@@ -260,6 +260,26 @@ pub fn render_entity(out: &EntityOutput, fmt: Fmt<'_>) -> String {
         s.push_str(&out.card.description);
     }
     s.push('\n');
+    if !out.candidates.is_empty() {
+        let items: Vec<String> = out
+            .candidates
+            .iter()
+            .map(|c| {
+                let kind = if c.kind.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", c.kind)
+                };
+                let desc = if c.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", c.description)
+                };
+                format!("[e{}] {}{kind}{desc}", c.id, c.name)
+            })
+            .collect();
+        s.push_str(&format!("also: {}\n", items.join(" · ")));
+    }
     if let Some(c) = &out.card.community {
         s.push_str(&format!(
             "community c{}: {} ({} entities)\n",
@@ -375,7 +395,9 @@ fn bytes(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Community, CommunityRef, EntityResolution, NextHop, RelationResult};
+    use crate::engine::{
+        Community, CommunityRef, EntityCandidate, EntityResolution, NextHop, RelationResult,
+    };
 
     fn fake(t: i64) -> String {
         format!("D{t}")
@@ -656,6 +678,7 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
             current_facts: vec![fact(9, "Pune", 100, None, false)],
             past_facts: vec![fact(4, "Delhi", 50, Some(100), true)],
             similar: vec![(9, "Mother".into(), 0.81)],
+            candidates: Vec::new(),
             timeline: vec![hit(42, "event", "Moved to Pune.", 100, None, false)],
         };
         assert_eq!(
@@ -673,12 +696,36 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
     }
 
     #[test]
+    fn entity_profile_lists_other_candidates() {
+        let out = EntityOutput {
+            card: card(3, "Maya Chen", "person", &[]),
+            current_facts: Vec::new(),
+            past_facts: Vec::new(),
+            similar: Vec::new(),
+            candidates: vec![EntityCandidate {
+                id: 5,
+                name: "Maya Lindqvist".into(),
+                kind: "person".into(),
+                description: "product designer".into(),
+                score: None,
+            }],
+            timeline: Vec::new(),
+        };
+        assert_eq!(
+            render_entity(&out, &fake),
+            "[e3] Maya Chen (person)\n\
+             also: [e5] Maya Lindqvist (person) — product designer\n"
+        );
+    }
+
+    #[test]
     fn entity_timeline_truncates_long_memory_lines() {
         let out = EntityOutput {
             card: card(3, "Mom", "person", &[]),
             current_facts: Vec::new(),
             past_facts: Vec::new(),
             similar: Vec::new(),
+            candidates: Vec::new(),
             timeline: vec![hit(42, "note", &"x".repeat(300), 100, None, false)],
         };
         let rendered = render_entity(&out, &fake);

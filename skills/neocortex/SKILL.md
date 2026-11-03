@@ -20,8 +20,11 @@ Store something when it will still matter next week:
 - mistakes and the fix that worked, so they are not repeated
 - procedures that worked (build steps, deploy order, gotchas)
 - outcomes: what shipped, what failed, what was measured
-- dates of events and when a fact became true (`--when`; if omitted, one
-  explicit date in the text such as "March 5, 2025" is used, and the output says so)
+- dates of events and when a fact became true (`--when`; if omitted, the date
+  written in the text is used and the output says so: "March 5, 2025",
+  "last Tuesday", "two weeks ago", "last month", "this morning", or a written
+  range "from 2026-07-06 to 2026-08-14" / "between March 1 and March 5" /
+  "until 2026-10-15", which sets both ends. `--when`/`--until` always win)
 
 ## When NOT to remember
 
@@ -34,8 +37,11 @@ Store something when it will still matter next week:
 
 - **Atomic**: one fact per memory. "Deploy moved to Friday" and "Friday deploy
   needs sign-off" are two memories.
-- **Self-contained**: no "it", "this", "yesterday". Name the subject and use
-  absolute dates ("2026-09-14", not "last week").
+- **Self-contained**: no "it" or "this". Name the subject. Absolute dates
+  ("2026-09-14") stay readable forever and are preferred; a relative date
+  ("last week", "two weeks ago", "last Tuesday") is resolved against the write
+  clock and stored as a date, so it is safe when you do not know today's date,
+  but the text will still say "last week" to a reader.
 - **Consistent names**: always "Mom", never "mother" in one memory and "Mom" in
   the next. Aliases belong in `entities`.
 - **Always pass relations for facts**: you are the extractor. Text alone never
@@ -81,15 +87,18 @@ Store something when it will still matter next week:
 - **Causes are relations too**: `{"source": "disk full", "predicate": "caused",
   "target": "deploy failed"}`. `causes`, `led to`, `resulted in`, `caused by`
   and `because of` share one seeded family, and the inverse is stored from the
-  cause side. Why-questions then surface the cause evidence first. The
-  `causal_extract` text-cue extractor is an eval-only knob (off); a cause you
-  do not pass is not stored.
+  cause side. A why-question follows the cause one step out from the memory
+  that answered it (the cause memory and its fact come back even when that
+  memory never names the cause). The `causal_extract` text-cue extractor is an
+  eval-only knob (off); a cause you do not pass is not stored.
 - **Negation**: pass `negated: true` for "does not support Y"; it renders as
-  `—NOT→` and ends the matching positive interval.
+  `—NOT→` and ends the matching positive interval. JSON facts carry `"polarity": 0`
+  next to the explicit negative `fact` text.
 - **Nicknames are aliases**: `{"source": "Robert Okafor", "predicate":
   "nickname", "target": "Bob"}` stores no fact; the target becomes another name
   of the same entity (prefer `entities[].aliases`). Any relation whose two ends
-  resolve to the same entity is dropped, and the reply counts it in `hints`.
+  resolve to the same entity is dropped, and the reply names it in `hints`
+  (`dropped self-relation: Robert Okafor nickname Bob (kept "Bob" as an alias)`).
 - **Text-only retraction**: a sentence with no relation ("Ivan left Acme; he no
   longer works there") ends the one live fact it names, at `valid_from`, and
   reports it as `invalidated`. It also runs on a write that supplies its own
@@ -141,6 +150,12 @@ and `next:` when present.
   the prefix.
 - `facts:` lines are relations: `[r9] Mom —live in→ Pune (since 2026-09-14)`.
   `—NOT→` is a negation. Current facts show `since <date>` or no end.
+- `[1 of N current]` appears only on a single-valued predicate (seeded: lives
+  in, works at, married to, reports to, ...; or one you flagged `exclusive:
+  true`) when more than one value is still live. It means two facts disagree:
+  invalidate the stale one. Multi-valued predicates (uses, depends on, owns,
+  likes) never carry it; their several current values are ordinary. JSON has
+  the same count in `current_values`.
 - `[planned]` / `[recurring]` mark a future plan or a rule; neither is a current
   fact. A range with `ended` is **history**: true then, not now. `retracted`
   means the source was forgotten, not that the fact stopped being true.
@@ -148,6 +163,15 @@ and `next:` when present.
   plans ("upcoming", "planned", "scheduled"), names a future window, or asks
   about that event ("when does the deploy freeze start", "is the v1 API
   deprecated").
+- A month, year or date range in the question is a window when the question
+  scopes itself to it ("in August 2026", "during 2025", "on 2026-08-01"):
+  memories whose stored dates fall outside it are dropped, while memories with
+  no stated date still appear (their `valid_from` is only when they were
+  written), so check the date on each line before answering "what happened in
+  August". An event whose text states a range ("from 2026-10-26 to 2026-11-06")
+  counts as spanning it. A month that names the subject ("the December 2026
+  conference") is not a window: the question is about that event, not about
+  December.
 - A memory-lapse phrasing ("I don't remember ...", "I forgot ...", "remind me
   ...") is a request, not a negation: pass the question itself to recall.
 - An exclusion question ("which service is not in Rust", "what database does
@@ -155,12 +179,27 @@ and `next:` when present.
   the memories of the items that lack it come first, and the facts that give
   the property to the other items are kept last. When no stored entity type or
   property matches, it is answered like an ordinary question.
+- A status question ("what bug is still open", "which issues are unresolved")
+  ranks the defect reports no later memory fixes first; a bug a later memory
+  fixes is still shown, after them. A report that says it is not fixed yet
+  ("not fixed yet", "no fix yet", "needs a fix") is an open report. When the
+  question names one defect ("is the login bug still open"), only that
+  defect's report is re-ranked and it keeps its place against unrelated bugs.
+  The question has to name a defect ("is the API still open to the public" and
+  "which PRs are outstanding" are ordinary questions), and "open question" is
+  a pending decision, not an open defect.
+- A why-question also returns the cause: after the first pass, the stored
+  cause of the memory that answered it (a `cause` relation that ends at an
+  entity of the question, or whose memory shares a specific entity with the
+  answer) is added to the memories and its fact leads `facts:`. A cause that
+  shares only a broad entity, such as a team every note mentions, is ignored.
 - History is automatic for past-tense wording ("used to", "before",
   "previously", "changed", "did ... use", "no longer"), so ended facts appear
   without `include_history`. Use `as_of` for "what was true then".
 - Ordering questions ("what happened first", "in order") return items sorted by
   start date. Duration questions ("how long did Alice work at Acme") add the
-  computed span: "3 years 2 months" or "ongoing since 2023-04-01".
+  computed span from the stored interval: "3 years 2 months", "3 days", or
+  "ongoing since 2023-04-01"; the memory that answers the question stays first.
 - `(bm25#2 vec#1 graph#1)` lists the matching channels; more agreeing channels
   means a stronger hit.
 - "no memories matched" means broaden the query or drop filters, not that the
@@ -187,7 +226,7 @@ CLI; the installed binary is `~/.neocortex/bin/neocortex` (DB
 | `recall` | `neocortex recall <query>` | retrieve (defaults: k 8, budget 1200 tokens) |
 | `follow` | — (MCP only) | walk relations hop by hop, from one entity (optionally to another) |
 | `aggregate` | — (MCP only) | count and list the entities one relation reaches |
-| `entity` | `neocortex entity <name\|eID>` | profile of one entity |
+| `entity` | `neocortex entity <name\|eID>` | profile of one entity; a first name several people share lists the others as `candidates` |
 | `invalidate` | `neocortex invalidate <mID\|rID> --at <date>` | end a fact, keep history |
 | `forget` | `neocortex forget <mID> [--hard]` | retire a memory (soft) or delete it (hard) |
 | `merge_entities` | `neocortex merge <keep> <merge> [--force]` / `alias <entity> <alias>` | fix names; `distinct_from` on a `remember` entity splits a homonym |
@@ -203,7 +242,10 @@ When to use each:
 - `aggregate`: how-many, which-ones and list questions over one relation ("who
   works at Acme", "how many pets"). `source` or `target` fixes one end. Negated
   facts come back under `negative`, not in the count.
-- `entity`: everything known about one person, place or project.
+- `entity`: everything known about one person, place or project. A bare first
+  name shared by several people returns the best card plus `candidates` (and an
+  `also:` line in text output): ask again with the full name before answering
+  about that person.
 - `overview`: orienting in an unfamiliar knowledge base, or `query` to see one
   topic's neighbourhood. Not a source of individual facts.
 - `invalidate`: a fact stopped being true at a time (`at`, default now). Prefer

@@ -308,16 +308,29 @@ fn ended_by_points_at_the_relation_that_ended_it_in_multi_relation_memories() {
 }
 
 #[test]
-fn current_values_marker_only_for_several_current_values() {
+fn current_values_marker_only_for_single_valued_predicates() {
     let e = engine();
     e.remember(likes("Alice likes jazz.", T0, None)).unwrap();
-    let card = e.entity("Alice", 20).unwrap();
-    let text = neocortex::render::render_entity(&card, &|t| t.to_string());
-    assert!(!text.contains("current]"), "{text}");
     let mut hiking = likes("Alice likes hiking.", T0 + 1, None);
     hiking.relations[0].target = "hiking".into();
     e.remember(hiking).unwrap();
     let card = e.entity("Alice", 20).unwrap();
+    let text = neocortex::render::render_entity(&card, &|t| t.to_string());
+    // "likes" is multi-valued: two live values are ordinary, not a conflict.
+    assert!(!text.contains("current]"), "{text}");
+    // A seeded single-valued predicate with two live values is a real conflict.
+    for (i, target) in ["Acme", "Globex"].iter().enumerate() {
+        e.remember(input(
+            &format!("Bob works at {target}"),
+            T0 + i as i64,
+            RelationIn {
+                exclusive: Some(false),
+                ..relation(target)
+            },
+        ))
+        .unwrap();
+    }
+    let card = e.entity("Bob", 20).unwrap();
     let text = neocortex::render::render_entity(&card, &|t| t.to_string());
     assert!(text.contains("[1 of 2 current]"), "{text}");
 }

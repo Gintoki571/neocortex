@@ -700,6 +700,16 @@ fn a_nickname_relation_to_the_same_entity_becomes_an_alias() {
     );
     assert_eq!(self_loops(&engine), 0, "{:?}", out.relations);
     assert!(out.relations.is_empty(), "{:?}", out.relations);
+    // The hint names the dropped fact, not only its count.
+    let hint = out
+        .hints
+        .iter()
+        .find(|h| h.contains("self-relation"))
+        .unwrap_or_else(|| panic!("no self-relation hint in {:?}", out.hints));
+    assert_eq!(
+        hint,
+        "dropped self-relation: Robert Okafor nickname Bob (kept \"Bob\" as an alias)"
+    );
     // The nickname is still a name of the person, not a relation.
     let card = engine.entity("Bob", 10).unwrap();
     assert_eq!(card.card.id, out.entities[0].id);
@@ -725,6 +735,15 @@ fn a_relation_whose_target_resolves_to_the_source_is_not_stored() {
     );
     assert_eq!(self_loops(&engine), 0, "{:?}", out.relations);
     assert!(out.relations.is_empty(), "{:?}", out.relations);
+    let hint = out
+        .hints
+        .iter()
+        .find(|h| h.contains("self-relation"))
+        .unwrap_or_else(|| panic!("no self-relation hint in {:?}", out.hints));
+    assert_eq!(
+        hint,
+        "dropped self-relation: Robert Okafor works with Bob Okafor"
+    );
 }
 
 #[test]
@@ -1707,6 +1726,61 @@ fn merge_entities_reprojects_only_the_surviving_entity() {
     let facts = engine.entity("Acme", 10).unwrap().current_facts;
     assert_eq!(facts.len(), 1, "{facts:?}");
     assert_eq!(facts[0].target, "Widget");
+}
+
+/// KG-GHOST: an edge whose endpoint was never projected must complete that
+/// node from its relational row. A bare-id MERGE used to create a node with
+/// only `id`, which no label query can name.
+#[test]
+fn reprojection_completes_a_never_projected_endpoint() {
+    let engine = engine();
+    let first = remember(
+        &engine,
+        "Acme makes widgets",
+        vec![
+            named("Acme"),
+            EntityIn {
+                kind: Some("org".into()),
+                ..named("Widget")
+            },
+        ],
+        vec![rel("Acme", "makes", "Widget")],
+    );
+    let acme = first.entities[0].id;
+    let widget = first.entities[1].id;
+    // The projection lost the Widget node (the write path links a new entity
+    // before its node exists; a partial projection can too).
+    engine
+        .db
+        .graph()
+        .cypher(&format!(
+            "MATCH (n:Entity {{id:'e:{widget}'}}) DETACH DELETE n"
+        ))
+        .unwrap();
+    // A merge re-projects the surviving entity's edges, one of which points at
+    // the missing node.
+    kg::reproject_entity(&engine.db, acme).unwrap();
+    let rows = engine
+        .db
+        .graph()
+        .cypher(&format!(
+            "MATCH (e:Entity {{id:'e:{widget}'}}) RETURN e.name AS name, e.type AS type"
+        ))
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the relation edge did not come back");
+    assert_eq!(rows[0].get::<String>("name").unwrap(), "Widget");
+    assert_eq!(rows[0].get::<String>("type").unwrap(), "org");
+    // Anything else that still leaves a bare node is reported by validate.
+    engine
+        .db
+        .graph()
+        .cypher("MERGE (e:Entity {id:'e:999'})")
+        .unwrap();
+    let problems = engine.validate().unwrap();
+    assert!(
+        problems.iter().any(|p| p.contains("no name")),
+        "{problems:?}"
+    );
 }
 
 /// #4: a soft forget ends relations whose only live evidence was that memory.
@@ -2937,4 +3011,33 @@ fn a_shared_short_alias_never_merges_two_different_full_names() {
         vec![],
     );
     assert_eq!(short.entities[0].id, mota.entities[0].id);
+}
+
+#[test]
+fn remember_reply_for_negated_relation_states_negation() {
+    let e = engine();
+    let out = remember(
+        &e,
+        "Kepler does not use Redis.",
+        vec![
+            EntityIn {
+                name: "Kepler".into(),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Redis".into(),
+                ..Default::default()
+            },
+        ],
+        vec![RelationIn {
+            source: "Kepler".into(),
+            predicate: "uses".into(),
+            target: "Redis".into(),
+            negated: Some(true),
+            ..Default::default()
+        }],
+    );
+    assert_eq!(out.relations.len(), 1);
+    assert_eq!(out.relations[0].fact, "Kepler NOT uses Redis");
+    assert_eq!(out.relations[0].status, "new");
 }

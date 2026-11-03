@@ -602,6 +602,8 @@ pub const CONFIG_KEYS: &[&str] = &[
     "tlink_window_hours",
     "tlink_cap",
     "w_causal",
+    "cause_follow",
+    "status_rank",
     "causal_extract",
     "w_retention",
     "access_keep",
@@ -609,6 +611,8 @@ pub const CONFIG_KEYS: &[&str] = &[
     "w_rerank",
     "hint_tau",
     "anchor_tiers",
+    "vec_prefilter",
+    "vec_prefilter_n",
 ];
 
 fn boolean(key: &str, value: &str) -> Result<bool> {
@@ -664,12 +668,21 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "tlink_window_hours" => cfg.tlink_window_hours = number(key, value)?.max(0.0),
         "tlink_cap" => cfg.tlink_cap = number(key, value)? as usize,
         "w_causal" => cfg.w_causal = number(key, value)?,
+        "cause_follow" => cfg.cause_follow = boolean(key, value)?,
+        "status_rank" => cfg.status_rank = boolean(key, value)?,
         "causal_extract" => cfg.causal_extract = boolean(key, value)?,
         "w_retention" => cfg.w_retention = number(key, value)?,
         "hint_tau" => cfg.hint_tau = number(key, value)? as f32,
         "access_keep" => cfg.access_keep = number(key, value)? as usize,
         "rerank_top" => cfg.rerank_top = number(key, value)? as usize,
         "w_rerank" => cfg.w_rerank = number(key, value)?,
+        "vec_prefilter" => {
+            if value != "off" && value != "bit" {
+                return Err(crate::err!("vec_prefilter takes off or bit, got '{value}'"));
+            }
+            cfg.vec_prefilter = value.to_string()
+        }
+        "vec_prefilter_n" => cfg.vec_prefilter_n = number(key, value)?.max(1.0) as usize,
         other => {
             return Err(crate::err!(
                 "unknown config key '{other}'; valid: {}",

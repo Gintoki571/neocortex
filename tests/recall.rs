@@ -789,6 +789,226 @@ fn unrelated_question_abstains_instead_of_ranking_noise() {
 }
 
 #[test]
+fn follow_and_aggregate_skip_stored_self_loops() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Robert Okafor leads payments rewrite.", |i| {
+        i.entities = vec![entity("Robert Okafor"), entity("payments rewrite")];
+        i.relations = vec![relation(
+            "Robert Okafor",
+            "lead",
+            "payments rewrite",
+            "Robert Okafor leads payments rewrite.",
+        )];
+    });
+    let robert: i64 =
+        e.db.sql()
+            .query_row(
+                "SELECT id FROM entities WHERE name='Robert Okafor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let predicate_id: i64 =
+        e.db.sql()
+            .query_row("SELECT predicate_id FROM relations", [], |r| r.get(0))
+            .unwrap();
+    // An older build left a nickname self-loop in the database.
+    e.db.sql()
+        .execute(
+            "INSERT INTO relations(src,dst,predicate_id,predicate_text,subj,fact,valid_from,created_at)
+             VALUES(?1,?1,?2,'nickname','Robert Okafor','Robert Okafor nickname Robert Okafor',?3,?3)",
+            rusqlite::params![robert, predicate_id, clock().now],
+        )
+        .unwrap();
+    let out = paths::follow(
+        &e,
+        &paths::FollowInput {
+            from: "Robert Okafor".into(),
+            depth: Some(2),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        out.facts.iter().all(|f| f.source != f.target),
+        "{:?}",
+        out.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+    let agg = paths::aggregate(
+        &e,
+        &paths::AggregateInput {
+            target: Some("Robert Okafor".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(agg.count, 0, "{:?}", agg.items);
+    assert!(agg.items.is_empty(), "{:?}", agg.items);
+}
+
+#[test]
+fn every_fact_channel_renders_one_predicate_spelling() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "The platform team uses Jenkins for CI.", |i| {
+        i.entities = vec![entity("platform team"), entity("Jenkins")];
+        i.relations = vec![relation(
+            "platform team",
+            "uses",
+            "Jenkins",
+            "platform team uses Jenkins",
+        )];
+    });
+    remember(&e, "The platform team uses Buildkite.", |i| {
+        i.entities = vec![entity("platform team"), entity("Buildkite")];
+        i.relations = vec![relation(
+            "platform team",
+            "uses",
+            "Buildkite",
+            "platform team uses Buildkite",
+        )];
+    });
+    // A query the lexical path channel answers itself: the path facts used to
+    // render the stemmed canonical ("use") while the DB channel showed "uses".
+    let out = e
+        .recall(&RecallInput {
+            query: "platform team uses Jenkins Buildkite".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let team: Vec<_> = out
+        .facts
+        .iter()
+        .filter(|f| f.source == "platform team")
+        .collect();
+    assert!(!team.is_empty(), "{:?}", out.facts);
+    assert!(
+        team.iter().all(|f| f.predicate == "uses"),
+        "{:?}",
+        team.iter()
+            .map(|f| (&f.predicate, &f.fact))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_negative_fact_carries_polarity_and_explicit_not_string() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Kepler does not use Redis.", |i| {
+        i.entities = vec![entity("Kepler"), entity("Redis")];
+        i.relations = vec![RelationIn {
+            source: "Kepler".into(),
+            predicate: "uses".into(),
+            target: "Redis".into(),
+            negated: Some(true),
+            ..Default::default()
+        }];
+    });
+    let out = e
+        .recall(&RecallInput {
+            query: "does Kepler use Redis".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let fact = out
+        .facts
+        .iter()
+        .find(|f| f.target == "Redis")
+        .unwrap_or_else(|| panic!("no Redis fact in {:?}", out.facts));
+    assert_eq!(fact.polarity, 0);
+    assert_eq!(fact.predicate, "uses");
+    assert_eq!(fact.fact, "Kepler NOT uses Redis");
+
+    // follow also carries polarity 0 and the explicit NOT fact string
+    let fol = paths::follow(
+        &e,
+        &paths::FollowInput {
+            from: "Kepler".into(),
+            depth: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let ffact = fol
+        .facts
+        .iter()
+        .find(|f| f.target == "Redis")
+        .unwrap_or_else(|| panic!("no Redis follow fact in {:?}", fol.facts));
+    assert_eq!(ffact.polarity, 0);
+    assert_eq!(ffact.predicate, "uses");
+    assert_eq!(ffact.fact, "Kepler NOT uses Redis");
+
+    // aggregate negative bucket also carries the explicit NOT fact string
+    let agg = paths::aggregate(
+        &e,
+        &paths::AggregateInput {
+            target: Some("Redis".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let neg = agg
+        .negative
+        .iter()
+        .find(|item| item.name == "Kepler")
+        .unwrap_or_else(|| panic!("no Kepler in negative aggregate {:?}", agg.negative));
+    assert!(
+        neg.facts.contains(&"Kepler NOT uses Redis".to_string()),
+        "{:?}",
+        neg.facts
+    );
+}
+
+#[test]
+fn replaced_by_renders_explicit_negation_marker() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Kepler uses Redis.", |i| {
+        i.valid_from = Some("2026-01-01".into());
+        i.entities = vec![entity("Kepler"), entity("Redis")];
+        i.relations = vec![RelationIn {
+            source: "Kepler".into(),
+            predicate: "uses".into(),
+            target: "Redis".into(),
+            exclusive: Some(true),
+            ..Default::default()
+        }];
+    });
+    remember(&e, "Kepler does not use Redis.", |i| {
+        i.valid_from = Some("2026-03-01".into());
+        i.entities = vec![entity("Kepler"), entity("Redis")];
+        i.relations = vec![RelationIn {
+            source: "Kepler".into(),
+            predicate: "uses".into(),
+            target: "Redis".into(),
+            negated: Some(true),
+            ..Default::default()
+        }];
+    });
+    let out = e
+        .recall(&RecallInput {
+            query: "Kepler Redis".into(),
+            include_history: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let old_fact = out
+        .facts
+        .iter()
+        .find(|f| f.ended)
+        .unwrap_or_else(|| panic!("no ended fact in {:?}", out.facts));
+    let (_, repl_fact) = old_fact
+        .replaced_by
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected replaced_by in {:?}", old_fact));
+    assert_eq!(repl_fact, "Kepler NOT uses Redis");
+
+    let text = neocortex::render::render_recall(&out, &|t| t.to_string());
+    assert!(
+        text.contains("replaced by r2: Kepler NOT uses Redis"),
+        "{text}"
+    );
+}
+
+#[test]
 fn follow_walks_to_a_named_target() {
     let e = engine(Arc::new(HashEmbedder));
     remember(&e, "Noah Tansen's manager is Mira Shah.", |i| {
@@ -1260,6 +1480,52 @@ fn sweep_ingests_once_and_reports_each_variant() {
 }
 
 #[test]
+fn entity_lookup_of_a_shared_first_name_lists_the_other_person() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(
+        &e,
+        "Maya Chen is a data engineer on the analytics pipeline.",
+        |i| {
+            i.entities = vec![EntityIn {
+                name: "Maya Chen".into(),
+                kind: Some("person".into()),
+                description: Some("data engineer".into()),
+                ..Default::default()
+            }];
+        },
+    );
+    remember(
+        &e,
+        "Maya Lindqvist is a product designer on the onboarding flow.",
+        |i| {
+            i.entities = vec![EntityIn {
+                name: "Maya Lindqvist".into(),
+                kind: Some("person".into()),
+                description: Some("product designer".into()),
+                ..Default::default()
+            }];
+        },
+    );
+    let out = e.entity("Maya", 10).unwrap();
+    assert!(
+        out.card.name == "Maya Chen" || out.card.name == "Maya Lindqvist",
+        "{}",
+        out.card.name
+    );
+    assert_eq!(out.candidates.len(), 1, "{out:#?}");
+    let other = &out.candidates[0];
+    assert_ne!(other.id, out.card.id);
+    assert!(other.name == "Maya Chen" || other.name == "Maya Lindqvist");
+    assert_eq!(other.kind, "person");
+    assert!(!other.description.is_empty());
+
+    // An exact full-name lookup stays unambiguous.
+    let exact = e.entity("Maya Chen", 10).unwrap();
+    assert_eq!(exact.card.name, "Maya Chen");
+    assert!(exact.candidates.is_empty(), "{exact:#?}");
+}
+
+#[test]
 fn entity_lookup_falls_back_to_prefix_and_suggests_closest() {
     let engine = engine(Arc::new(HashEmbedder));
     remember(&engine, "The lab runs UltraBERT-Embed-150M on CPU.", |m| {
@@ -1272,4 +1538,697 @@ fn entity_lookup_falls_back_to_prefix_and_suggests_closest() {
         err.contains("unknown entity") && err.contains("closest:"),
         "{err}"
     );
+}
+
+// ---------------------------------------------------------------- nc-status H2-15/16
+
+#[test]
+fn status_intent_only_fires_on_unresolved_questions() {
+    for query in [
+        "what bug is still open in lumen",
+        "which issues are unresolved",
+        "what is still broken",
+        "which bugs are not fixed yet",
+        "any open bugs in lumen",
+        "what defects are outstanding",
+    ] {
+        assert!(paths::status_intent(query), "{query:?}");
+    }
+    for query in [
+        "what bugs did we fix",
+        "what did we fix in v0.3.1",
+        "what is the open question about workspaces",
+        "why is the sky blue",
+        "what is Mira working on",
+    ] {
+        assert!(!paths::status_intent(query), "{query:?}");
+    }
+}
+
+#[test]
+fn a_still_open_question_ranks_the_unfixed_bug_first() {
+    let e = engine(Arc::new(HashEmbedder));
+    let bug = remember(
+        &e,
+        "Bug on 2026-09-18: Lumen's sync loop panicked with DatabaseBusy when two devices synced at once.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-09-18".into());
+            i.entities = vec![entity("Lumen")];
+        },
+    );
+    let fixed = remember(
+        &e,
+        "Fix for the 2026-09-18 DatabaseBusy panic: set PRAGMA busy_timeout=5000 and retried the transaction once.",
+        |i| {
+            i.kind = Some("procedure".into());
+            i.valid_from = Some("2026-09-19".into());
+            i.entities = vec![entity("Lumen")];
+        },
+    );
+    let open = remember(
+        &e,
+        "A user reported on 2026-10-15 that offline edits from two devices lost one note body; suspected bug in merge_note_versions.",
+        |i| {
+            i.kind = Some("observation".into());
+            i.valid_from = Some("2026-10-15".into());
+            i.entities = vec![entity("Lumen")];
+        },
+    );
+    let question = remember(
+        &e,
+        "Open question 2026-10-15: whether Lumen should support team workspaces in v0.5; the decision was deferred.",
+        |i| {
+            i.kind = Some("note".into());
+            i.valid_from = Some("2026-10-16".into());
+            i.entities = vec![entity("Lumen")];
+        },
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "what bug is still open in lumen".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let position = |id: i64| out.memories.iter().position(|m| m.id == id);
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert_eq!(out.memories.first().map(|m| m.id), Some(open), "{shown:?}");
+    assert!(
+        position(open) < position(bug),
+        "the open bug must outrank the fixed one: {shown:?}"
+    );
+    assert!(
+        position(open) < position(fixed),
+        "the open bug must outrank its fix: {shown:?}"
+    );
+    assert!(
+        position(open) < position(question),
+        "an open question is not an open bug: {shown:?}"
+    );
+    // Re-ranking only: the fixed bug is demoted, never dropped.
+    assert!(position(bug).is_some(), "{shown:?}");
+}
+
+#[test]
+fn a_status_question_without_bugs_changes_nothing() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Lumen is written in Rust.", |i| {
+        i.entities = vec![entity("Lumen")];
+    });
+    remember(&e, "Lumen uses SQLite in WAL mode.", |i| {
+        i.entities = vec![entity("Lumen")];
+    });
+    let query = "what bug is still open in lumen".to_string();
+    let on = e
+        .recall(&RecallInput {
+            query: query.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    e.cfg.status_rank = false;
+    let base = e
+        .recall(&RecallInput {
+            query,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&on), ids(&base));
+}
+
+#[test]
+fn a_why_question_follows_the_cause_of_the_answering_memory() {
+    let e = engine(Arc::new(HashEmbedder));
+    let fix = remember(
+        &e,
+        "Mira Shah fixed the 2026-08-14 outage by adding a circuit breaker to the payments client.",
+        |i| {
+            i.entities = vec![entity("Mira Shah"), service("payments client")];
+        },
+    );
+    let cause = remember(
+        &e,
+        "The 2026-08-14 outage was caused by a retry storm from the payments client, which amplified the failure.",
+        |i| {
+            i.entities = vec![service("payments client")];
+            i.relations = vec![relation(
+                "retry storm",
+                "caused",
+                "2026-08-14 outage",
+                "retry storm caused 2026-08-14 outage",
+            )];
+        },
+    );
+    remember(
+        &e,
+        "Mira Shah prefers async written updates over meetings.",
+        |i| {
+            i.entities = vec![entity("Mira Shah")];
+        },
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "why did Mira add a circuit breaker".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert_eq!(out.memories.first().map(|m| m.id), Some(fix), "{shown:?}");
+    assert!(
+        out.memories.iter().any(|m| m.id == cause),
+        "the cause memory must be added: {shown:?}"
+    );
+    assert!(has_reason(&out, cause, "cause"), "{shown:?}");
+    assert!(
+        out.facts.iter().any(|f| f.source == "retry storm"),
+        "the cause fact must be rendered: {:?}",
+        out.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn status_intent_needs_a_defect_in_the_question() {
+    for query in [
+        "what bug is still open in lumen",
+        "which issues are unresolved",
+        "what is still broken",
+        "what is still failing in the sync loop",
+        "which bugs are not fixed yet",
+        "any open bugs in lumen",
+        "what defects are outstanding",
+        "which crashes are unresolved",
+        "which incident tickets are still open for the 500 error",
+    ] {
+        assert!(paths::status_intent(query), "{query:?}");
+    }
+    // "still open" / "outstanding" describe a state, not a defect: a plain
+    // question about an API or a PR is not a status question.
+    for query in [
+        "is the API still open to the public",
+        "is the API gateway still open to the public",
+        "which PRs are outstanding",
+        "is the office still open on fridays",
+        "which tickets are outstanding for the offsite",
+        "what is the open question about workspaces",
+    ] {
+        assert!(!paths::status_intent(query), "{query:?}");
+    }
+}
+
+#[test]
+fn an_open_ended_question_is_not_a_status_question() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    let api = remember(
+        &e,
+        "The API is open to the public; anonymous requests are rate limited to 60 per minute.",
+        |i| {
+            i.entities = vec![entity("API")];
+        },
+    );
+    let gateway = remember(
+        &e,
+        "The API gateway is open to the public and routes anonymous traffic to the billing service.",
+        |i| {
+            i.entities = vec![entity("API gateway")];
+        },
+    );
+    let pr = remember(
+        &e,
+        "PR 412 adds the export endpoint and is awaiting review.",
+        |i| {
+            i.entities = vec![entity("PR 412")];
+        },
+    );
+    // Unrelated defect reports in the same database.
+    remember(
+        &e,
+        "The ingest worker failed with a 500 error on 2026-10-02.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-02".into());
+        },
+    );
+    remember(
+        &e,
+        "The smoke test failed against staging on 2026-10-03.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-03".into());
+        },
+    );
+    for (query, allowed) in [
+        ("is the API still open to the public", [api, gateway]),
+        (
+            "is the API gateway still open to the public",
+            [gateway, api],
+        ),
+        ("which PRs are outstanding", [pr, pr]),
+    ] {
+        let on = e
+            .recall(&RecallInput {
+                query: query.into(),
+                k: Some(8),
+                ..Default::default()
+            })
+            .unwrap();
+        let shown: Vec<(i64, &str)> = on
+            .memories
+            .iter()
+            .map(|m| (m.id, m.content.as_str()))
+            .collect();
+        assert!(
+            on.memories.first().is_some_and(|m| allowed.contains(&m.id)),
+            "{query:?}: {shown:?}"
+        );
+        e.cfg.status_rank = false;
+        let base = e
+            .recall(&RecallInput {
+                query: query.into(),
+                k: Some(8),
+                ..Default::default()
+            })
+            .unwrap();
+        e.cfg.status_rank = true;
+        assert_eq!(ids(&on), ids(&base), "{query:?}: {shown:?}");
+    }
+}
+
+#[test]
+fn an_unfixed_crash_report_is_ranked_as_open() {
+    let e = engine(Arc::new(HashEmbedder));
+    let crash = remember(
+        &e,
+        "The nightly export crashes with a null pointer in the CSV writer.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-15".into());
+        },
+    );
+    remember(
+        &e,
+        "The nightly export writes one CSV file per table to the export bucket.",
+        |i| {
+            i.kind = Some("fact".into());
+            i.valid_from = Some("2026-10-14".into());
+        },
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "what is still broken in the export".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert!(
+        has_reason(&out, crash, "status"),
+        "not ranked as open: {shown:?}"
+    );
+    assert_eq!(out.memories.first().map(|m| m.id), Some(crash), "{shown:?}");
+}
+
+#[test]
+fn a_report_that_says_not_fixed_yet_is_still_open() {
+    let e = engine(Arc::new(HashEmbedder));
+    let asked = remember(
+        &e,
+        "Bug 2026-10-08: the nightly export crashes with a null pointer in the CSV writer; it is not fixed yet.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-08".into());
+        },
+    );
+    remember(
+        &e,
+        "Bug 2026-10-07: the search index rebuild hangs on large vaults.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-07".into());
+        },
+    );
+    remember(
+        &e,
+        "Bug 2026-10-05: the login fails with a 500 when the session cookie is missing.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-05".into());
+        },
+    );
+    for (day, fact) in [
+        (
+            1,
+            "The nightly export writes one CSV file per table to the export bucket.",
+        ),
+        (2, "The export bucket keeps objects for 30 days."),
+        (3, "The CSV writer quotes fields that contain a comma."),
+        (4, "The search index is rebuilt on every deploy."),
+    ] {
+        remember(&e, fact, |i| {
+            i.kind = Some("fact".into());
+            i.valid_from = Some(format!("2026-10-{day:02}"));
+        });
+    }
+    let out = e
+        .recall(&RecallInput {
+            query: "is the nightly export bug still open".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert_eq!(out.memories.first().map(|m| m.id), Some(asked), "{shown:?}");
+    assert!(has_reason(&out, asked, "status"), "{shown:?}");
+}
+
+#[test]
+fn a_shared_date_alone_does_not_close_a_bug() {
+    // A release note dated the same day as a bug report is not its fix: the
+    // two share a date and nothing else, so the report stays open and keeps
+    // the top answer instead of being halved below a plain fact.
+    let e = engine(Arc::new(HashEmbedder));
+    let bug = remember(
+        &e,
+        "Bug 2026-10-15: the nightly export crashes with a null pointer in the CSV writer; it is not fixed yet.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-15".into());
+        },
+    );
+    remember(
+        &e,
+        "Lumen v0.9.0 was released on 2026-10-15 with the new dashboard layout.",
+        |i| {
+            i.kind = Some("note".into());
+            i.valid_from = Some("2026-10-15".into());
+            i.entities = vec![entity("Lumen")];
+        },
+    );
+    for (day, fact) in [
+        (
+            14,
+            "The nightly export writes one CSV file per table to the export bucket.",
+        ),
+        (14, "The export bucket keeps objects for 30 days."),
+        (13, "The CSV writer quotes fields that contain a comma."),
+    ] {
+        remember(&e, fact, |i| {
+            i.kind = Some("fact".into());
+            i.valid_from = Some(format!("2026-10-{day:02}"));
+        });
+    }
+    let out = e
+        .recall(&RecallInput {
+            query: "what bugs are still open".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert_eq!(out.memories.first().map(|m| m.id), Some(bug), "{shown:?}");
+    assert!(
+        has_reason(&out, bug, "status"),
+        "not ranked as open: {shown:?}"
+    );
+}
+
+#[test]
+fn a_question_about_a_fixed_bug_keeps_the_fix_in_front() {
+    let e = engine(Arc::new(HashEmbedder));
+    let bug = remember(
+        &e,
+        "Bug 2026-10-05: the login fails with a 500 when the session cookie is missing.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-05".into());
+        },
+    );
+    let fix = remember(
+        &e,
+        "Fix for the 2026-10-05 login bug: the session cookie is now signed before it is stored.",
+        |i| {
+            i.kind = Some("procedure".into());
+            i.valid_from = Some("2026-10-06".into());
+        },
+    );
+    let export = remember(
+        &e,
+        "Bug 2026-10-02: the nightly export crashes with a null pointer in the CSV writer.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-02".into());
+        },
+    );
+    let index = remember(
+        &e,
+        "Bug 2026-10-03: the search index rebuild hangs on large vaults.",
+        |i| {
+            i.kind = Some("mistake".into());
+            i.valid_from = Some("2026-10-03".into());
+        },
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "is the login bug still open".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    let position = |id: i64| out.memories.iter().position(|m| m.id == id);
+    assert!(
+        matches!(out.memories.first().map(|m| m.id), Some(first) if first == fix || first == bug),
+        "the asked bug or its fix must answer: {shown:?}"
+    );
+    for id in [fix, bug] {
+        for other in [export, index] {
+            assert!(
+                position(id) < position(other),
+                "an unrelated open bug outranks the asked one: {shown:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_status_answer_does_not_depend_on_ingestion_order() {
+    let subjects = [
+        "proxy", "cache", "billing", "search", "export", "import", "auth", "session", "webhook",
+        "queue", "worker", "invoice", "mailer", "router", "gateway", "storage", "backup",
+        "restore", "report", "digest", "ledger", "hooks", "plugins", "themes",
+    ];
+    let build = |scheduler_at: usize| -> (Engine, i64) {
+        let e = engine(Arc::new(HashEmbedder));
+        let mut scheduler = 0;
+        for (i, subject) in subjects.iter().enumerate() {
+            let content = if i == scheduler_at {
+                "Bug 2026-10-02: the scheduler job fails with a 500 error on retry.".to_string()
+            } else {
+                format!("Bug 2026-10-01: the {subject} path fails with a 500 error on retry.")
+            };
+            let id = remember(&e, &content, |i| {
+                i.kind = Some("mistake".into());
+                i.valid_from = Some("2026-10-01".into());
+            });
+            if i == scheduler_at {
+                scheduler = id;
+            }
+        }
+        (e, scheduler)
+    };
+    let mut tops = Vec::new();
+    for (at, label) in [(0, "first"), (22, "last")] {
+        let (e, scheduler) = build(at);
+        let out = e
+            .recall(&RecallInput {
+                query: "is the scheduler bug still open".into(),
+                k: Some(8),
+                ..Default::default()
+            })
+            .unwrap();
+        let shown: Vec<(i64, &str)> = out
+            .memories
+            .iter()
+            .map(|m| (m.id, m.content.as_str()))
+            .collect();
+        assert_eq!(
+            out.memories.first().map(|m| m.id),
+            Some(scheduler),
+            "scheduler bug stored {label}: {shown:?}"
+        );
+        assert!(has_reason(&out, scheduler, "status"), "{label}: {shown:?}");
+        tops.push(out.memories.first().map(|m| m.content.clone()));
+    }
+    assert_eq!(tops[0], tops[1]);
+}
+
+#[test]
+fn a_why_question_renders_each_cause_fact_once() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(
+        &e,
+        "The 2026-08-14 outage was caused by a retry storm from the payments client.",
+        |i| {
+            i.entities = vec![service("payments client")];
+            i.relations = vec![relation(
+                "retry storm",
+                "caused",
+                "2026-08-14 outage",
+                "retry storm caused 2026-08-14 outage",
+            )];
+        },
+    );
+    remember(
+        &e,
+        "Mira Shah reviewed the incident report afterwards.",
+        |i| {
+            i.entities = vec![entity("Mira Shah")];
+        },
+    );
+    let out = e
+        .recall(&RecallInput {
+            query: "why did the retry storm cause the 2026-08-14 outage".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let lines: Vec<&str> = out.facts.iter().map(|f| f.fact.as_str()).collect();
+    let mut unique: Vec<i64> = out.facts.iter().map(|f| f.id).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        out.facts.len(),
+        "duplicate fact lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|f| f.contains("retry storm")),
+        "the cause fact must be rendered: {lines:?}"
+    );
+}
+
+#[test]
+fn a_why_question_ignores_a_cause_that_only_shares_a_hub_entity() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    let slow = remember(
+        &e,
+        "The search service got slow after the 2026-10-10 deploy; p99 latency went from 80 ms to 900 ms.",
+        |i| {
+            i.entities = vec![service("search service"), entity("Platform team")];
+        },
+    );
+    let storm = remember(
+        &e,
+        "The 2026-10-11 retry storm hit the payments client.",
+        |i| {
+            i.entities = vec![service("payments client"), entity("Platform team")];
+            i.relations = vec![relation(
+                "retry storm",
+                "caused",
+                "payments client outage",
+                "retry storm caused payments client outage",
+            )];
+        },
+    );
+    // The team is a hub: every standup note mentions it, so sharing it says
+    // nothing about what caused the search slowdown.
+    for day in 1..=6 {
+        remember(
+            &e,
+            &format!("Platform team standup on 2026-10-{day:02} covered the on-call rotation."),
+            |i| {
+                i.entities = vec![entity("Platform team")];
+            },
+        );
+    }
+    let out = e
+        .recall(&RecallInput {
+            query: "why is the search service slow".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    let shown: Vec<(i64, &str)> = out
+        .memories
+        .iter()
+        .map(|m| (m.id, m.content.as_str()))
+        .collect();
+    assert_eq!(out.memories.first().map(|m| m.id), Some(slow), "{shown:?}");
+    assert!(
+        !has_reason(&out, storm, "cause"),
+        "hub cause followed: {shown:?}"
+    );
+    // Nothing about the hub-only cause reaches the answer, facts included.
+    let facts_on: Vec<i64> = out.facts.iter().map(|f| f.id).collect();
+    e.cfg.cause_follow = false;
+    let base = e
+        .recall(&RecallInput {
+            query: "why is the search service slow".into(),
+            k: Some(8),
+            ..Default::default()
+        })
+        .unwrap();
+    e.cfg.cause_follow = true;
+    assert_eq!(ids(&out), ids(&base), "{shown:?}");
+    assert_eq!(
+        facts_on,
+        base.facts.iter().map(|f| f.id).collect::<Vec<_>>(),
+        "{:?}",
+        out.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_why_question_without_causes_is_unchanged() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    remember(
+        &e,
+        "Mira Shah prefers async written updates over meetings.",
+        |i| {
+            i.entities = vec![entity("Mira Shah")];
+        },
+    );
+    remember(&e, "Mira Shah has a cat named Poppy.", |i| {
+        i.entities = vec![entity("Mira Shah")];
+    });
+    let query = "why is the sky blue".to_string();
+    let on = e
+        .recall(&RecallInput {
+            query: query.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+    e.cfg.cause_follow = false;
+    let base = e
+        .recall(&RecallInput {
+            query,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&on), ids(&base));
+    assert!(on.facts.iter().all(|f| f.source != "retry storm"));
 }

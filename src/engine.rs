@@ -86,6 +86,17 @@ pub struct Config {
     pub tlink_cap: usize,
     /// RRF weight of the causal channel on why/intent questions (E4b).
     pub w_causal: f64,
+    /// H2-16: on a why-question, follow the stored cause relations of the top
+    /// answering memories (an anchored endpoint, or a specific entity shared
+    /// with another answer) and add their cause memory and fact. 0 disables
+    /// the follow step.
+    pub cause_follow: bool,
+    /// H2-15: on a question that names a defect and asks whether it is still
+    /// open, rank open bug reports above bugs a later memory fixes: every open
+    /// report on a general question, only the named defect's report when the
+    /// question names one. Re-ranks, never hides, and never demotes a
+    /// better-matching answer.
+    pub status_rank: bool,
     /// Extract cause relations from in-memory text cues (E4b). Off by default:
     /// the calling agent is the reliable extractor.
     pub causal_extract: bool,
@@ -141,6 +152,13 @@ pub struct Config {
     /// `1` unique first/last name word, `2` role noun via a relation; `b` / `x`
     /// / `p` let weak anchors block pass-through / enable prose hops / both. Empty or `0` = exact aliases only.
     pub anchor_tiers: String,
+    /// Memory KNN candidate generator: "off" (exact vec0 scan) or "bit"
+    /// (`memories_bits` Hamming scan, then an exact rerank of the top
+    /// `vec_prefilter_n` x depth candidates). The bit table is created and
+    /// backfilled on first use; writes keep it in sync.
+    pub vec_prefilter: String,
+    /// Candidate depth multiplier of the bit prefilter (`N = n * k`).
+    pub vec_prefilter_n: usize,
 }
 
 impl Default for Config {
@@ -163,6 +181,8 @@ impl Default for Config {
             tlink_window_hours: 24.0,
             tlink_cap: 20,
             w_causal: 0.0,
+            cause_follow: true,
+            status_rank: true,
             causal_extract: false,
             w_retention: 0.05,
             access_keep: 8,
@@ -186,6 +206,8 @@ impl Default for Config {
             w_rerank: 0.5,
             hint_tau: 0.40,
             anchor_tiers: String::new(),
+            vec_prefilter: "off".to_string(),
+            vec_prefilter_n: 10,
         }
     }
 }
@@ -562,6 +584,10 @@ pub struct EntityOutput {
     pub current_facts: Vec<FactHit>,
     pub past_facts: Vec<FactHit>,
     pub similar: Vec<(i64, String, f32)>,
+    /// Other entities the looked-up name could mean: a bare first name or a
+    /// name prefix that is not the exact alias of one entity (H2-13).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<EntityCandidate>,
     /// Newest first.
     pub timeline: Vec<MemoryHit>,
 }
@@ -777,8 +803,7 @@ impl Engine {
                     "UPDATE memories SET superseded_by=NULL WHERE superseded_by=?1",
                     [id],
                 )?;
-                db.sql()
-                    .execute("DELETE FROM memories_vec WHERE rowid=?1", [id])?;
+                db.delete_memory_vec(id)?;
                 // Cascades mentions and relation_evidence.
                 db.sql().execute("DELETE FROM memories WHERE id=?1", [id])?;
                 // Incremental projection: only this node and the edges of the
@@ -792,8 +817,7 @@ impl Engine {
                 // snapshot/validate exclude it from the live graph.
                 db.sql()
                     .execute("UPDATE memories SET expired_at=?1 WHERE id=?2", [now, id])?;
-                db.sql()
-                    .execute("UPDATE memories_vec SET live=0 WHERE rowid=?1", [id])?;
+                db.set_memory_vec_live(id, 0)?;
             }
             crate::kg::bump_gen(db)?;
             Ok(ChangeOutput {
@@ -1082,17 +1106,26 @@ impl Engine {
         let mentions = count("SELECT count(*) FROM mentions")?;
         let similar = count("SELECT count(*) FROM similar")?;
         let relations = count("SELECT count(*) FROM relations")?;
+        let name_parts = count("SELECT count(*) FROM name_part")?;
         if nodes != memories + entities {
             out.push(format!(
                 "projection nodes: {nodes}, relational: {}",
                 memories + entities
             ));
         }
-        if edges != mentions + similar + relations {
+        // A B5 containment link is a projection edge like a mention or a relation.
+        if edges != mentions + similar + relations + name_parts {
             out.push(format!(
                 "projection edges: {edges}, relational: {}",
-                mentions + similar + relations
+                mentions + similar + relations + name_parts
             ));
+        }
+        // An edge MERGE run before its endpoint was projected leaves a node
+        // with only `id`: every node is projected with a name.
+        let unnamed =
+            cypher_count("MATCH (n) WHERE n.name IS NULL OR n.name = '' RETURN count(n) AS c")?;
+        if unnamed != 0 {
+            out.push(format!("{unnamed} projection nodes have no name"));
         }
         if count("SELECT count(*) FROM memories_vec")? != memories {
             out.push("memory vectors do not match memories".into());

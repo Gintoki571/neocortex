@@ -90,7 +90,7 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 |---|---|
 | `remember <content...>` | store a memory; flags below |
 | `recall <query...>` | retrieve memories, facts and entities |
-| `entity <name\|eID>` | profile (with its community), current/past facts and timeline of one entity |
+| `entity <name\|eID>` | profile (with its community), current/past facts and timeline of one entity; a first name several people share also lists the others as `candidates` |
 | `invalidate <mID\|rID>` | end a memory or relation at a time, keeping it as history |
 | `forget <mID>` | retire a memory; its sole-evidence relations are retracted (`--hard` deletes it with vectors and mentions) |
 | `merge <keep> <merge>` | merge one entity into another (`--force` crosses types) |
@@ -222,7 +222,11 @@ says what to fix.
 
 `overview` runs deterministic Leiden community detection over the live graph
 (the same seed always gives the same partition; `cN` ids are matched to the
-previous run by member overlap). Each community is summarised without an LLM:
+previous run by member overlap). A mention counts by how selective it is
+(`1/sqrt(deg(memory)·deg(entity))`), so a hub that hundreds of memories mention
+still lands with the entities its relations name, and a community that would
+hold one entity alone is attached to the community holding most of that
+entity's live relations. Each community is summarised without an LLM:
 a label of its highest-degree entities, its size, the most common live
 predicates, the date span of its memories, three central facts and a
 representative memory. `entity` cards carry the same community as
@@ -246,7 +250,12 @@ recall — is in [`skills/neocortex/SKILL.md`](skills/neocortex/SKILL.md).
 Four channels run in parallel: **BM25** over memory text and tags, **vector**
 KNN over UltraBERT embeddings, **graph** personalized PageRank over entities,
 memories and relations, and **temporal** overlap with a time window parsed from
-the query. Their ranked lists are fused with weighted RRF, then lightly
+the query. A window also filters when the question scopes itself to it ("in
+August 2026", "during 2025"): a memory that states its own dates and falls
+outside the window is not returned, so a range in its text ("from X to Y")
+counts as spanning, while a month that only names the subject ("the December
+2026 conference") and a memory dated only by its ingest time stay. Their ranked
+lists are fused with weighted RRF, then lightly
 adjusted for recency, importance and whether a fact is ended. MMR removes
 near-duplicates and the result is packed into a token budget, whole items only.
 
@@ -255,8 +264,13 @@ the world, `expired_at` says when neocortex retired it. Changed facts are kept
 as history and are never presented as current unless you ask for history or an
 `as_of` snapshot. A memory's `--until` or `invalidate m<id>` ends the facts only
 that memory states; `forget` retracts them without an end date. Without
-`--when`, one explicit date in the text (`March 5, 2025`, `2019`, `yesterday`)
-becomes the start; several dates, or none, leave it at today.
+`--when`, the date written in the text becomes the start: an absolute date
+(`March 5, 2025`, `2019`), a relative phrase (`yesterday`, `last Tuesday`,
+`two weeks ago`, `last month`, `this morning`), or a written range (`from
+2026-07-06 to 2026-08-14`, `between March 1 and March 5`, `until 2026-10-15`),
+which sets both ends and makes the written last day inclusive. Several
+unrelated dates, a vague phrase, or none leave it at today; `--when`/`--until`
+always win.
 
 The channel set is extensible: two measured experiments are built in but off by
 default (`--set w_tlink=…` temporal neighbours, `--set w_causal=…` why-question
@@ -393,6 +407,7 @@ of supporting-hop memories on the multi-hop world (0.965 -> 0.816), and adds
 | `NEOCORTEX_MAX_TOKENS` | `1024` | max tokens per embedding |
 | `NEOCORTEX_EMBEDDER` | unset | `hash` selects the deterministic test embedder |
 | `NEOCORTEX_VEC` | `f32` | vector storage of a **new** database: `f32` or `int8` (one byte per element, scale 127); an existing database keeps the mode in `schema_meta.vec_mode` |
+| `NEOCORTEX_VEC_PREFILTER` | unset | `bit` creates and backfills the `memories_bits` sign-bit table on open (memory KNN prefilter, exact rerank); unset = exact scan |
 | `NEOCORTEX_RERANK_MODEL` | `~/.neocortex/models/ms-marco-MiniLM-L-6-v2` | reranker model directory (optional) |
 | `NEOCORTEX_RERANK` | unset | `<N>` reranks the top N fused candidates, `off` disables; unset = built-in default |
 

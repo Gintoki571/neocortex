@@ -1165,10 +1165,16 @@ fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Resul
     } else {
         None
     };
-    // Without --when, a date written in the content is the start (one only).
-    let (valid_from, span_end, when_inferred) = match inp.valid_from.as_deref() {
+    // Without --when, the dates written in the content are the memory's own:
+    // a start, and for a written range also its end. Caller values always win.
+    let text_dates = if inp.valid_from.is_none() {
+        temporal::text_dates(&content, &clock)
+    } else {
+        None
+    };
+    let (valid_from, span_end, when_inferred, text_end) = match inp.valid_from.as_deref() {
         Some(s) => match temporal::parse_span(s, &clock) {
-            Some((start, end)) => (start, Some(end), None),
+            Some((start, end)) => (start, Some(end), None, None),
             None => {
                 let start = temporal::parse_instant(s, &clock).ok_or_else(|| {
                     crate::err!(
@@ -1177,19 +1183,35 @@ fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Resul
                          3 days ago, 2 weeks ago, next Monday, or a span 'from X to Y'"
                     )
                 })?;
-                (start, None, None)
+                (start, None, None, None)
             }
         },
         None if plan => match future_plan {
-            Some(w) => (w.start, None, Some(w.matched)),
+            Some(w) => (w.start, None, Some(w.matched), None),
             // A plan with no resolvable date is not a past event either.
-            None => (clock.now, None, None),
+            None => (clock.now, None, None, None),
         },
         // A future date in a decision/note is the subject's date, not when the
         // memory became true; only events are dated in the future.
-        None => match temporal::text_date(&content, &clock) {
-            Some(w) if w.start <= clock.now || kind == "event" => (w.start, None, Some(w.matched)),
-            _ => (clock.now, None, None),
+        None => match text_dates {
+            Some(d) => {
+                let (start, when) = match &d.start {
+                    Some(w) if w.start <= clock.now || kind == "event" => {
+                        (w.start, Some(w.matched.clone()))
+                    }
+                    // A future range dates nothing: its end belongs to it too.
+                    Some(_) => (clock.now, None),
+                    // "until Y" states only an end; a past one cannot bound a
+                    // memory recorded now, so it dates nothing either.
+                    None => (
+                        clock.now,
+                        d.end.filter(|e| *e > clock.now).map(|_| d.matched.clone()),
+                    ),
+                };
+                let end = if when.is_some() { d.end } else { None };
+                (start, None, when, end)
+            }
+            None => (clock.now, None, None, None),
         },
     };
     // A plan stated in the text, or anything dated after now, has not happened
@@ -1213,6 +1235,10 @@ fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Resul
         ));
     }
     let valid_to = valid_to.or(span_end);
+    // A range written in the text only fills an end the caller left open, and
+    // an end that already passed cannot bound a memory recorded now: drop it
+    // instead of inventing a start for it.
+    let valid_to = valid_to.or(text_end.filter(|v| *v > valid_from));
     if valid_to.is_some_and(|v| v <= valid_from) {
         return Err(crate::err!("valid_to must be after valid_from"));
     }
@@ -1489,13 +1515,7 @@ fn write_prepared(
             Ok(_) => {
                 let id = db.sql().last_insert_rowid();
                 crate::wtiming::begin(crate::wtiming::VEC_INSERT);
-                db.sql().execute(
-                    &format!(
-                        "INSERT INTO memories_vec(rowid,embedding,live) VALUES (?1,{},1)",
-                        db.vec_sql("?2")
-                    ),
-                    params![id, db.vec_blob(&vectors[0])],
-                )?;
+                db.insert_memory_vec(id, &vectors[0])?;
                 crate::wtiming::end(crate::wtiming::VEC_INSERT);
                 crate::wtiming::begin(crate::wtiming::GRAPH);
                 kg::project_memory(db, id, &kind, &content)?;
@@ -1604,10 +1624,13 @@ fn write_prepared(
     let mut invalidated = Vec::new();
     let mut conflicts = Vec::new();
     let mut related = Vec::new();
-    // Relations dropped because both ends resolved to one entity (H2-18).
-    let mut self_relations = 0usize;
+    // Relations dropped because both ends resolved to one entity (H2-18),
+    // described so the hint can name each one.
+    let mut self_relations: Vec<String> = Vec::new();
     if relations.is_empty() && !entity_ids.is_empty() {
-        for &(mid, cosine) in neighbours.iter() {
+        // A stored memory is its own nearest row; a duplicate stored nothing.
+        let keep = if duplicate_of.is_some() { 10 } else { 9 };
+        for &(mid, cosine) in neighbours.iter().take(keep) {
             if cosine < cfg.update_candidate || cosine >= cfg.near_dup || mid == id {
                 continue;
             }
@@ -1689,10 +1712,21 @@ fn write_prepared(
         // target as another name of the entity; any other predicate is
         // dropped, because a self-loop only adds noise to PPR and the card.
         if src == dst {
+            let dropped = format!(
+                "{} {} {}",
+                relation.source.trim(),
+                relation.predicate.trim(),
+                relation.target.trim()
+            );
             if is_name_predicate(&relation.predicate) {
                 resolve::add_alias(db, src, &relation.target, "agent")?;
+                self_relations.push(format!(
+                    "{dropped} (kept \"{}\" as an alias)",
+                    relation.target.trim()
+                ));
+            } else {
+                self_relations.push(dropped);
             }
-            self_relations += 1;
             continue;
         }
         // Exclusivity is per semantic subject: src normally, the original
@@ -2010,8 +2044,7 @@ fn write_prepared(
             "UPDATE memories SET valid_to=COALESCE(valid_to,?1),expired_at=?2,superseded_by=?3 WHERE id=?4",
             params![valid_from, now, id, target],
         )?;
-        db.sql()
-            .execute("UPDATE memories_vec SET live=0 WHERE rowid=?1", [target])?;
+        db.set_memory_vec_live(*target, 0)?;
     }
     let touched: Vec<i64> = invalidated
         .iter()
@@ -2037,10 +2070,16 @@ fn write_prepared(
             related[0].memory_id, related[0].memory_id
         ));
     }
-    if self_relations > 0 {
-        hints.push(format!(
-            "dropped {self_relations} relation(s) whose source and target are the same entity; nickname/alias targets are kept as names"
-        ));
+    if let Some(first) = self_relations.first() {
+        hints.push(if self_relations.len() == 1 {
+            format!("dropped self-relation: {first}")
+        } else {
+            format!(
+                "dropped {} self-relations: {}",
+                self_relations.len(),
+                self_relations.join("; ")
+            )
+        });
     }
     // Text alone yields no graph facts (no CPU-sized extractor is reliable
     // here, see docs/research/extraction.md); the calling agent is the extractor.

@@ -46,6 +46,16 @@ pub fn project_memory(db: &Db, id: i64, kind: &str, content: &str) -> Result<()>
     )
 }
 
+/// Project a memory using its stored kind and text.
+fn project_memory_from_db(db: &Db, id: i64) -> Result<()> {
+    let (kind, content): (String, String) =
+        db.sql()
+            .query_row("SELECT kind,content FROM memories WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+    project_memory(db, id, &kind, &content)
+}
+
 pub fn project_entity(db: &Db, id: i64, name: &str, kind: &str) -> Result<()> {
     run(
         db,
@@ -79,9 +89,44 @@ pub fn bump_gen(db: &Db) -> Result<()> {
     Ok(())
 }
 
+const MEMORY_PROBE: &str = "MATCH (n:Memory {id:$id}) RETURN n.name AS name";
+const ENTITY_PROBE: &str = "MATCH (n:Entity {id:$id}) RETURN n.name AS name";
+
+/// True when the node carries its `name`. An edge MERGE run before its endpoint
+/// was projected leaves a node with only `id`, which no label query can name.
+fn node_named(db: &Db, probe: &str, id: &str) -> Result<bool> {
+    let mut q = db.graph().cypher_builder(probe);
+    q = q.param("id", id.to_string());
+    let rows = q.run()?;
+    let named = rows
+        .iter()
+        .next()
+        .and_then(|r| r.get::<String>("name").ok())
+        .is_some_and(|name| !name.is_empty());
+    Ok(named)
+}
+
+/// Project an endpoint missing from the projection before the edge that needs
+/// it, from its relational row.
+fn ensure_memory_node(db: &Db, id: i64) -> Result<()> {
+    if !node_named(db, MEMORY_PROBE, &format!("m:{id}"))? {
+        project_memory_from_db(db, id)?;
+    }
+    Ok(())
+}
+
+fn ensure_entity_node(db: &Db, id: i64) -> Result<()> {
+    if !node_named(db, ENTITY_PROBE, &format!("e:{id}"))? {
+        project_entity_from_db(db, id)?;
+    }
+    Ok(())
+}
+
 pub fn project_mention(db: &Db, memory: i64, entity: i64) -> Result<()> {
     // One MERGE statement: the two-`MATCH` form made graphqlite plan a
     // cartesian product and cost O(edges) per call on a grown graph.
+    ensure_memory_node(db, memory)?;
+    ensure_entity_node(db, entity)?;
     run(
         db,
         "MERGE (m:Memory {id:$m})-[:MENTIONS]->(e:Entity {id:$e})",
@@ -93,6 +138,8 @@ pub fn project_mention(db: &Db, memory: i64, entity: i64) -> Result<()> {
 }
 
 pub fn project_similar(db: &Db, a: i64, b: i64, score: f32) -> Result<()> {
+    ensure_entity_node(db, a)?;
+    ensure_entity_node(db, b)?;
     run(
         db,
         "MERGE (a:Entity {id:$a})-[r:SIMILAR]->(b:Entity {id:$b}) SET r.score=$score",
@@ -107,6 +154,8 @@ pub fn project_similar(db: &Db, a: i64, b: i64, score: f32) -> Result<()> {
 /// B5: a name-containment edge ("Cascais marina" contains "Cascais"), the
 /// weak hop the semantic beam and PPR walk.
 pub fn project_name_part(db: &Db, a: i64, b: i64, weight: f32) -> Result<()> {
+    ensure_entity_node(db, a)?;
+    ensure_entity_node(db, b)?;
     run(
         db,
         "MERGE (a:Entity {id:$a})-[r:CONTAINS]->(b:Entity {id:$b}) SET r.weight=$weight",
@@ -118,9 +167,7 @@ pub fn project_name_part(db: &Db, a: i64, b: i64, weight: f32) -> Result<()> {
     )
 }
 
-/// Project the containment edges of one entity. The caller must have
-/// projected the entity's node first: the edge MERGE matches both endpoints,
-/// and the write path links a new entity before its node exists.
+/// Project the containment edges of one entity.
 pub fn project_name_parts(db: &Db, entity: i64) -> Result<()> {
     let rows: Vec<(i64, i64, f32)> = {
         let mut st = db
@@ -136,6 +183,8 @@ pub fn project_name_parts(db: &Db, entity: i64) -> Result<()> {
 }
 
 pub fn project_relation(db: &Db, id: i64, src: i64, dst: i64, predicate: &str) -> Result<()> {
+    ensure_entity_node(db, src)?;
+    ensure_entity_node(db, dst)?;
     run(db, "MERGE (a:Entity {id:$a})-[r:REL {rid:$rid}]->(b:Entity {id:$b}) SET r.predicate=$predicate", &[
         ("a", format!("e:{src}").into()), ("b", format!("e:{dst}").into()),
         ("rid", id.into()), ("predicate", predicate.into()),
@@ -282,6 +331,21 @@ pub fn snapshot_with(
     include_ended: bool,
     name_parts: bool,
 ) -> Result<Snapshot> {
+    build_snapshot(db, as_of, include_ended, name_parts, false)
+}
+
+/// `selective_mentions` weights every mention edge by
+/// `1/sqrt(deg(memory) * deg(entity))` instead of 1: a mention counts by how
+/// selective it is, so a hub that hundreds of memories mention stops
+/// out-weighing the entity-entity relations that say what it is. Used by
+/// community detection only (PPR keeps the flat snapshot).
+fn build_snapshot(
+    db: &Db,
+    as_of: Option<i64>,
+    include_ended: bool,
+    name_parts: bool,
+    selective_mentions: bool,
+) -> Result<Snapshot> {
     let mut nodes = Vec::new();
     let mut mem_node = HashMap::new();
     let mut ent_node = HashMap::new();
@@ -310,12 +374,29 @@ pub fn snapshot_with(
         }
     }
     let mut edges = Vec::new();
+    let mut ments: Vec<(u32, u32)> = Vec::new();
     let mut st = db
         .sql()
         .prepare("SELECT memory_id,entity_id FROM mentions")?;
     for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
         let (m, e) = row?;
         if let (Some(&a), Some(&b)) = (mem_node.get(&m), ent_node.get(&e)) {
+            ments.push((a, b));
+        }
+    }
+    if selective_mentions {
+        let mut mem_deg: HashMap<u32, f32> = HashMap::new();
+        let mut ent_deg: HashMap<u32, f32> = HashMap::new();
+        for &(a, b) in &ments {
+            *mem_deg.entry(a).or_insert(0.0) += 1.0;
+            *ent_deg.entry(b).or_insert(0.0) += 1.0;
+        }
+        for &(a, b) in &ments {
+            let w = 1.0 / (mem_deg[&a] * ent_deg[&b]).sqrt();
+            edges.push((a, b, w));
+        }
+    } else {
+        for &(a, b) in &ments {
             edges.push((a, b, 1.0));
         }
     }
@@ -396,9 +477,82 @@ pub fn snapshot_with(
 /// partition, so ids only change when the graph does.
 const COMMUNITY_SEED: u64 = 7;
 
+/// H2-19: modularity isolates a hub. On the project scenario the hub carries 53
+/// mention edges against 6.2 of relation weight, so the best cut puts it alone
+/// in a community labelled by itself while its facts sit in other communities.
+/// A one-entity community groups nothing: attach it to the community that holds
+/// most of that entity's live relations (ties: more evidence, then the lowest
+/// community id). Entities without a live relation stay where they are; the
+/// pass is deterministic and leaves Leiden's partition otherwise untouched.
+fn attach_singletons(db: &Db, snap: &Snapshot, partition: &mut [u32]) -> Result<()> {
+    let mut live: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
+    {
+        let mut st = db.sql().prepare(
+            "SELECT src,dst,evidence_count FROM relations
+             WHERE valid_to IS NULL AND expired_at IS NULL",
+        )?;
+        for row in st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (src, dst, evidence) = row?;
+            if src == dst {
+                continue;
+            }
+            live.entry(src).or_default().push((dst, evidence));
+            live.entry(dst).or_default().push((src, evidence));
+        }
+    }
+    let mut members: HashMap<u32, usize> = HashMap::new();
+    for &node in snap.ent_node.values() {
+        *members.entry(partition[node as usize]).or_insert(0) += 1;
+    }
+    let mut entities: Vec<(i64, u32)> = snap.ent_node.iter().map(|(&e, &n)| (e, n)).collect();
+    entities.sort_unstable_by_key(|&(entity, _)| entity);
+    for (entity, node) in entities {
+        let own = partition[node as usize];
+        if members.get(&own).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let Some(neighbours) = live.get(&entity) else {
+            continue;
+        };
+        let mut score: HashMap<u32, (usize, i64)> = HashMap::new();
+        for &(other, evidence) in neighbours {
+            let Some(&onode) = snap.ent_node.get(&other) else {
+                continue;
+            };
+            let community = partition[onode as usize];
+            if community == own {
+                continue;
+            }
+            let entry = score.entry(community).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += evidence;
+        }
+        let best = score.into_iter().max_by(|a, b| {
+            a.1 .0
+                .cmp(&b.1 .0)
+                .then_with(|| a.1 .1.cmp(&b.1 .1))
+                .then_with(|| b.0.cmp(&a.0))
+        });
+        let Some((target, _)) = best else {
+            continue;
+        };
+        partition[node as usize] = target;
+        members.insert(own, 0);
+        *members.entry(target).or_insert(0) += 1;
+    }
+    Ok(())
+}
+
 pub fn communities(db: &Db) -> Result<HashMap<i64, i64>> {
-    let snap = snapshot(db, None, false)?;
-    let partition = crate::graph::leiden(&snap.csr, COMMUNITY_SEED, 1.0);
+    let snap = build_snapshot(db, None, false, true, true)?;
+    let mut partition = crate::graph::leiden(&snap.csr, COMMUNITY_SEED, 1.0);
+    attach_singletons(db, &snap, &mut partition)?;
     let mut current: HashMap<i64, u32> = HashMap::with_capacity(snap.ent_node.len());
     for (&entity, &node) in &snap.ent_node {
         current.insert(entity, partition[node as usize]);
@@ -472,4 +626,65 @@ pub fn communities(db: &Db) -> Result<HashMap<i64, i64>> {
         [],
     )?;
     Ok(out)
+}
+
+/// The entity-induced subgraph of a snapshot: entities only, weighted by the
+/// edges between them. Memory nodes exist so that a hub's mentions can pull it
+/// into a community; they say nothing about how the entities themselves group,
+/// so modularity is scored here. Returns the CSR and the entity id of each node.
+pub fn entity_subgraph(snap: &Snapshot) -> (Csr, Vec<i64>) {
+    let mut entities: Vec<i64> = snap.ent_node.keys().copied().collect();
+    entities.sort_unstable();
+    let index: HashMap<i64, u32> = entities
+        .iter()
+        .enumerate()
+        .map(|(i, &e)| (e, i as u32))
+        .collect();
+    let mut edges = Vec::new();
+    for &entity in &entities {
+        let node = snap.ent_node[&entity] as usize;
+        for k in snap.csr.offsets[node]..snap.csr.offsets[node + 1] {
+            let other = snap.csr.targets[k];
+            let ('e', other_id) = snap.node_kind[other as usize] else {
+                continue;
+            };
+            // Each edge once: keep the copy that starts at the lower entity id.
+            if other_id > entity {
+                edges.push((index[&entity], index[&other_id], snap.csr.weights[k]));
+            }
+        }
+    }
+    (Csr::from_edges(entities.len(), &edges), entities)
+}
+
+/// Quality of the partition the engine serves (`communities`, the one
+/// `overview` and entity cards show), scored on the entity-induced subgraph.
+/// `examples/community_eval` prints it: the flat Leiden partition the probe used
+/// to score cannot see H2-19 (mentions weight the community graph, attach moves
+/// a hub), so its number never moved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CommunityQuality {
+    pub modularity: f64,
+    pub communities: usize,
+    /// Communities holding exactly one entity: the shape H2-19 removes.
+    pub singletons: usize,
+}
+
+pub fn community_quality(db: &Db) -> Result<CommunityQuality> {
+    let snap = snapshot(db, None, false)?;
+    let (csr, entities) = entity_subgraph(&snap);
+    let labels = communities(db)?;
+    let comm: Vec<u32> = entities
+        .iter()
+        .map(|entity| labels.get(entity).copied().unwrap_or(-1) as u32)
+        .collect();
+    let mut sizes: HashMap<u32, usize> = HashMap::new();
+    for &c in &comm {
+        *sizes.entry(c).or_insert(0) += 1;
+    }
+    Ok(CommunityQuality {
+        modularity: crate::graph::modularity(&csr, &comm, 1.0),
+        communities: sizes.len(),
+        singletons: sizes.values().filter(|n| **n == 1).count(),
+    })
 }
