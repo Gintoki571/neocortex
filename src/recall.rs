@@ -2984,7 +2984,13 @@ pub(crate) fn resolve_entity(engine: &Engine, name: &str) -> Result<i64> {
 pub fn entity(engine: &Engine, name: &str, limit: usize) -> Result<EntityOutput> {
     let limit = limit.min(200);
     let id = resolve_entity(engine, name)?;
-    let candidates = entity_candidates(engine, name, id)?;
+    let homonyms = first_name_homonyms(engine, name)?;
+    let ambiguous = homonyms.len() >= 2;
+    let candidates = if ambiguous {
+        homonyms
+    } else {
+        entity_candidates(engine, name, id)?
+    };
     let now = engine.clock().now;
     let mut card = card(engine, id)?;
     card.community = community_ref(engine, id)?;
@@ -3050,8 +3056,38 @@ pub fn entity(engine: &Engine, name: &str, limit: usize) -> Result<EntityOutput>
         past_facts: past.into_iter().take(limit).collect(),
         similar,
         candidates,
+        status: ambiguous.then(|| "ambiguous".to_string()),
         timeline,
     })
+}
+
+/// H2-13: every person entity whose first name is the bare `name` (`Maya` ->
+/// "Maya Chen", "Maya Lindqvist"), most-mentioned first. Empty for a multi-word
+/// name, which names one person.
+fn first_name_homonyms(engine: &Engine, name: &str) -> Result<Vec<EntityCandidate>> {
+    let n = text::norm_name(name);
+    if n.is_empty() || n.contains(' ') {
+        return Ok(Vec::new());
+    }
+    let mut st = engine.db.sql().prepare(
+        "SELECT id, name, type, description FROM entities
+         WHERE norm=?1 OR substr(norm,1,length(?1)+1)=?1||' '
+         ORDER BY mention_count DESC, id LIMIT 50",
+    )?;
+    let rows = st.query_map([&n], |r| {
+        Ok(EntityCandidate {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            kind: r.get(2)?,
+            description: r.get(3)?,
+            score: None,
+        })
+    })?;
+    Ok(rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|c| crate::resolve::is_person_type(&c.kind))
+        .collect())
 }
 
 /// H2-13: the other people a name can mean. A bare first name (`Maya`) or a

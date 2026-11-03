@@ -238,8 +238,8 @@ When to use each:
   facts come back under `negative`, not in the count.
 - `entity`: everything known about one person, place or project. A bare first
   name shared by several people returns the best card plus `candidates` (and an
-  `also:` line in text output): ask again with the full name before answering
-  about that person.
+  `also:` line in text output) with `status: "ambiguous"`, listing every one
+  of them: ask again with the full name before answering about that person.
 - `overview`: orienting in an unfamiliar knowledge base, or `query` to see one
   topic's neighbourhood. Not a source of individual facts.
 - `invalidate`: a fact stopped being true at a time (`at`, default now). Prefer
