@@ -1323,6 +1323,17 @@ fn ngram_words(text: &str) -> Vec<(usize, usize)> {
                 break;
             }
         }
+        // A 1-3 character core keeps a trailing run of `#` or `+` ("C#", "C++"),
+        // in step with `text::expand_symbols`.
+        let core = &text[start..end];
+        if core.chars().count() <= 3 && core.chars().all(char::is_alphanumeric) {
+            if let Some(&(_, sym @ ('#' | '+'))) = chars.get(j) {
+                while let Some(&(pos, ch)) = chars.get(j).filter(|&&(_, ch)| ch == sym) {
+                    end = pos + ch.len_utf8();
+                    j += 1;
+                }
+            }
+        }
         words.push((start, end));
         i = j;
     }
