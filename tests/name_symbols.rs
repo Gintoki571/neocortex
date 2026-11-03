@@ -10,6 +10,9 @@ use neocortex::engine::{Engine, EntityIn, RecallInput, RelationIn, RememberInput
 use neocortex::text::norm_name;
 use std::sync::Arc;
 
+mod common;
+use common::TempDir;
+
 fn engine() -> Engine {
     Engine::open_in_memory(Arc::new(HashEmbedder)).unwrap()
 }
@@ -198,4 +201,171 @@ fn recall_answers_the_asked_tool() {
             .map(|m| (&m.content, m.score))
             .collect::<Vec<_>>()
     );
+}
+
+fn project(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("project".into()),
+        ..Default::default()
+    }
+}
+
+/// Four tool entities, each used by one project. Returns the engine.
+fn tools_world() -> Engine {
+    let engine = engine();
+    for (proj, name) in [
+        ("Helios Engine", "C++"),
+        ("Quasar Signal", "C#"),
+        ("Atlas Kernel", "C"),
+        ("Nimbus Cloud", "F#"),
+    ] {
+        remember(
+            &engine,
+            &format!("{proj} uses {name} for its core."),
+            vec![project(proj), tool(name)],
+            relation(proj, "uses", name),
+        );
+    }
+    engine
+}
+
+#[test]
+fn read_side_anchors_on_the_asked_symbol_tool() {
+    let engine = tools_world();
+    for (query, want) in [
+        ("who uses C++", "Helios Engine uses C++"),
+        ("who uses C++,", "Helios Engine uses C++"),
+        ("Tell me about C#", "Quasar Signal uses C#"),
+        ("Tell me about (C#)", "Quasar Signal uses C#"),
+        ("Tell me about C#.", "Quasar Signal uses C#"),
+        ("what uses C", "Atlas Kernel uses C"),
+    ] {
+        let out = engine
+            .recall(&RecallInput {
+                query: query.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let first = out.facts.first().map(|f| f.fact.as_str());
+        assert_eq!(first, Some(want), "query {query:?}");
+    }
+}
+
+#[test]
+fn write_side_ignores_surrounding_punctuation() {
+    for (input, want) in [
+        ("C++,", "c plus plus"),
+        ("(C#)", "c sharp"),
+        ("C#.", "c sharp"),
+        ("C.", "c"),
+    ] {
+        assert_eq!(norm_name(input), want, "input {input:?}");
+    }
+}
+
+/// A database written before TOOL-NAMES stores C++/C#/C under norm `c`.
+#[test]
+fn old_symbol_keys_are_rekeyed_on_open() {
+    let dir = TempDir::new("symbols-rekey");
+    let path = dir.join("old.db");
+    {
+        let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        remember(
+            &engine,
+            "Helios Engine uses C++ for its renderer.",
+            vec![project("Helios Engine"), tool("C++")],
+            relation("Helios Engine", "uses", "C++"),
+        );
+        // Rewrite to the pre-fix keys.
+        let c = engine.db.sql();
+        c.execute("UPDATE entities SET norm='c' WHERE name='C++'", [])
+            .unwrap();
+        c.execute(
+            "UPDATE entity_aliases SET alias_norm='c' WHERE alias_norm='c plus plus'",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "DELETE FROM name_tokens WHERE entity_id=(SELECT id FROM entities WHERE name='C++')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO name_tokens SELECT 'c', id FROM entities WHERE name='C++'",
+            [],
+        )
+        .unwrap();
+    }
+    let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    let norm: String = engine
+        .db
+        .sql()
+        .query_row("SELECT norm FROM entities WHERE name='C++'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(norm, "c plus plus");
+    remember(
+        &engine,
+        "Helios Engine uses C++ for its renderer.",
+        vec![project("Helios Engine"), tool("C++")],
+        relation("Helios Engine", "uses", "C++"),
+    );
+    remember(
+        &engine,
+        "Atlas Kernel uses C for its core.",
+        vec![project("Atlas Kernel"), tool("C")],
+        relation("Atlas Kernel", "uses", "C"),
+    );
+    assert_eq!(
+        tool_norms(&engine),
+        vec!["c".to_string(), "c plus plus".to_string()],
+        "C++ must not be duplicated and C must not be swallowed"
+    );
+    assert_ne!(entity_for(&engine, "C"), entity_for(&engine, "C++"));
+    assert_eq!(engine.validate().unwrap(), Vec::<String>::new());
+    drop(engine);
+    // Idempotent: a second open changes nothing.
+    let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    assert_eq!(engine.validate().unwrap(), Vec::<String>::new());
+}
+
+/// Re-keying never merges: a stale row whose new key is taken stays, and
+/// `validate` names it.
+#[test]
+fn rekey_conflict_is_left_for_validate() {
+    let dir = TempDir::new("symbols-conflict");
+    let path = dir.join("old.db");
+    {
+        let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        remember(
+            &engine,
+            "Helios Engine uses C++ for its renderer.",
+            vec![project("Helios Engine"), tool("C++")],
+            relation("Helios Engine", "uses", "C++"),
+        );
+        engine
+            .db
+            .sql()
+            .execute(
+                "INSERT INTO entities(name,norm,type,created_at,updated_at) VALUES ('C++','c','tool',0,0)",
+                [],
+            )
+            .unwrap();
+    }
+    let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    let n: i64 = engine
+        .db
+        .sql()
+        .query_row("SELECT count(*) FROM entities WHERE name='C++'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(n, 2, "nothing is merged or deleted");
+    assert!(engine
+        .validate()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("is keyed")));
 }

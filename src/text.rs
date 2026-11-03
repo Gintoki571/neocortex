@@ -111,7 +111,11 @@ fn expand_symbols(s: &str) -> String {
 }
 
 fn expand_symbol_word(word: &str) -> String {
-    let chars: Vec<char> = word.chars().collect();
+    // Surrounding punctuation ("(C#)", "C++,", "C#.") must not defeat the expansion.
+    let trimmed = word
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim_end_matches(|c: char| !c.is_alphanumeric() && c != '#' && c != '+');
+    let chars: Vec<char> = trimmed.chars().collect();
     let core_len = chars.iter().take_while(|c| c.is_alphanumeric()).count();
     if core_len == 0 || core_len > 3 || !chars[..core_len].iter().any(|c| c.is_alphabetic()) {
         return word.to_string();
