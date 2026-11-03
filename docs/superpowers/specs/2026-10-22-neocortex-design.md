@@ -51,7 +51,7 @@ src/
   schema.sql
   embed.rs      Embedder trait; UltraBERT (candle); HashEmbedder for tests
   ultrabert.rs  model forward pass
-  text.rs       normalisation, singularisation, stopwords, Jaro-Winkler, trigram Jaccard
+  text.rs       normalisation (symbol suffixes of short names spelled out: C# -> c sharp), singularisation, stopwords, Jaro-Winkler, trigram Jaccard
   temporal.rs   date/time parsing (absolute + relative), intervals, bi-temporal predicates
   extract.rs    heuristic entity extraction + alias gazetteer matching
   resolve.rs    entity and predicate resolution

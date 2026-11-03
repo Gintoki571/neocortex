@@ -351,7 +351,103 @@ impl Db {
         // (the `mentor` family, `accountable to`). A presence probe cannot tell:
         // the causal family made an old database look complete.
         self.seed_predicates(false)?;
+        self.rekey_symbol_names()?;
         Ok(())
+    }
+
+    /// Entities whose stored key is not `norm_name(name)`: (id, name, stored
+    /// norm, current norm). A name never changes, so a difference means the key
+    /// was written by a build that folded `#`/`+` away (TOOL-NAMES); only names
+    /// holding one of them are read, so this is one cheap scan.
+    pub fn stale_symbol_keys(&self) -> Result<Vec<(i64, String, String, String)>> {
+        let mut st = self.sql().prepare(
+            "SELECT id,name,norm FROM entities WHERE instr(name,'#')>0 OR instr(name,'+')>0",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, name, norm) = row?;
+            let now = crate::text::norm_name(&name);
+            if now != norm && !now.is_empty() {
+                out.push((id, name, norm, now));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Re-key entities written before TOOL-NAMES: `entities.norm`, the `name`
+    /// alias and `name_tokens` move to the new key and the stale alias goes
+    /// (its raw text is not stored, so only the name can derive a new one).
+    /// Never merges: an entity whose new key is taken by a live row of the same
+    /// type is left as is and `validate` reports it. Best-effort like the seed
+    /// reconcile: a busy or read-only file opens and repairs on a later open.
+    fn rekey_symbol_names(&self) -> Result<()> {
+        let stale = self.stale_symbol_keys()?;
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let own_txn = self.sql().is_autocommit();
+        if own_txn && self.sql().is_readonly("main")? {
+            return Ok(());
+        }
+        if own_txn {
+            self.sql().busy_timeout(SEED_BUSY)?;
+        }
+        let begun = if own_txn {
+            self.sql().execute_batch("BEGIN IMMEDIATE")
+        } else {
+            Ok(())
+        };
+        if own_txn {
+            self.sql().busy_timeout(OPEN_BUSY)?;
+        }
+        match begun {
+            Ok(()) => {}
+            Err(e) if own_txn && is_busy_or_readonly(&e) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        let written = (|| -> Result<()> {
+            for (id, _, old, new) in &stale {
+                let moved = self.sql().execute(
+                    "UPDATE OR IGNORE entities SET norm=?1 WHERE id=?2",
+                    rusqlite::params![new, id],
+                )?;
+                if moved == 0 {
+                    continue;
+                }
+                self.sql().execute(
+                    "INSERT OR IGNORE INTO entity_aliases(alias_norm,entity_id,origin) VALUES (?1,?2,'name')",
+                    rusqlite::params![new, id],
+                )?;
+                self.sql().execute(
+                    "DELETE FROM entity_aliases WHERE entity_id=?1 AND alias_norm=?2",
+                    rusqlite::params![id, old],
+                )?;
+                self.sql()
+                    .execute("DELETE FROM name_tokens WHERE entity_id=?1", [id])?;
+                for token in crate::text::name_tokens(new) {
+                    self.sql().execute(
+                        "INSERT OR IGNORE INTO name_tokens(token,entity_id) VALUES (?1,?2)",
+                        rusqlite::params![token, id],
+                    )?;
+                }
+                crate::resolve::refresh_entity_fts(self, *id)?;
+            }
+            Ok(())
+        })();
+        if own_txn {
+            if written.is_ok() {
+                if let Err(e) = self.sql().execute_batch("COMMIT") {
+                    let _ = self.sql().execute_batch("ROLLBACK");
+                    return Err(e.into());
+                }
+            } else {
+                let _ = self.sql().execute_batch("ROLLBACK");
+            }
+        }
+        written
     }
 
     fn table_exists(&self, name: &str) -> Result<bool> {

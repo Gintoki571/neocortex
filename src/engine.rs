@@ -1127,6 +1127,11 @@ impl Engine {
         if unnamed != 0 {
             out.push(format!("{unnamed} projection nodes have no name"));
         }
+        for (id, name, norm, now) in self.db.stale_symbol_keys()? {
+            out.push(format!(
+                "entity e{id} {name:?} is keyed {norm:?}, expected {now:?} (older symbol key shares a row)"
+            ));
+        }
         if count("SELECT count(*) FROM memories_vec")? != memories {
             out.push("memory vectors do not match memories".into());
         }
