@@ -42,6 +42,10 @@ const OPEN_BUSY: std::time::Duration = std::time::Duration::from_secs(5);
 /// writable open.
 const SEED_BUSY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Lock wait of the bit reconcile on a recall: a busy writer makes the recall
+/// fall back to the exact scan at once, and the next recall retries.
+const BITS_BUSY: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl VecMode {
     pub fn name(self) -> &'static str {
         match self {
@@ -145,8 +149,8 @@ pub fn sign_bits(v: &[f32]) -> Vec<u8> {
 pub struct Db {
     g: graphqlite::Connection,
     vec: VecMode,
-    /// Per-connection answer to "does `BITS_TABLE` exist" (see [`Db::has_bits`]).
-    bits: std::cell::Cell<Option<bool>>,
+    /// Set once this connection reconciled `BITS_TABLE` (see [`Db::ensure_bits`]).
+    bits_reconciled: std::cell::Cell<bool>,
 }
 
 fn register_vec() {
@@ -242,7 +246,7 @@ impl Db {
         let mut db = Db {
             g,
             vec: VecMode::F32,
-            bits: std::cell::Cell::new(None),
+            bits_reconciled: std::cell::Cell::new(false),
         };
         // graphqlite stamps `user_version=1` when it creates its own schema in
         // a fresh file, so presence of our tables, not the number alone, says
@@ -537,24 +541,34 @@ impl Db {
         self.vec.bind_sql(arg)
     }
 
-    /// Sign bits of every stored memory vector, `BITS_TABLE` created if needed
-    /// and reconciled with `memories_vec`. A table is trusted only when
-    /// `meta.vec_bits` marks a complete backfill and its row count and largest
-    /// rowid match `memories_vec`: an older binary writes vectors and forgets
-    /// memories without touching the table, and the marker alone cannot see
-    /// that. Otherwise [`Db::backfill_bits`] adds the missing rows and drops
-    /// the orphans. On a read-only database the write fails and the caller
-    /// falls back to the exact scan.
+    /// Sign bits of every stored memory vector, `BITS_TABLE` created if needed.
+    /// The first call on a connection reconciles the table with `memories_vec`
+    /// (count and largest rowid; `meta.vec_bits` alone cannot see rows an older
+    /// binary added or removed). Later calls only check that the table exists,
+    /// so a recall costs one catalog probe. The reconcile waits at most
+    /// [`BITS_BUSY`] for a writer and then fails, so the caller falls back to
+    /// the exact scan; a failed reconcile is retried by the next call. On a
+    /// read-only database the write fails the same way.
     pub fn ensure_bits(&self) -> Result<()> {
         let created = !self.table_exists(BITS_TABLE)?;
+        if !created && self.bits_reconciled.get() {
+            return Ok(());
+        }
+        self.sql().busy_timeout(BITS_BUSY)?;
+        let done = self.reconcile_bits(created);
+        self.sql().busy_timeout(OPEN_BUSY)?;
+        done?;
+        self.bits_reconciled.set(true);
+        Ok(())
+    }
+
+    fn reconcile_bits(&self, created: bool) -> Result<()> {
         if created {
             self.sql().execute_batch(&format!(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS {BITS_TABLE} \
                  USING vec0(embedding bit[{DIMS}], live integer, chunk_size=1024)"
             ))?;
-        }
-        self.bits.set(Some(true));
-        if !created {
+        } else {
             let done: bool = self.sql().query_row(
                 "SELECT EXISTS(SELECT 1 FROM meta WHERE key='vec_bits')",
                 [],
@@ -647,21 +661,10 @@ impl Db {
         }
     }
 
-    /// Whether the bit table exists (never creates it). Cached per connection:
-    /// [`Db::ensure_bits`] answers from the catalog and sets the cache, so a
-    /// table another process creates is picked up by the next bit recall
-    /// rather than by every write.
+    /// Whether the bit table exists (never creates it). Probed on every call,
+    /// so a table another process creates or drops is seen by the next write.
     pub fn has_bits(&self) -> bool {
-        if let Some(v) = self.bits.get() {
-            return v;
-        }
-        match self.table_exists(BITS_TABLE) {
-            Ok(v) => {
-                self.bits.set(Some(v));
-                v
-            }
-            Err(_) => false,
-        }
+        self.table_exists(BITS_TABLE).unwrap_or(false)
     }
 
     /// Ids of the `k` memories nearest `query` by Hamming distance over the
