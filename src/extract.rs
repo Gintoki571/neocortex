@@ -271,7 +271,8 @@ fn path_end(text: &str, start: usize) -> Option<usize> {
 }
 
 /// EX-06: a quoted span is an entity only when it reads as a name or an
-/// identifier: title case, or one code token. Phrases ("used by X's project"),
+/// identifier: title case, or one whitespace-free token ("neocortex",
+/// "sqlite-vec", "C#"). Multi-word lowercase phrases ("used by X's project"),
 /// questions and possessive-ended spans are not.
 fn quoted_is_name(inner: &str) -> bool {
     let last = inner.split_whitespace().last().unwrap_or("");
@@ -279,9 +280,10 @@ fn quoted_is_name(inner: &str) -> bool {
         return false;
     }
     let title = inner.chars().next().is_some_and(char::is_uppercase);
-    let code = !inner.contains(char::is_whitespace)
-        && (word_hint(inner).is_some() || inner.chars().any(|c| c.is_ascii_digit()));
-    title || code
+    let single = !inner.contains(char::is_whitespace);
+    let token = single && inner.chars().count() >= 2;
+    let code = single && (word_hint(inner).is_some() || inner.chars().any(|c| c.is_ascii_digit()));
+    title || token || code
 }
 
 fn quoted_span(text: &str, open: usize, quote: char) -> Option<(usize, usize)> {
@@ -1337,6 +1339,17 @@ fn ngram_words(text: &str) -> Vec<(usize, usize)> {
                 j += 1;
             } else {
                 break;
+            }
+        }
+        // A 1-3 character core keeps a trailing run of `#` or `+` ("C#", "C++"),
+        // in step with `text::expand_symbols`.
+        let core = &text[start..end];
+        if core.chars().count() <= 3 && core.chars().all(char::is_alphanumeric) {
+            if let Some(&(_, sym @ ('#' | '+'))) = chars.get(j) {
+                while let Some(&(pos, ch)) = chars.get(j).filter(|&&(_, ch)| ch == sym) {
+                    end = pos + ch.len_utf8();
+                    j += 1;
+                }
             }
         }
         words.push((start, end));

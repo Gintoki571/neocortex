@@ -148,6 +148,7 @@ fn ex06_quoted_phrases_that_are_not_names_are_not_entities() {
         "the project led by Marco",
         "what is the Atlas build?",
         "Priya's",
+        "the sqlite vec index",
     ] {
         let got = candidates(&format!("The notes say \"{phrase}\" in the review."));
         assert!(
@@ -164,6 +165,17 @@ fn ex06_quoted_names_and_identifiers_stay_entities() {
         "UltraBERT-Embed-150M",
         "ultrabert-embed-150m",
     ] {
+        let got = candidates(&format!("The notes name \"{name}\" as the target."));
+        assert!(
+            got.iter().any(|(n, h)| *h == "quoted" && n == name),
+            "{name}: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn ex06_quoted_lowercase_single_tokens_are_names() {
+    for name in ["neocortex", "pgvector", "tokio", "sqlite-vec"] {
         let got = candidates(&format!("The notes name \"{name}\" as the target."));
         assert!(
             got.iter().any(|(n, h)| *h == "quoted" && n == name),

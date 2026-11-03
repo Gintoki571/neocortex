@@ -38,6 +38,7 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | nc-er08 (qoder) | ER-08: a typo-sized near-name merge needs transliteration-key equality or a person/org named in the same write that the candidate's memories also mention; otherwise a new entity reported `ambiguous` (root cause found by nc-hop3 (codebuddy): different people one surname edit apart merged, one person's write ended the other's exclusive facts) | world-3000 false merges 26 -> 0 (`examples/merge_audit.rs`), three-hop acc@10 0.897 -> 1.000; name_eval 0.964 unchanged; gates and private 0.867 / agent_sim 111/120 unchanged; real-model table: typed shared-org typo still merges, text-only typos now `ambiguous` | bf73846 |
 | nc-binvec (codebuddy) | research3 I4: opt-in `vec_prefilter=bit` keeps a sign-bit `memories_bits` table (sqlite-vec `bit[768]`), hamming top-N then exact rerank; default off | real-model 108k: acc@10 0.990, recall 0.966, MRR 0.859 identical off/on in every category; paired p50 -17..-34% (Sonnet verifier, loaded machine); first-open backfill 6.5 s, DB +5% (274 -> 288 MB); hash-embedder DBs: recall@50 0.617, do not enable; gates and private 0.867 / 111/120 unchanged | f97e1c2 |
 | nc-passive (codebuddy) | passive two-hop questions read as their active predicate: `lemma_verb` led->lead, an answer word with a `TERM_SYNONYMS` relation word steers ("language" -> `use`), "<Person>'s <noun>" starts the lexical beam at the typed entity the person holds | real-model 108k: acc@10 0.990 -> 1.000, two-hop 0.950 -> 1.000 (all six misses fixed, no new miss), p50 -0.4%; world-300 0.992 -> 1.000; other gates and private 0.867 / 111/120 unchanged | ea8136c |
+| nc-toolnames (opencode; fix round Sonnet) | `norm_name` expands symbol suffixes (C# -> `c sharp`, C++ -> `c plus plus`, F# -> `f sharp`); `ngram_words` keeps a trailing #/+ run so questions anchor on the asked tool; `rekey_symbol_names` re-keys old #/+ names on open (never merges; collisions reported by `validate`) | C, C++, C#, F# four entities (main: two); "who uses C++" leads with C++ (main: C); old-DB C++ re-keyed, new C/C++ writes attach correctly; facts main already collapsed onto one entity stay there; open cost ~15 ms scan at 11.9k entities; gates, name_eval 0.964/0.964, private 0.867 / 111/120 unchanged | a26f004 |
 
 ## Killed (branch kept, not merged)
 
@@ -49,8 +50,9 @@ workers). Idea letters refer to `agent-memory/ideas.md`, which carries a "Measur
 | nc-chainx | cross-encoder verification of top chains | mh1 +2 (tuning set), blind and world-300 unchanged; p50 +51%, RSS +228 MB |
 | nc-hoplast (qoder) | `hop_last_open`: the semantic beam's last hop opens low-degree entities beyond the question's 100-nearest relations | world-300 three-hop recall 0.761 -> 0.812 (MRR -0.006, acc@10 1.000 both); fixtures/holdout/mh1/mh2 identical; private mh3 identical in every category at 0 and 8: no transfer, not merged (branch e2f4b72) |
 | nc-hop3 | read-side `hop_ended` knob for three-hop misses at world-3000 | 0.897 -> 0.974, but the misses were ER-08 false merges; fixed at the write side by nc-er08 (1.000), knob not needed |
+| nc-fanout (opencode) | research3 I6: hub cap (p99 degree, floor 50), early truncation in `facts_for_view`, no expansion through non-seed hubs; `rel_prefilter` knob | 108k real model: acc@10 1.000 unchanged, 70/70 hub-answer queries keep their answer, but p50 unchanged (454 vs 455 ms): `facts_for_view` is ~2 ms of ~450 ms at 108k; no tests. `rel_prefilter=on`: no acc loss, three-hop recall +0.017, p50 -5..13% (2 noisy samples): worth its own lane (branch d97817f) |
 
-## Where main stands (ea8136c)
+## Where main stands (a26f004)
 
 | measure | value |
 |---|---|
