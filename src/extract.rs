@@ -170,12 +170,14 @@ fn scan_specials(text: &str) -> (Vec<Candidate>, Vec<(usize, usize)>) {
 
         if matches!(c, '"' | '\'' | '`') && at_boundary {
             if let Some((name_start, name_end)) = quoted_span(text, i, c) {
-                cands.push(Candidate {
-                    name: text[name_start..name_end].to_string(),
-                    hint: "quoted",
-                    start: name_start,
-                    end: name_end,
-                });
+                if quoted_is_name(&text[name_start..name_end]) {
+                    cands.push(Candidate {
+                        name: text[name_start..name_end].to_string(),
+                        hint: "quoted",
+                        start: name_start,
+                        end: name_end,
+                    });
+                }
             }
         }
         i += c.len_utf8();
@@ -266,6 +268,20 @@ fn path_end(text: &str, start: usize) -> Option<usize> {
     let explicit_relative =
         path.starts_with("./") || path.starts_with("~/") || path.starts_with("../");
     (end > start + prefix && (has_extension || has_segments || explicit_relative)).then_some(end)
+}
+
+/// EX-06: a quoted span is an entity only when it reads as a name or an
+/// identifier: title case, or one code token. Phrases ("used by X's project"),
+/// questions and possessive-ended spans are not.
+fn quoted_is_name(inner: &str) -> bool {
+    let last = inner.split_whitespace().last().unwrap_or("");
+    if inner.contains('?') || possessive_len(last) > 0 {
+        return false;
+    }
+    let title = inner.chars().next().is_some_and(char::is_uppercase);
+    let code = !inner.contains(char::is_whitespace)
+        && (word_hint(inner).is_some() || inner.chars().any(|c| c.is_ascii_digit()));
+    title || code
 }
 
 fn quoted_span(text: &str, open: usize, quote: char) -> Option<(usize, usize)> {

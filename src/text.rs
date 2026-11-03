@@ -69,11 +69,28 @@ fn push_ascii(out: &mut String, c: char) {
     out.push_str(mapped);
 }
 
+/// EX-06b: the plural of an all-caps abbreviation is the singular's norm
+/// ("DBs" = "DB", "APIs" = "API"). Folding alone keeps "dbs" (<= 3 chars) and
+/// "apis" ("-is" is invariant) apart.
+fn drop_caps_plurals(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| match w.strip_suffix('s') {
+            Some(stem)
+                if stem.chars().count() >= 2 && stem.chars().all(|c| c.is_ascii_uppercase()) =>
+            {
+                stem
+            }
+            _ => w,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Canonical entity key: fold, drop leading articles/possessive determiners
 /// (the, a, an, my, our, your, his, her, their), drop trailing "'s",
 /// singularise the last token. "The Houses" -> "house", "my bros" -> "bro".
 pub fn norm_name(s: &str) -> String {
-    let folded = fold(strip_possessive(s));
+    let folded = fold(&drop_caps_plurals(strip_possessive(s)));
     let mut words = name_words(&folded);
     if words.is_empty() {
         return folded;
