@@ -292,3 +292,156 @@ fn knob_off_is_unchanged_and_bit_agrees() {
     // the contract is the returned set.
     assert_eq!(ids(&on), ids(&base), "the prefilter keeps the top 10");
 }
+
+fn clock_2026() -> Clock {
+    Clock {
+        now: parse_instant(
+            "2026-10-21T15:00:00Z",
+            &Clock {
+                now: 0,
+                tz_offset_secs: 0,
+            },
+        )
+        .unwrap(),
+        tz_offset_secs: 0,
+    }
+}
+
+/// A database whose bit table predates an older binary's writes: one memory
+/// was stored without its bit row, and one was hard-forgotten by that binary
+/// (vector and row gone, bit row left). `meta.vec_bits` is still set, so only
+/// the row-count check can notice; the next bit recall must reconcile.
+#[test]
+fn stale_bit_table_is_reconciled_before_use() {
+    let dir = TempDir::new("vec-bits-stale");
+    let path = dir.join("s.db");
+    let emb: Arc<dyn Embedder> = Arc::new(HashEmbedder);
+    let mut e = Engine::open(&path, emb.clone())
+        .unwrap()
+        .with_clock(clock_2026());
+    e.cfg.vec_prefilter = "bit".into();
+    e.db.ensure_bits().unwrap();
+    let remember = |e: &Engine, s: &str| {
+        e.remember(RememberInput {
+            content: s.into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id
+    };
+    remember(&e, "Ana works at the harbor clinic in Lisbon.");
+    let fresh = remember(&e, "Dana bought a red bicycle in Faro.");
+    let ghost = remember(&e, "Eli keeps an old bike in Braga.");
+    e.db.sql()
+        .execute("DELETE FROM memories_bits WHERE rowid=?1", [fresh])
+        .unwrap();
+    e.db.sql()
+        .execute("DELETE FROM memories_vec WHERE rowid=?1", [ghost])
+        .unwrap();
+    e.db.sql()
+        .execute("DELETE FROM memories WHERE id=?1", [ghost])
+        .unwrap();
+    drop(e);
+
+    let mut e = Engine::open(&path, emb).unwrap().with_clock(clock_2026());
+    let query = |e: &Engine| {
+        e.recall(&RecallInput {
+            query: "where did Dana ride a bicycle".into(),
+            k: Some(10),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    e.cfg.vec_prefilter = "bit".into();
+    let on = query(&e);
+    e.cfg.vec_prefilter = "off".into();
+    let off = query(&e);
+    let ids = |o: &neocortex::engine::RecallOutput| -> Vec<i64> {
+        let mut v: Vec<i64> = o.memories.iter().map(|m| m.id).collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(ids(&on), ids(&off), "bit recall agrees with the exact scan");
+    assert!(
+        ids(&on).contains(&fresh),
+        "the memory written without bits is found"
+    );
+    assert!(
+        !ids(&on).contains(&ghost),
+        "a forgotten memory is not a hit"
+    );
+
+    let count = |t: &str| -> i64 {
+        e.db.sql()
+            .query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        count("memories_bits"),
+        count("memories_vec"),
+        "tables reconciled"
+    );
+    let blob: Vec<u8> =
+        e.db.sql()
+            .query_row(
+                "SELECT embedding FROM memories_vec WHERE rowid=?1",
+                [fresh],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let q = e.db.blob_to_vec(&blob).unwrap();
+    let hits = e.db.bits_knn(&q, 100, true).unwrap();
+    assert!(hits.contains(&fresh), "the bit scan sees the repaired row");
+    assert!(
+        !hits.contains(&ghost),
+        "no ghost candidate survives reconcile"
+    );
+}
+
+/// A read-only file with a stale bit table: the knob-on open and recall must
+/// not error, and the memory written without bits is still found by the exact
+/// scan the caller falls back to.
+#[test]
+fn stale_bit_table_on_a_read_only_file_falls_back_to_the_exact_scan() {
+    let dir = TempDir::new("vec-bits-ro");
+    let path = dir.join("ro.db");
+    let emb: Arc<dyn Embedder> = Arc::new(HashEmbedder);
+    let mut e = Engine::open(&path, emb.clone())
+        .unwrap()
+        .with_clock(clock_2026());
+    e.cfg.vec_prefilter = "bit".into();
+    e.db.ensure_bits().unwrap();
+    let remember = |e: &Engine, s: &str| {
+        e.remember(RememberInput {
+            content: s.into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id
+    };
+    remember(&e, "Ana works at the harbor clinic in Lisbon.");
+    let fresh = remember(&e, "Dana bought a red bicycle in Faro.");
+    e.db.sql()
+        .execute("DELETE FROM memories_bits WHERE rowid=?1", [fresh])
+        .unwrap();
+    e.db.sql()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(e);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let mut e = Engine::open(&path, emb).unwrap().with_clock(clock_2026());
+    e.cfg.vec_prefilter = "bit".into();
+    let out = e.recall(&RecallInput {
+        query: "where did Dana ride a bicycle".into(),
+        k: Some(10),
+        ..Default::default()
+    });
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = out.expect("a stale bit table on a read-only file does not fail recall");
+    assert!(
+        out.memories.iter().any(|m| m.id == fresh),
+        "the exact scan finds the memory written without bits"
+    );
+}

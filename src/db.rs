@@ -145,6 +145,8 @@ pub fn sign_bits(v: &[f32]) -> Vec<u8> {
 pub struct Db {
     g: graphqlite::Connection,
     vec: VecMode,
+    /// Per-connection answer to "does `BITS_TABLE` exist" (see [`Db::has_bits`]).
+    bits: std::cell::Cell<Option<bool>>,
 }
 
 fn register_vec() {
@@ -240,6 +242,7 @@ impl Db {
         let mut db = Db {
             g,
             vec: VecMode::F32,
+            bits: std::cell::Cell::new(None),
         };
         // graphqlite stamps `user_version=1` when it creates its own schema in
         // a fresh file, so presence of our tables, not the number alone, says
@@ -439,27 +442,29 @@ impl Db {
     }
 
     /// Sign bits of every stored memory vector, `BITS_TABLE` created if needed
-    /// and backfilled once. Idempotent and resumable: `meta.vec_bits` marks a
-    /// complete backfill, so a process killed mid-way fills the missing rows on
-    /// the next call instead of leaving a silent hole; a complete table is one
-    /// probe and a database that already has it needs no write.
+    /// and reconciled with `memories_vec`. A table is trusted only when
+    /// `meta.vec_bits` marks a complete backfill and its row count and largest
+    /// rowid match `memories_vec`: an older binary writes vectors and forgets
+    /// memories without touching the table, and the marker alone cannot see
+    /// that. Otherwise [`Db::backfill_bits`] adds the missing rows and drops
+    /// the orphans. On a read-only database the write fails and the caller
+    /// falls back to the exact scan.
     pub fn ensure_bits(&self) -> Result<()> {
-        let created = if self.table_exists(BITS_TABLE)? {
-            false
-        } else {
+        let created = !self.table_exists(BITS_TABLE)?;
+        if created {
             self.sql().execute_batch(&format!(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS {BITS_TABLE} \
                  USING vec0(embedding bit[{DIMS}], live integer, chunk_size=1024)"
             ))?;
-            true
-        };
+        }
+        self.bits.set(Some(true));
         if !created {
             let done: bool = self.sql().query_row(
                 "SELECT EXISTS(SELECT 1 FROM meta WHERE key='vec_bits')",
                 [],
                 |r| r.get(0),
             )?;
-            if done {
+            if done && self.bits_in_sync()? {
                 return Ok(());
             }
         }
@@ -471,10 +476,35 @@ impl Db {
         Ok(())
     }
 
+    /// Row count and largest rowid of `BITS_TABLE` equal those of
+    /// `memories_vec`. Cheap shortcut: a swap of one missing and one orphan
+    /// row with the same count and maximum passes, and the next write that
+    /// changes the maximum or the count repairs it.
+    fn bits_in_sync(&self) -> Result<bool> {
+        let stat = |t: &str| -> rusqlite::Result<(i64, i64)> {
+            self.sql().query_row(
+                &format!("SELECT count(*), coalesce(max(rowid), 0) FROM {t}"),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        };
+        Ok(stat(BITS_TABLE)? == stat("memories_vec")?)
+    }
+
     /// Fill `BITS_TABLE` from `memories_vec` in rowid batches (never holds more
     /// than one batch of vectors); rows already present are skipped, so a
-    /// partial table is completed rather than trusted.
+    /// partial table is completed rather than trusted. Bit rows whose vector
+    /// is gone are deleted first, so they cannot take candidate slots.
     fn backfill_bits(&self) -> Result<()> {
+        self.write(|db| {
+            db.sql().execute(
+                &format!(
+                    "DELETE FROM {BITS_TABLE} WHERE rowid NOT IN (SELECT rowid FROM memories_vec)"
+                ),
+                [],
+            )?;
+            Ok(())
+        })?;
         let have: std::collections::HashSet<i64> = {
             let mut st = self
                 .sql()
@@ -521,9 +551,21 @@ impl Db {
         }
     }
 
-    /// Whether the bit table exists (never creates it).
+    /// Whether the bit table exists (never creates it). Cached per connection:
+    /// [`Db::ensure_bits`] answers from the catalog and sets the cache, so a
+    /// table another process creates is picked up by the next bit recall
+    /// rather than by every write.
     pub fn has_bits(&self) -> bool {
-        self.table_exists(BITS_TABLE).unwrap_or(false)
+        if let Some(v) = self.bits.get() {
+            return v;
+        }
+        match self.table_exists(BITS_TABLE) {
+            Ok(v) => {
+                self.bits.set(Some(v));
+                v
+            }
+            Err(_) => false,
+        }
     }
 
     /// Ids of the `k` memories nearest `query` by Hamming distance over the
