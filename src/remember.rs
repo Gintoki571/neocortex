@@ -287,6 +287,58 @@ fn words_of(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// One owner per object ("X leads Y": Y has one lead), so the exclusive slot is
+/// keyed on the target. Every other exclusive predicate is keyed on the subject.
+/// shortcut: `use` is the only multi-valued-by-nature predicate; a list of such
+/// predicates belongs in the seed table when more show up.
+fn object_keyed(canonical: &str) -> bool {
+    matches!(canonical, "lead" | "own")
+}
+
+/// Does the relation start only at the ingest stamp of an undated memory (its
+/// evidence memory was written without a date, so valid_from = created_at)?
+fn starts_at_ingest(db: &Db, relation: i64, from: i64) -> Result<bool> {
+    Ok(db.sql().query_row(
+        "SELECT EXISTS(SELECT 1 FROM relation_evidence e JOIN memories m ON m.id=e.memory_id
+         WHERE e.relation_id=?1 AND m.valid_from=m.created_at AND m.valid_from=?2)",
+        params![relation, from],
+        |r| r.get(0),
+    )?)
+}
+
+/// Does the text name `old` as replaced or removed ("from npm", "replaced npm",
+/// "npm was removed")? The gate for an agent-declared exclusive slot: "Atlas
+/// uses ESLint" does not end "Atlas uses npm" unless the write says so (H3-01).
+fn names_as_replaced(content: &str, old: &str) -> bool {
+    const BEFORE: [&str; 5] = [
+        " from",
+        " replaced",
+        " replaces",
+        " replacing",
+        " instead of",
+    ];
+    const AFTER: [&str; 10] = [
+        " was removed",
+        " is removed",
+        " was dropped",
+        " is dropped",
+        " was retired",
+        " is retired",
+        " was replaced",
+        " is replaced",
+        " was deprecated",
+        " is deprecated",
+    ];
+    let text = format!(" {} ", text::fold(content));
+    let needle = format!(" {old} ");
+    text.match_indices(&needle).any(|(i, _)| {
+        let before = &text[..i];
+        let after = &text[i + needle.len() - 1..];
+        BEFORE.iter().any(|cue| before.ends_with(cue))
+            || AFTER.iter().any(|cue| after.starts_with(cue))
+    })
+}
+
 /// Predicates that name the entity again instead of relating it to another
 /// thing: on a self-resolving relation the target becomes an alias (H2-18).
 fn is_name_predicate(predicate: &str) -> bool {
@@ -1792,20 +1844,31 @@ fn write_prepared(
             && relation.exclusive != Some(false)
             && (relation.exclusive == Some(true) || resolved.exclusive)
         {
-            let mut st = db.sql().prepare(
+            // The slot key: the subject, or the target for one-owner predicates.
+            let by_object = !swap && object_keyed(&pred.canonical);
+            let key = if by_object { dst } else { subj };
+            let mut st = db.sql().prepare(if by_object {
+                "SELECT r.id,r.valid_from,r.valid_to,r.src,r.dst,es.norm,ed.norm,r.fact
+                 FROM relations r
+                 JOIN predicates p ON p.id=r.predicate_id
+                 JOIN entities es ON es.id=r.src
+                 JOIN entities ed ON ed.id=r.dst
+                 WHERE r.dst=?1 AND COALESCE(NULLIF(p.group_id,0),p.id)=?2
+                   AND r.polarity=1 AND r.expired_at IS NULL"
+            } else {
                 "SELECT r.id,r.valid_from,r.valid_to,r.src,r.dst,es.norm,ed.norm,r.fact
                  FROM relations r
                  JOIN predicates p ON p.id=r.predicate_id
                  JOIN entities es ON es.id=r.src
                  JOIN entities ed ON ed.id=r.dst
                  WHERE r.subj=?1 AND COALESCE(NULLIF(p.group_id,0),p.id)=?2
-                   AND r.polarity=1 AND r.expired_at IS NULL",
-            )?;
+                   AND r.polarity=1 AND r.expired_at IS NULL"
+            })?;
             /// One live exclusive relation: (id, valid_from, valid_to, src,
             /// dst, src norm, dst norm, fact).
             type OldRel = (i64, i64, Option<i64>, i64, i64, String, String, String);
             let olds: Vec<OldRel> = st
-                .query_map(params![subj, group_id], |r| {
+                .query_map(params![key, group_id], |r| {
                     Ok((
                         r.get(0)?,
                         r.get(1)?,
@@ -1824,22 +1887,34 @@ fn write_prepared(
             // new value ("Bergn") never ends the correct one; near targets
             // that hit a blocker or sit over the typo-edit allowance are
             // reported as conflict candidates instead.
-            let value_new = if swap { src } else { dst };
-            let value_norm = text::norm_name(if swap { src_name } else { dst_name });
-            let value_vector = if swap {
+            let value_is_src = swap || by_object;
+            let value_new = if value_is_src { src } else { dst };
+            let value_norm = text::norm_name(if value_is_src { src_name } else { dst_name });
+            let value_vector = if value_is_src {
                 endpoint_vector(src_name)
             } else {
                 endpoint_vector(dst_name)
             };
             let mut later: Option<(i64, i64)> = None;
             for (old, old_from, old_to, o_src, o_dst, s_norm, d_norm, old_fact) in olds {
-                let (value_old, value_old_norm) = if o_dst == subj {
-                    (o_src, s_norm)
-                } else {
+                let (value_old, value_old_norm) = if !by_object && o_dst != subj {
                     (o_dst, d_norm)
+                } else {
+                    (o_src, s_norm)
                 };
                 if value_old == value_new {
                     // Re-assertion of the same value: the evidence path dedupes it.
+                    continue;
+                }
+                // `use` (tools, dependencies) is multi-valued per subject, so an
+                // agent-declared exclusive "uses" ends a value only when this
+                // write names it as replaced (H3-01, H3-03). Other predicates
+                // keep the supersede rule: a successor venue ends the old one.
+                if !by_object
+                    && !resolved.seeded
+                    && resolved.canonical == "use"
+                    && !names_as_replaced(&content, &value_old_norm)
+                {
                     continue;
                 }
                 let judge = resolve::NearJudge {
@@ -1872,6 +1947,15 @@ fn write_prepared(
                     db.sql().execute(
                         "UPDATE relations SET valid_to=?1 WHERE id=?2",
                         params![rf, old],
+                    )?;
+                    ended_here.push(old);
+                } else if old_from > rf && rf != now && starts_at_ingest(db, old, old_from)? {
+                    // H3-02: the old start is only the ingest stamp of an undated
+                    // memory, so a dated write replaces it instead of being
+                    // history up to that stamp.
+                    db.sql().execute(
+                        "UPDATE relations SET expired_at=?1 WHERE id=?2",
+                        params![now, old],
                     )?;
                     ended_here.push(old);
                 } else if old_from > rf {
