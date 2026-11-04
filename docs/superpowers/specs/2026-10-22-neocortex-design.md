@@ -51,7 +51,7 @@ src/
   schema.sql
   embed.rs      Embedder trait; UltraBERT (candle); HashEmbedder for tests
   ultrabert.rs  model forward pass
-  text.rs       normalisation, singularisation, stopwords, Jaro-Winkler, trigram Jaccard
+  text.rs       normalisation (symbol suffixes of short names spelled out: C# -> c sharp), singularisation, stopwords, Jaro-Winkler, trigram Jaccard
   temporal.rs   date/time parsing (absolute + relative), intervals, bi-temporal predicates
   extract.rs    heuristic entity extraction + alias gazetteer matching
   resolve.rs    entity and predicate resolution
@@ -218,7 +218,7 @@ MCP (stdio, JSON-RPC 2.0, newline-delimited; protocol version negotiated) tools,
 |---|---|
 | `remember` | store a memory, optionally with entities/relations/time (schema §6) |
 | `recall` | retrieve (§8) |
-| `entity` | profile of one entity: aliases, description, current facts, past facts, similar entities, other matches (`candidates`) when the looked-up name is a shared first name or prefix rather than the exact alias of one entity, and a memory timeline (paged) |
+| `entity` | profile of one entity: aliases, description, current facts, past facts, similar entities, other matches (`candidates`) when the looked-up name is a shared first name or prefix rather than the exact alias of one entity (a bare first name shared by 2+ people sets `status: ambiguous` and lists all of them), and a memory timeline (paged) |
 | `invalidate` | mark a memory or relation as no longer true from a time (`valid_to`), keeping it as history |
 | `forget` | retire a memory (soft, sets expired_at), or `hard: true` to delete it with its vectors/mentions/evidence |
 | `merge_entities` | fix resolution: merge b into a (aliases, mentions, relations move; self-loops reported as expired), or `alias` to add a name |

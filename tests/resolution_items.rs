@@ -6,6 +6,7 @@
 use neocortex::{
     embed::HashEmbedder,
     engine::{Engine, EntityIn, RememberInput, RememberOutput},
+    extract,
     temporal::Clock,
 };
 use std::sync::Arc;
@@ -130,4 +131,103 @@ fn ex04_two_prefix_candidates_stay_ambiguous() {
         .find(|r| r.name == "UltraBERT")
         .expect("UltraBERT mention");
     assert_ne!(hit.status, "alias", "{:?}", out.entities);
+}
+
+/// (name, hint) of every heuristic candidate in `text`.
+fn candidates(text: &str) -> Vec<(String, &'static str)> {
+    extract::heuristic_entities(text)
+        .into_iter()
+        .map(|c| (c.name, c.hint))
+        .collect()
+}
+
+#[test]
+fn ex06_quoted_phrases_that_are_not_names_are_not_entities() {
+    for phrase in [
+        "used by Priya's project",
+        "the project led by Marco",
+        "what is the Atlas build?",
+        "Priya's",
+        "the sqlite vec index",
+    ] {
+        let got = candidates(&format!("The notes say \"{phrase}\" in the review."));
+        assert!(
+            !got.iter().any(|(n, h)| *h == "quoted" && n == phrase),
+            "{phrase}: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn ex06_quoted_names_and_identifiers_stay_entities() {
+    for name in [
+        "Harbor Building",
+        "UltraBERT-Embed-150M",
+        "ultrabert-embed-150m",
+    ] {
+        let got = candidates(&format!("The notes name \"{name}\" as the target."));
+        assert!(
+            got.iter().any(|(n, h)| *h == "quoted" && n == name),
+            "{name}: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn ex06_quoted_lowercase_single_tokens_are_names() {
+    for name in ["neocortex", "pgvector", "tokio", "sqlite-vec"] {
+        let got = candidates(&format!("The notes name \"{name}\" as the target."));
+        assert!(
+            got.iter().any(|(n, h)| *h == "quoted" && n == name),
+            "{name}: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn ex06b_plural_of_caps_abbreviation_resolves_to_singular_entity() {
+    let e = engine();
+    let a = remember(&e, "The fresh DB holds the memories.", vec![]);
+    let db_id = a.entities.iter().find(|r| r.name == "DB").expect("DB").id;
+    let b = remember(&e, "Each cluster runs DBs for the memories.", vec![]);
+    assert_eq!(b.entities.len(), 1, "{:?}", names(&b));
+    assert_eq!(b.entities[0].id, db_id, "DBs must resolve to DB");
+}
+
+#[test]
+fn ex06b_plural_of_caps_abbreviations_share_one_norm() {
+    use neocortex::text::norm_name;
+    for (plural, singular) in [
+        ("DBs", "DB"),
+        ("APIs", "API"),
+        ("GPUs", "GPU"),
+        ("LLMs", "LLM"),
+    ] {
+        assert_eq!(norm_name(plural), norm_name(singular), "{plural}");
+    }
+    // "APIs Inc" stays one name; only the abbreviation's plural is folded.
+    assert_eq!(norm_name("APIs Inc"), norm_name("API Inc"));
+}
+
+#[test]
+fn ex02_units_after_numbers_are_never_entities() {
+    for text in [
+        "The fresh DB is 1.2 MB on disk.",
+        "Recall takes 300 ms on the laptop.",
+        "The image is 2 GiB in size.",
+        "The disk is 40% full today.",
+    ] {
+        let got = candidates(text);
+        for unit in ["MB", "ms", "GiB", "40%", "40", "%"] {
+            assert!(!got.iter().any(|(n, _)| n == unit), "{text}: {got:?}");
+        }
+    }
+}
+
+#[test]
+fn ex06_controls_caps_names_and_compound_names_still_extract() {
+    let got = candidates("Deploy the service to AWS on Friday with APIs Inc.");
+    for name in ["AWS", "APIs Inc"] {
+        assert!(got.iter().any(|(n, _)| n == name), "{name}: {got:?}");
+    }
 }

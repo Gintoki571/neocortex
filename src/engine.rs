@@ -588,6 +588,10 @@ pub struct EntityOutput {
     /// name prefix that is not the exact alias of one entity (H2-13).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<EntityCandidate>,
+    /// "ambiguous" when a bare first name is shared by 2+ people (H2-13); the
+    /// card is the best guess and `candidates` lists every one of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     /// Newest first.
     pub timeline: Vec<MemoryHit>,
 }
@@ -1126,6 +1130,11 @@ impl Engine {
             cypher_count("MATCH (n) WHERE n.name IS NULL OR n.name = '' RETURN count(n) AS c")?;
         if unnamed != 0 {
             out.push(format!("{unnamed} projection nodes have no name"));
+        }
+        for (id, name, norm, now) in self.db.stale_symbol_keys()? {
+            out.push(format!(
+                "entity e{id} {name:?} is keyed {norm:?}, expected {now:?} (older symbol key shares a row)"
+            ));
         }
         if count("SELECT count(*) FROM memories_vec")? != memories {
             out.push("memory vectors do not match memories".into());

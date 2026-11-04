@@ -214,7 +214,7 @@ fn weak_lexical_guards_keep_entities_separate() {
     // plain new entity.
     for (a, b, want) in [
         ("Paris TX", "Paris", "ambiguous"), // near, cosine disagrees
-        ("API v1", "API v2", "ambiguous"),  // digits blocker
+        ("API v1", "API v2", "new"),        // version sibling: distinct, unflagged (H3-06)
         ("mother", "guardian", "new"),      // far below the near tier
     ] {
         // Longer keys first so "Paris TX" is not shadowed by "Paris".

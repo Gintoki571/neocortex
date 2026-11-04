@@ -1512,17 +1512,37 @@ fn entity_lookup_of_a_shared_first_name_lists_the_other_person() {
         "{}",
         out.card.name
     );
-    assert_eq!(out.candidates.len(), 1, "{out:#?}");
-    let other = &out.candidates[0];
-    assert_ne!(other.id, out.card.id);
-    assert!(other.name == "Maya Chen" || other.name == "Maya Lindqvist");
-    assert_eq!(other.kind, "person");
-    assert!(!other.description.is_empty());
+    // H2-13: a bare first name shared by 2 people is flagged, and every
+    // person with that first name is listed (the card included).
+    assert_eq!(out.status.as_deref(), Some("ambiguous"), "{out:#?}");
+    assert_eq!(out.candidates.len(), 2, "{out:#?}");
+    assert!(out.candidates.iter().any(|c| c.id == out.card.id));
+    assert!(out.candidates.iter().any(|c| c.name == "Maya Chen"));
+    assert!(out.candidates.iter().any(|c| c.name == "Maya Lindqvist"));
+    assert!(out.candidates.iter().all(|c| c.kind == "person"));
+    assert!(out.candidates.iter().all(|c| !c.description.is_empty()));
 
     // An exact full-name lookup stays unambiguous.
     let exact = e.entity("Maya Chen", 10).unwrap();
     assert_eq!(exact.card.name, "Maya Chen");
     assert!(exact.candidates.is_empty(), "{exact:#?}");
+    assert!(exact.status.is_none(), "{exact:#?}");
+}
+
+#[test]
+fn entity_lookup_of_a_unique_first_name_is_unflagged() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Jun Park owns the billing service.", |i| {
+        i.entities = vec![EntityIn {
+            name: "Jun Park".into(),
+            kind: Some("person".into()),
+            ..Default::default()
+        }];
+    });
+    let out = e.entity("Jun", 10).unwrap();
+    assert_eq!(out.card.name, "Jun Park");
+    assert!(out.status.is_none(), "{out:#?}");
+    assert!(out.candidates.is_empty(), "{out:#?}");
 }
 
 #[test]

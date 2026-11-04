@@ -466,6 +466,11 @@ pub(crate) fn near_name(
     if jw < f64::from(judge.cfg.name_near) {
         return Verdict::Below;
     }
+    // H3-06: a version or number sibling is a different entity, not a near
+    // name, so it is never reported as ambiguous and an exclusive slot ends it.
+    if number_siblings(a_norm, b_norm) {
+        return Verdict::Below;
+    }
     if text::name_blocker(a_norm, b_norm).is_some() {
         return Verdict::Blocked;
     }
@@ -492,6 +497,21 @@ pub(crate) fn near_name(
     } else {
         Verdict::Unsure
     }
+}
+
+/// True when the two names differ only in version or number tokens: "Postgres
+/// 14"/"Postgres 16", "Python 3.12"/"3.13", "API v1"/"v2". A letter label
+/// ("Apt 3B"/"Apt 3C") is not a version token and stays a digit blocker.
+pub(crate) fn number_siblings(a: &str, b: &str) -> bool {
+    let is_number = |t: &str| {
+        let t = t.strip_prefix('v').unwrap_or(t);
+        t.chars().any(|c| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || c == '.')
+    };
+    let ta: HashSet<&str> = a.split_whitespace().collect();
+    let tb: HashSet<&str> = b.split_whitespace().collect();
+    let only_a: Vec<&str> = ta.difference(&tb).copied().collect();
+    let only_b: Vec<&str> = tb.difference(&ta).copied().collect();
+    !only_a.is_empty() && !only_b.is_empty() && only_a.iter().chain(&only_b).all(|t| is_number(t))
 }
 
 /// ER-08: a name-layer `Merge` between typo-sized names is automatic only for
@@ -1030,6 +1050,11 @@ const ORG_TYPES: &[&str] = &[
 
 /// A person is never a container: "Paris Hilton" is not part of "Paris".
 const PERSON_TYPES: &[&str] = &["person", "people", "human"];
+
+/// True for a person entity type (the types that corroborate identity).
+pub(crate) fn is_person_type(kind: &str) -> bool {
+    PERSON_TYPES.contains(&kind)
+}
 
 /// Largest candidate pool for one containment lookup: a token shared by more
 /// entities is a hub and would only add noise.

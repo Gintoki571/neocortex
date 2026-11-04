@@ -177,9 +177,88 @@ fn er07_digit_siblings_stay_separate_and_are_reported() {
     let second = remember_named(&e, "Room 102 was swept.", vec![org("Room 102")], vec![]);
     let res = resolution(&second, "Room 102");
     assert_ne!(res.id, room_id, "digit siblings must not merge");
-    assert_eq!(res.status, "ambiguous", "blocked pair is never silent");
-    let cands = &res.candidates;
-    assert!(cands.iter().any(|c| c.id == room_id), "{cands:?}");
+    // H3-06: a number-only sibling is a different entity, not a flagged near name.
+    assert_eq!(
+        res.status, "new",
+        "number siblings are distinct, not ambiguous"
+    );
+    assert!(res.candidates.is_empty(), "{:?}", res.candidates);
+}
+
+fn tool(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("tool".into()),
+        ..Default::default()
+    }
+}
+
+// H3-06: "Postgres 16" is a different entity from "Postgres 14", not an
+// ambiguous near name, so the exclusive slot ends the old version normally.
+#[test]
+fn h3_06_version_sibling_exclusive_write_ends_the_old_version() {
+    let e = engine();
+    let first = remember_named(
+        &e,
+        "Harbor stores raw events in Postgres 14.",
+        vec![org("Harbor"), tool("Postgres 14")],
+        vec![rel("Harbor", "stores in", "Postgres 14", true)],
+    );
+    let old = first.relations[0].id;
+    let second = remember_named(
+        &e,
+        "Harbor's Postgres 14 instance was upgraded to Postgres 16.",
+        vec![org("Harbor"), tool("Postgres 16")],
+        vec![rel("Harbor", "stores in", "Postgres 16", true)],
+    );
+    let res = resolution(&second, "Postgres 16");
+    assert_eq!(res.status, "new", "{res:?}");
+    assert!(second.conflicts.is_empty(), "{:?}", second.conflicts);
+    assert_eq!(second.invalidated_relations, vec![old]);
+    let live = sql_i64(
+        &e,
+        &format!("SELECT EXISTS(SELECT 1 FROM relations WHERE id={old} AND valid_to IS NULL AND expired_at IS NULL)"),
+    );
+    assert_eq!(live, Some(0));
+}
+
+// H3-06 controls: version siblings without an exclusive predicate stay
+// distinct and unflagged; letter-labelled siblings ("Apt 3B"/"Apt 3C") keep
+// their ambiguity flag; a lone "Postgres" still resolves to its one entity.
+#[test]
+fn h3_06_controls_keep_labels_flagged_and_unique_names_resolved() {
+    let e = engine();
+    remember_named(
+        &e,
+        "Ingest runs Python 3.12.",
+        vec![tool("Python 3.12")],
+        vec![],
+    );
+    let py = remember_named(
+        &e,
+        "API runs Python 3.13.",
+        vec![tool("Python 3.13")],
+        vec![],
+    );
+    assert_eq!(resolution(&py, "Python 3.13").status, "new");
+
+    let apt = remember_named(&e, "Sam lives in Apt 3B.", vec![place("Apt 3B")], vec![]);
+    let apt_id = resolution(&apt, "Apt 3B").id;
+    let apt2 = remember_named(&e, "Lee lives in Apt 3C.", vec![place("Apt 3C")], vec![]);
+    let res = resolution(&apt2, "Apt 3C");
+    assert_eq!(res.status, "ambiguous", "letter labels stay flagged");
+    assert!(res.candidates.iter().any(|c| c.id == apt_id));
+
+    let f = engine();
+    let first = remember_named(
+        &f,
+        "Postgres is the main database.",
+        vec![tool("Postgres")],
+        vec![],
+    );
+    let pg = resolution(&first, "Postgres").id;
+    let again = remember_named(&f, "Postgres was patched.", vec![tool("Postgres")], vec![]);
+    assert_eq!(resolution(&again, "Postgres").id, pg);
 }
 
 #[test]

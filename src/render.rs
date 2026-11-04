@@ -278,7 +278,13 @@ pub fn render_entity(out: &EntityOutput, fmt: Fmt<'_>) -> String {
                 format!("[e{}] {}{kind}{desc}", c.id, c.name)
             })
             .collect();
-        s.push_str(&format!("also: {}\n", items.join(" · ")));
+        // H2-13: a flagged bare first name lists every person, the card included.
+        let label = if out.status.is_some() {
+            "ambiguous"
+        } else {
+            "also"
+        };
+        s.push_str(&format!("{label}: {}\n", items.join(" · ")));
     }
     if let Some(c) = &out.card.community {
         s.push_str(&format!(
@@ -679,6 +685,7 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
             past_facts: vec![fact(4, "Delhi", 50, Some(100), true)],
             similar: vec![(9, "Mother".into(), 0.81)],
             candidates: Vec::new(),
+            status: None,
             timeline: vec![hit(42, "event", "Moved to Pune.", 100, None, false)],
         };
         assert_eq!(
@@ -709,6 +716,7 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
                 description: "product designer".into(),
                 score: None,
             }],
+            status: None,
             timeline: Vec::new(),
         };
         assert_eq!(
@@ -726,6 +734,7 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
             past_facts: Vec::new(),
             similar: Vec::new(),
             candidates: Vec::new(),
+            status: None,
             timeline: vec![hit(42, "note", &"x".repeat(300), 100, None, false)],
         };
         let rendered = render_entity(&out, &fake);

@@ -58,6 +58,12 @@ Store something when it will still matter next week:
   entity; it splits off a new card). Real different people with the same name
   and type are separate entities: do not `merge_entities` them without
   checking the facts on both cards.
+- **Symbol names are names**: "C#", "C++", "F#" and "C" are distinct tool
+  entities (normalised "c sharp", "c plus plus", "f sharp"); pass them exactly
+  and never merge them. A database written before this rule may still hold them
+  on one card, and those facts are not migrated: check `entity`, `forget` the
+  corrupted memory, write the fact again, and add `distinct_from` when the name
+  alone still resolves to the old card.
 - Status `near` (a transliteration variant, or a typo with a corroborating
   shared person/org in the same write) needs nothing. `ambiguous` (homonym,
   sibling name, or a typo-sized near name without corroboration) is never
@@ -238,8 +244,8 @@ When to use each:
   facts come back under `negative`, not in the count.
 - `entity`: everything known about one person, place or project. A bare first
   name shared by several people returns the best card plus `candidates` (and an
-  `also:` line in text output): ask again with the full name before answering
-  about that person.
+  `also:` line in text output) with `status: "ambiguous"`, listing every one
+  of them: ask again with the full name before answering about that person.
 - `overview`: orienting in an unfamiliar knowledge base, or `query` to see one
   topic's neighbourhood. Not a source of individual facts.
 - `invalidate`: a fact stopped being true at a time (`at`, default now). Prefer

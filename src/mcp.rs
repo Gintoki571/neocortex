@@ -699,7 +699,7 @@ fn tool_defs() -> Vec<Value> {
         }),
         json!({
             "name": "entity",
-            "description": "Profile of one entity: type, aliases, description, current facts, past facts, similar entities and a newest-first memory timeline. Use it to check what is known about a person, place or project, and to see how a fact changed over time. A bare first name or a prefix that several entities share (\"Maya\") returns the best card plus a `candidates` list of the other matches: read it, then ask again with the full name before answering about that person.",
+            "description": "Profile of one entity: type, aliases, description, current facts, past facts, similar entities and a newest-first memory timeline. Use it to check what is known about a person, place or project, and to see how a fact changed over time. A bare first name or a prefix that several entities share (\"Maya\") returns the best card plus a `candidates` list of the other matches: read it, then ask again with the full name before answering about that person. When several people share the bare first name, `status` is \"ambiguous\" and `candidates` lists all of them, the card included.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
