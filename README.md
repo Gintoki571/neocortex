@@ -410,6 +410,7 @@ of supporting-hop memories on the multi-hop world (0.965 -> 0.816), and adds
 | `NEOCORTEX_VEC_PREFILTER` | unset | `bit` creates and backfills the `memories_bits` sign-bit table on open (memory KNN prefilter, exact rerank); unset = exact scan |
 | `NEOCORTEX_RERANK_MODEL` | `~/.neocortex/models/ms-marco-MiniLM-L-6-v2` | reranker model directory (optional) |
 | `NEOCORTEX_RERANK` | unset | `<N>` reranks the top N fused candidates, `off` disables; unset = built-in default |
+| `NEOCORTEX_CORRECTION_HINTS` | unset (off) | `1`/`on` makes `remember` report `possible_supersedes` (older memories the new text may correct; nothing is ended) and `recall` mark them `[maybe superseded by m<id>]` (H3-04) |
 
 ## License
 

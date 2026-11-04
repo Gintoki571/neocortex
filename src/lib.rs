@@ -2,6 +2,7 @@
 
 pub mod anchor;
 pub mod bench;
+pub mod correction;
 pub mod db;
 pub mod embed;
 pub mod engine;

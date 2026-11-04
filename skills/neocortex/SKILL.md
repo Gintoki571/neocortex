@@ -210,8 +210,12 @@ and `next:` when present.
   Do not guess the missing name.
 - `remember` prints `saved m<id>` (or `duplicate of`), its `entities:` and
   `relations:` with statuses, `invalidated:`, `superseded:`, `conflict:`,
-  `related:`, and `hint:` lines. A `hint:` names the next action (invalidate or
+  `related:`, `possible_supersedes:`, and `hint:` lines. A `hint:` names the next action (invalidate or
   re-send with `exclusive=true`, pass `supersedes`, or pass relations).
+  `possible_supersedes` (only when the server runs with `NEOCORTEX_CORRECTION_HINTS=1`)
+  lists older memories this text may correct; nothing is ended, so decide with
+  `supersedes` or `invalidate`. A recalled memory with `[maybe superseded by m<id>]`
+  has a later correction.
 
 ## Tools (MCP) and CLI equivalents
 

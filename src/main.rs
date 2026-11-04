@@ -233,6 +233,10 @@ fn open_engine(globals: &Globals) -> std::result::Result<Engine, Fail> {
         }
         Err(_) => {}
     }
+    // NEOCORTEX_CORRECTION_HINTS=1|on: report possible corrections (H3-04); default off.
+    if let Ok(v) = std::env::var("NEOCORTEX_CORRECTION_HINTS") {
+        engine.cfg.correction_hints = matches!(v.as_str(), "1" | "on" | "true" | "yes");
+    }
     Ok(engine)
 }
 

@@ -30,6 +30,9 @@ fn memory_line(m: &MemoryHit, fmt: Fmt<'_>) -> String {
             None => line.push_str(" [ended]"),
         }
     }
+    if let Some(by) = m.maybe_superseded_by {
+        line.push_str(&format!(" [maybe superseded by m{by}]"));
+    }
     if m.tags.iter().any(|tag| tag == "planned") {
         line.push_str(" [planned]");
     }
@@ -191,6 +194,12 @@ pub fn render_remember(out: &RememberOutput) -> String {
         s.push_str(&format!(
             "related: m{} ({:.2}) {}\n",
             r.memory_id, r.cosine, r.snippet
+        ));
+    }
+    for p in &out.possible_supersedes {
+        s.push_str(&format!(
+            "possible_supersedes: m{} {}\n",
+            p.memory_id, p.snippet
         ));
     }
     for hint in &out.hints {
@@ -429,6 +438,7 @@ mod tests {
             score: 1.0,
             reasons: Vec::new(),
             duration: None,
+            maybe_superseded_by: None,
         }
     }
 
@@ -633,6 +643,7 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
             superseded_memories: vec![12],
             conflicts: Vec::new(),
             related: Vec::new(),
+            possible_supersedes: Vec::new(),
             hints: vec!["content is long; atomic memories retrieve better".into()],
             when_inferred: None,
         };
@@ -660,6 +671,7 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
             superseded_memories: Vec::new(),
             conflicts: Vec::new(),
             related: Vec::new(),
+            possible_supersedes: Vec::new(),
             hints: Vec::new(),
             when_inferred: None,
         };

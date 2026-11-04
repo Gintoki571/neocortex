@@ -2055,6 +2055,11 @@ fn write_prepared(
     end_memories_of_ended_facts(db, &touched)?;
     kg::bump_gen(db)?;
     crate::wtiming::end(crate::wtiming::FINALIZE);
+    let possible_supersedes = if cfg.correction_hints && duplicate_of.is_none() {
+        crate::correction::possible_supersedes(db, id, &content, valid_from)?
+    } else {
+        Vec::new()
+    };
     let mut hints = if content.len() > 2000 {
         vec!["long content: consider splitting into atomic memories".into()]
     } else {
@@ -2068,6 +2073,12 @@ fn write_prepared(
         hints.push(format!(
             "if this updates m{}, pass supersedes=[m{}]",
             related[0].memory_id, related[0].memory_id
+        ));
+    }
+    if let Some(first) = possible_supersedes.first() {
+        hints.push(format!(
+            "if this corrects m{}, pass supersedes=[m{}] (or forget it)",
+            first.memory_id, first.memory_id
         ));
     }
     if let Some(first) = self_relations.first() {
@@ -2100,6 +2111,7 @@ fn write_prepared(
         superseded_memories: supersedes,
         conflicts,
         related,
+        possible_supersedes,
         hints,
         when_inferred,
     })
@@ -2426,7 +2438,7 @@ fn candidate_fts_query(content: &str) -> Option<String> {
 /// memories whose text shares words with this one, the newest memories per
 /// mentioned entity (the `related` block needs shared entities anyway) and
 /// the newest memories overall (agents repeat what they just wrote).
-fn neighbour_candidates(db: &Db, content: &str, entity_ids: &[i64]) -> Result<Vec<i64>> {
+pub(crate) fn neighbour_candidates(db: &Db, content: &str, entity_ids: &[i64]) -> Result<Vec<i64>> {
     let mut out: Vec<i64> = Vec::new();
     let mut seen: HashSet<i64> = HashSet::new();
     if let Some(q) = candidate_fts_query(content) {

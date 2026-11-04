@@ -159,6 +159,10 @@ pub struct Config {
     pub vec_prefilter: String,
     /// Candidate depth multiplier of the bit prefilter (`N = n * k`).
     pub vec_prefilter_n: usize,
+    /// H3-04 correction hints: `remember` reports older text memories the new
+    /// text corrects (`possible_supersedes`) and `recall` marks them. Proposes
+    /// only; nothing is ended. Off: no output changes.
+    pub correction_hints: bool,
 }
 
 impl Default for Config {
@@ -208,6 +212,7 @@ impl Default for Config {
             anchor_tiers: String::new(),
             vec_prefilter: "off".to_string(),
             vec_prefilter_n: 10,
+            correction_hints: false,
         }
     }
 }
@@ -403,6 +408,10 @@ pub struct RememberOutput {
     pub conflicts: Vec<Conflict>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<RelatedMemory>,
+    /// Older memories this text may correct (`correction_hints`); call
+    /// `forget`/`invalidate`, or re-send with `supersedes`, to end one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub possible_supersedes: Vec<PossibleSupersede>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hints: Vec<String>,
     /// The text phrase a valid_from was inferred from (no --when given).
@@ -421,6 +430,13 @@ pub struct Conflict {
 pub struct RelatedMemory {
     pub memory_id: i64,
     pub cosine: f32,
+    pub snippet: String,
+}
+
+/// An older memory the new one may correct (`correction_hints`). Not ended.
+#[derive(Clone, Debug, Serialize)]
+pub struct PossibleSupersede {
+    pub memory_id: i64,
     pub snippet: String,
 }
 
@@ -482,6 +498,9 @@ pub struct MemoryHit {
     /// "ongoing since 2023-04-01".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<String>,
+    /// A later live memory corrects this one (`correction_hints`); a note, not an end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maybe_superseded_by: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
