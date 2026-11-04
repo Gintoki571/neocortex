@@ -436,6 +436,107 @@ One miss also sits on a real entity-resolution defect, found while checking: "C#
 "Quasar Signal uses C#" and every C++ fact share it). The relation text is right, but the entity name and its
 card are not. Not fixed here; open item TOOL-NAMES.
 
+## 7. 300k (hash embedder, main 159a461)
+
+Does the read path still answer under 1 s on one core at 293k memories, and what grows between 108k and 293k. Measurement lane nc-scale300k, no code change; binaries `neocortex-clean-159a461` and `neocortex-timing-159a461` (the section 4/5 scratch timing patch, `NEOCORTEX_TIMING`), both built from 159a461.
+
+World and DB. `gen_world --people 24000 --seed 28001` (260,793 memories) and `--people 3000 --seed 28002` (32,519) concatenated: `world-293k.json`, 293,312 memories, 600 queries, 81.9 MB (each half's queries reference only its own memories). Ingested by `NEOCORTEX_EMBEDDER=hash neocortex eval world-293k.json --save-db db293k-int8.db`; int8 vectors; 293,305 memories stored (7 inputs folded as near-duplicates). Kept for later lanes at `lanes/tmp/nc-scale300k/db293k-int8.db` (764 MB) and `lanes/tmp/nc-scale300k/world-293k.json`.
+
+| | 108k (hash, section 4) | 293k |
+|---|---|---|
+| memories | 108,667 | 293,305 |
+| entities / relations | - | 30,970 / 114,931 |
+| mentions / memory_links | - | 651,587 / 995,786 |
+| DB bytes (int8) | 249,704,448 | 763,772,928 |
+| bytes per memory | 2,298 | 2,604 (+13%) |
+
+Where the 2,604 B/memory goes (`dbstat`): `memories_vec` 227.6 MB (776 B per row: int8[768] + rowid), `relations_vec` 89.2 MB, `entities_vec` 24.0 MB - 341 MB, 45% of the file - then `node_props_text` 71.5 MB + its index 34.9 MB, `memories` 35.4 MB, `memory_links` 25.4 MB + its index 17.2 MB, `edges` 18.1 MB + indexes 34.6 MB. The vector share is why the read path is a bandwidth problem, not a graph problem.
+
+Ingest: 293,305 memories in 44,360 s (12.3 h, 6.61/s average), rate per 20k block from the log:
+
+| block | rate | block | rate |
+|---|---|---|---|
+| 0-20k | 20.5/s | 140k-160k | 11.9/s |
+| 20k-40k | 19.9/s | 160k-180k | 11.0/s |
+| 40k-60k | 19.0/s | 180k-200k | 9.5/s |
+| 60k-80k | 18.1/s | 200k-220k | 9.8/s |
+| 80k-100k | 16.8/s | 220k-240k | 9.9/s |
+| 100k-120k | 15.1/s | 240k-259k | 9.9/s |
+| 120k-140k | 12.9/s | 259k-279k | 1.1/s |
+| | | 279k-293k | 1.9/s |
+
+The last two rows are not neocortex: from ~267k (t=21,907 s) the host's disk was saturated by other lanes' builds (21-35 `rustc`, `/proc/pressure/io` some 70-97%), the process sat in state D on `folio_wait_bit_common` and read at 4.7 KB/s; 0-259k took 18,741 s (13.8/s), the last 34k took 25,619 s (1.3/s). On the write path itself the rate at 240k-259k is 9.9/s against 20.5/s at 20k, i.e. 2.1x slower per memory over 13x the corpus and flat from 200k: sub-linear, no cliff (nc-write100k's bounded candidate set holds).
+
+Read path. 600 queries, `eval --load-db` on a copy, `taskset -c 0`, `systemd-run --user --scope -p MemoryMax=2G`, host shared with the other lanes (load 27-260):
+
+| pass | mean / p50 / p95 | peak RSS | wall |
+|---|---|---|---|
+| A, clean build | 926.4 / 941.4 / 1,201.2 ms | 433.4 MiB | 574.4 s |
+| B, repeat (noise band) | 936.1 / 948.8 / 1,288.0 ms | 426.9 MiB | 571.1 s |
+| timing build (stage timers) | 964.7 / 940.9 / 1,554.5 ms | 436.7 MiB | 598.7 s |
+
+`NEOCORTEX_VEC_PREFILTER` does not exist in 159a461 (`grep -rn` over `src/` finds nothing), so both A and B ran with it unset and B is the run-to-run band: p50 +0.8%, p95 +7.2%, wall +0.6%. Two choices were forced by the host: the DB copy lived on `/dev/shm` (a disk-backed pass at load 164 spent its time in state D at 7 MB/s), and the scope carried `-p CPUWeight=10000` so the measured process got a full core (checked: state R, 291 s CPU in 300 s wall); a dedicated 2-core box gives the same. Accuracy is the hash embedder's and is a sanity check only - identical in all three passes:
+
+| category | q | acc@10 | recall | MRR |
+|---|---|---|---|---|
+| aggregation | 60 | 0.817 | 0.767 | 0.561 |
+| as-of | 102 | 0.559 | 0.510 | 0.305 |
+| current | 102 | 0.990 | 0.853 | 0.538 |
+| history | 78 | 0.641 | 0.532 | 0.445 |
+| temporal-window | 60 | 0.850 | 0.750 | 0.617 |
+| three-hop | 78 | 1.000 | 0.863 | 0.759 |
+| two-hop | 120 | 0.975 | 0.967 | 0.774 |
+| overall | 600 | 0.838 | 0.758 | 0.572 |
+
+Context 423.9 tokens/query, hints 17/600, `expect_absent` leaked 2/151. Same numbers as the ingest run's own eval, so `--load-db` scores what `--save-db` built.
+
+Stage timers (1 core, 600 queries, mean ms; the total row is the eval's own mean, the stage rows are the timer means - they sum to it within 0.3 ms at 293k and 13 ms at 108k). The 3.3k column is the same binary on `eval/world-300.json` (3,264 memories, 200 queries) and shows which stages are per-query overhead rather than N:
+
+| stage | function | 3.3k | 108k (section 4, f32, pre-nc-perf) | 293k | x108k->293k |
+|---|---|---|---|---|---|
+| memory KNN (k=5000) | `recall::recall` `memories_vec` MATCH | 6.4 | 189.5 | 370.5 | 1.96 |
+| path beams | `paths::search` + `paths::search_semantic` | 5.3 | 77.5 | 153.1 | 1.98 |
+| relation-fact seeds | `recall::relation_seeds_with_config` | 3.4 | 75.4 | 147.0 | 1.95 |
+| as-of snapshot (cached; p50 0.1) | `recall::snapshot` -> `kg::snapshot_with` | 1.1 | 37.7 | 121.2 | 3.22 |
+| entity KNN | `entities_vec` MATCH | 1.4 | 18.5 | 54.8 | 2.96 |
+| BM25 | FTS5 `memories_fts` | 1.2 | 13.3 | 37.1 | 2.79 |
+| temporal window scan | `recall::recall` (window queries) | 0.4 | - | 34.4 | - |
+| PPR push (ACL) | `graph::ppr_push` | 0.3 | 0.5 | 16.3 (p50 1.5; mean is a few queries) | 32.6 |
+| causal channel | `recall::recall` | 0.3 | - | 8.1 | - |
+| facts for top entities | `recall::facts_for_view` | 2.5 | 617.3 | 7.6 | 0.01 |
+| access write (WAL commit) | `Db::write` | 0.3 | 21.8 | 5.8 | 0.27 |
+| entities, next hops, pack, embed, fuse | - | 2.5 | 3.0 | 8.8 | - |
+| **total** | | **25.4** | **1,068.0** | **964.7** | **0.90** |
+
+Growth is linear in rows: `mem_knn` costs 1.75 ms per 1,000 memories at 108k (f32 DB) and 1.26 at 293k (int8), and each of the three vec0 stages lands at 1.95-2.0x its 108k value for 2.70x the memories - the scans grow with the table, not with the graph. int8 did not make the scan cheaper per row: the scan is per-row overhead, not bytes. The 108k comparison mixes builds (the section 4 timers predate nc-perf) and vector modes; only `facts` is affected by that mix, and it fell from 617.3 ms (58% of the 108k mean, the unindexed `current_values` count) to 7.6 ms after nc-perf. Without that fix 293k would run at ~1.5 s p50, not 0.94 s.
+
+Top three cost centres at 293k (mean, share of 964.7 ms):
+
+1. **38.4% - memory KNN**, `recall::recall` (src/recall.rs:1111): `SELECT rowid,1-distance FROM memories_vec WHERE embedding MATCH ?1 AND k=5000 AND live=1`, a brute-force scan of 293,305 x int8[768] rows (228 MB) per query.
+2. **15.9% - path beams**, `paths::search` (src/paths.rs:789) and `paths::search_semantic` (src/paths.rs:980), whose `relations_vec` MATCH k=100 at src/paths.rs:1004 scans 114,931 x int8[768] rows (89 MB).
+3. **15.2% - relation-fact seeds**, `recall::relation_seeds_with_config` (src/recall.rs:561), the second `relations_vec` scan (`k=10`, src/recall.rs:613) plus the `relations_fts` hits; together with the beams the relation table is streamed twice per query.
+
+`facts_for_view` (src/recall.rs:2237) is no longer a cost centre at 293k (7.6 ms; fan-in is bounded at 10 relations per entity in this world, and the count runs only on kept rows). The as-of snapshot (12.6%) is charged to the as-of queries only (p50 0.1 ms, p95 276.2).
+
+Read volume: 60 queries on the same DB read 30.3 GB (`rchar`), 505 MB per query, 0.66x the 764 MB file - each query streams the whole vector set. On a 2-3 GB box the file fits in page cache but leaves little for the agent; on anything slower than a warm cache the read path is IO-bound, and this section's ingest tail is what that looks like.
+
+Answer: **yes, p50 stays under 1 s on one core** - 941.4 / 948.8 ms (clean passes), mean 926.4 / 936.1 ms, p95 1.20 / 1.29 s, peak RSS 433 MiB under a 2 GiB cap. The headroom is 6% at p50: 293k costs ~940 ms of which 370 ms is one vector scan, and the scan adds ~1.3 ms per 1,000 more memories, so ~340k is where p50 crosses 1 s on this CPU. The lever is the pre-filter from section 5 item 3 (restrict `memories_vec` to candidate entities before the scan); nothing else is close.
+
+Peak RSS is no longer model-bound: 170 MiB at 108k (hash) -> 433 MiB at 293k, +1.4 MiB per 1,000 memories of read-path working set (row maps, k=5000 result set, snapshot), so with the q8 model (237 MiB) the same query would sit near 670 MiB - still inside 2 GiB, above the 512 MiB working budget.
+
+Reproduce (293k):
+
+```bash
+export TMPDIR=... NEOCORTEX_EMBEDDER=hash NEOCORTEX_DB=.../never.db
+cargo run --release --example gen_world -- --people 24000 --seed 28001 --out world-a.json
+cargo run --release --example gen_world -- --people 3000  --seed 28002 --out world-b.json
+# concatenate the two `memories`/`queries` arrays into world-293k.json
+neocortex eval world-293k.json --save-db db293k-int8.db        # 44,360 s here, IO-contended
+cp db293k-int8.db /dev/shm/base.db                             # keep the scans off the disk
+taskset -c 0 neocortex eval world-293k.json --load-db /dev/shm/base.db
+NEOCORTEX_TIMING=rt.tsv taskset -c 0 neocortex-timing-159a461 eval world-293k.json --load-db /dev/shm/base.db
+```
+
 ## Reproduce
 
 ```bash
