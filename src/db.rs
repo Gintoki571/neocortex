@@ -354,11 +354,12 @@ impl Db {
 
     /// Entities whose stored key is not `norm_name(name)`: (id, name, stored
     /// norm, current norm). A name never changes, so a difference means the key
-    /// was written by a build that folded `#`/`+` away (TOOL-NAMES); only names
-    /// holding one of them are read, so this is one cheap scan.
+    /// was written by a build that folded `#`/`+` away (TOOL-NAMES) or dropped
+    /// the `s` of an all-caps abbreviation's plural (EX-06b, "DBs" = "DB"). Only
+    /// names holding one of those shapes are read, so this is one cheap scan.
     pub fn stale_symbol_keys(&self) -> Result<Vec<(i64, String, String, String)>> {
         let mut st = self.sql().prepare(
-            "SELECT id,name,norm FROM entities WHERE instr(name,'#')>0 OR instr(name,'+')>0",
+            "SELECT id,name,norm FROM entities WHERE instr(name,'#')>0 OR instr(name,'+')>0 OR name GLOB '*[A-Z][A-Z]s*'",
         )?;
         let rows = st.query_map([], |r| {
             Ok((r.get(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
@@ -374,7 +375,7 @@ impl Db {
         Ok(out)
     }
 
-    /// Re-key entities written before TOOL-NAMES: `entities.norm`, the `name`
+    /// Re-key entities written before TOOL-NAMES or EX-06b: `entities.norm`, the `name`
     /// alias and `name_tokens` move to the new key and the stale alias goes
     /// (its raw text is not stored, so only the name can derive a new one).
     /// Never merges: an entity whose new key is taken by a live row of the same

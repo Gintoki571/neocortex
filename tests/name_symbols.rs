@@ -369,3 +369,134 @@ fn rekey_conflict_is_left_for_validate() {
         .iter()
         .any(|l| l.contains("is keyed")));
 }
+
+/// A database written before EX-06b stores "DBs" and "APIs" under the norms
+/// `dbs` and `apis`; they re-key on open so new "DB"/"API" writes attach to
+/// the old entities instead of forking a duplicate.
+#[test]
+fn old_caps_plural_keys_are_rekeyed_on_open() {
+    let dir = TempDir::new("caps-plural-rekey");
+    let path = dir.join("old.db");
+    {
+        let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        remember(
+            &engine,
+            "Atlas Cluster runs DBs for the memories.",
+            vec![project("Atlas Cluster"), tool("DBs")],
+            relation("Atlas Cluster", "uses", "DBs"),
+        );
+        remember(
+            &engine,
+            "Atlas Cluster exposes APIs to the team.",
+            vec![project("Atlas Cluster"), tool("APIs")],
+            relation("Atlas Cluster", "uses", "APIs"),
+        );
+        // Rewrite to the pre-EX-06b keys.
+        let c = engine.db.sql();
+        for (name, old, new) in [("DBs", "dbs", "db"), ("APIs", "apis", "api")] {
+            c.execute(
+                "UPDATE entities SET norm=?1 WHERE name=?2",
+                rusqlite::params![old, name],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE entity_aliases SET alias_norm=?1 WHERE alias_norm=?2 AND entity_id=(SELECT id FROM entities WHERE name=?3)",
+                rusqlite::params![old, new, name],
+            )
+            .unwrap();
+        }
+    }
+    let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    assert_eq!(
+        tool_norms(&engine),
+        vec!["api".to_string(), "db".to_string()]
+    );
+    let dbs_id = entity_for(&engine, "DBs").expect("DBs alias");
+    let apis_id = entity_for(&engine, "APIs").expect("APIs alias");
+    remember(
+        &engine,
+        "The fresh DB holds the memories.",
+        vec![project("Atlas Cluster"), tool("DB")],
+        relation("Atlas Cluster", "uses", "DB"),
+    );
+    remember(
+        &engine,
+        "The API gateway serves the APIs.",
+        vec![project("Atlas Cluster"), tool("API")],
+        relation("Atlas Cluster", "uses", "API"),
+    );
+    assert_eq!(
+        entity_for(&engine, "DB"),
+        Some(dbs_id),
+        "DB joins the old DBs entity"
+    );
+    assert_eq!(entity_for(&engine, "DBs"), Some(dbs_id), "DBs stays on it");
+    assert_eq!(
+        entity_for(&engine, "API"),
+        Some(apis_id),
+        "API joins the old APIs entity"
+    );
+    assert_eq!(
+        tool_norms(&engine),
+        vec!["api".to_string(), "db".to_string()]
+    );
+    assert_eq!(engine.validate().unwrap(), Vec::<String>::new());
+    drop(engine);
+    // Idempotent: a second open changes nothing.
+    let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    assert_eq!(
+        tool_norms(&engine),
+        vec!["api".to_string(), "db".to_string()]
+    );
+    assert_eq!(engine.validate().unwrap(), Vec::<String>::new());
+}
+
+/// A database holding both "DB" and "DBs" keeps both rows: the re-key never
+/// merges, and `validate` names the stale one.
+#[test]
+fn caps_plural_rekey_conflict_is_left_for_validate() {
+    let dir = TempDir::new("caps-plural-conflict");
+    let path = dir.join("old.db");
+    {
+        let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        remember(
+            &engine,
+            "Atlas Cluster runs DB for the memories.",
+            vec![project("Atlas Cluster"), tool("DB")],
+            relation("Atlas Cluster", "uses", "DB"),
+        );
+        engine
+            .db
+            .sql()
+            .execute(
+                "INSERT INTO entities(name,norm,type,created_at,updated_at) VALUES ('DBs','dbs','tool',0,0)",
+                [],
+            )
+            .unwrap();
+    }
+    for _ in 0..2 {
+        let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+        let rows: Vec<(String, String)> = engine
+            .db
+            .sql()
+            .prepare("SELECT name,norm FROM entities WHERE type='tool' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("DB".to_string(), "db".to_string()),
+                ("DBs".to_string(), "dbs".to_string())
+            ],
+            "nothing is merged or deleted"
+        );
+        assert!(engine
+            .validate()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("\"DBs\"") && l.contains("is keyed")));
+    }
+}
