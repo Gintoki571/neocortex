@@ -102,6 +102,7 @@ fn typed_bridge_pull_adds_an_answer_typed_relation() {
         i.relations = vec![relation("Mira", "lives in", "Oslo", "Mira lives in Oslo")];
     });
     e.cfg.w_sempath = 0.0;
+    // Test with bridge_pull explicitly off (old default)
     let off = e
         .recall(&RecallInput {
             query: "Where does Noah's colleague live?".into(),
@@ -111,7 +112,7 @@ fn typed_bridge_pull_adds_an_answer_typed_relation() {
         .unwrap();
     assert!(off.facts.iter().any(|fact| fact.target.contains("Oslo")));
 
-    e.cfg.bridge_pull = true;
+    // Test with bridge_pull on (new default)
     let on = e
         .recall(&RecallInput {
             query: "Where does Noah's colleague live?".into(),
@@ -125,6 +126,61 @@ fn typed_bridge_pull_adds_an_answer_typed_relation() {
         on.facts
     );
     assert!(on.facts.iter().any(|fact| fact.target.contains("Oslo")));
+}
+
+#[test]
+fn config_default_bridge_pull_is_true() {
+    let e = engine(Arc::new(HashEmbedder));
+    assert!(
+        e.cfg.bridge_pull,
+        "Config::default().bridge_pull should be true"
+    );
+}
+
+#[test]
+fn bridge_pull_off_restores_old_output() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Noah manages Mira.", |i| {
+        i.entities = vec![
+            EntityIn {
+                name: "Noah".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Mira".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+        ];
+        i.relations = vec![relation("Noah", "manages", "Mira", "Noah manages Mira")];
+    });
+    remember(&e, "Mira lives in Oslo.", |i| {
+        i.entities = vec![
+            EntityIn {
+                name: "Mira".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Oslo".into(),
+                kind: Some("place".into()),
+                ..Default::default()
+            },
+        ];
+        i.relations = vec![relation("Mira", "lives in", "Oslo", "Mira lives in Oslo")];
+    });
+    e.cfg.w_sempath = 0.0;
+    // Explicitly turn bridge_pull off to verify old output
+    e.cfg.bridge_pull = false;
+    let off = e
+        .recall(&RecallInput {
+            query: "Where does Noah's colleague live?".into(),
+            k: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(off.facts.iter().any(|fact| fact.target.contains("Oslo")));
 }
 
 #[test]
