@@ -117,7 +117,8 @@ Store something when it will still matter next week:
   several people only returns a conflict. A pair before the cue ("Acme and
   Northwind are no longer partners") ends the pair's relation. The name must be
   the whole object of the cue: "left the Acme office", "left Acme a voicemail"
-  and "Acme's parking lot" end nothing. A hedge or report ("almost quit",
+  and "Acme's parking lot" end nothing, while a trailing date ("... no longer
+  reviews X since August 2026") is a time tail and still ends it. A hedge or report ("almost quit",
   "might have left", "thinks Bob left") returns a `conflicts` candidate and
   ends nothing. If several live facts match, the result is `conflicts` and
   nothing ends, so say which one you mean. A live fact recorded now is retired
@@ -200,7 +201,10 @@ and `next:` when present.
   shares only a broad entity, such as a team every note mentions, is ignored.
 - History is automatic for past-tense wording ("used to", "before",
   "previously", "changed", "did ... use", "no longer"), so ended facts appear
-  without `include_history`. Use `as_of` for "what was true then".
+  without `include_history`. Use `as_of` for "what was true then". A yes/no
+  status question that names both ends ("is npm still used in atlas") also
+  shows the ended fact between them with its end date, so the answer is "no,
+  ended <date>" rather than silence.
 - Ordering questions ("what happened first", "in order") return items sorted by
   start date. Duration questions ("how long did Alice work at Acme") add the
   computed span from the stored interval: "3 years 2 months", "3 days", or
