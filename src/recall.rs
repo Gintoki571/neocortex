@@ -1301,6 +1301,50 @@ fn next_hops(
     Ok(out)
 }
 
+fn memory_has_ended_anchor_relation(
+    engine: &Engine,
+    memory_id: i64,
+    cutoff: i64,
+    anchors: &HashSet<i64>,
+    query: &str,
+) -> Result<bool> {
+    if anchors.is_empty() {
+        return Ok(false);
+    }
+    let placeholders = std::iter::repeat_n("?", anchors.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let predicate_param = 3 + 2 * anchors.len();
+    let sql = format!(
+        "SELECT EXISTS(
+             SELECT 1 FROM relation_evidence e JOIN relations r ON r.id=e.relation_id
+             JOIN predicates p ON p.id=r.predicate_id
+             WHERE e.memory_id=?1 AND (r.expired_at IS NOT NULL OR r.valid_to IS NOT NULL AND r.valid_to<=?2)
+               AND (r.src IN ({placeholders}) OR r.dst IN ({placeholders}))
+               AND (instr(?{predicate_param}, lower(r.predicate_text)) > 0 OR instr(?{predicate_param}, lower(p.canonical)) > 0 OR instr(?{predicate_param}, lower(p.display)) > 0)
+         )"
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(memory_id), Box::new(cutoff)];
+    params.extend(
+        anchors
+            .iter()
+            .copied()
+            .map(|id| Box::new(id) as Box<dyn rusqlite::ToSql>),
+    );
+    params.extend(
+        anchors
+            .iter()
+            .copied()
+            .map(|id| Box::new(id) as Box<dyn rusqlite::ToSql>),
+    );
+    params.push(Box::new(text::norm_predicate(query)));
+    Ok(engine.db.sql().query_row(
+        &sql,
+        params_from_iter(params.iter().map(|p| p.as_ref())),
+        |r| r.get(0),
+    )?)
+}
+
 pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     engine.check_embedder()?;
     if input.query.trim().is_empty() {
@@ -1313,6 +1357,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let until = parse_bound(input.until.as_deref(), &clock)?;
     let window = temporal::find_window(&input.query, &clock);
     let history_query = temporal::history_intent(&input.query);
+    let past_state_query = temporal::past_state_intent(&input.query);
     // Planned memories stay out of current answers unless the question is
     // about plans, and an ordering/duration question is a history question:
     // it needs the ended intervals to compute an answer.
@@ -1949,8 +1994,23 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             if !history {
                 score *= engine.cfg.expired_penalty;
             } else if as_of.is_none() {
-                // "where did X live before": the past state is the answer.
-                score *= engine.cfg.history_boost;
+                let ended_pair = past_state_query
+                    && memory_has_ended_anchor_relation(
+                        engine,
+                        f.id,
+                        cutoff,
+                        &query_alias_entities,
+                        &input.query,
+                    )?;
+                score *= if past_state_query {
+                    if ended_pair {
+                        engine.cfg.history_boost.max(4.0)
+                    } else {
+                        1.0
+                    }
+                } else {
+                    engine.cfg.history_boost
+                };
             }
         }
         if window
