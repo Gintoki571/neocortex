@@ -156,7 +156,9 @@ fn writes_keep_the_bit_table_in_sync() {
 
 #[test]
 fn backfill_resumes_a_partial_table() {
-    let db = Db::open_in_memory_with_mode(VecMode::F32).unwrap();
+    let dir = TempDir::new("vec-bits-resume");
+    let path = dir.join("r.db");
+    let db = Db::open_with_mode(&path, VecMode::F32).unwrap();
     let mut seed = 21u64;
     let docs: Vec<Vec<f32>> = (0..20).map(|_| random_unit(&mut seed)).collect();
     for (i, d) in docs.iter().enumerate() {
@@ -173,6 +175,9 @@ fn backfill_resumes_a_partial_table() {
     db.sql()
         .execute("DELETE FROM meta WHERE key='vec_bits'", [])
         .unwrap();
+    // The next process (a fresh connection) reconciles the partial table.
+    drop(db);
+    let db = Db::open_with_mode(&path, VecMode::F32).unwrap();
     db.ensure_bits().unwrap();
     let rows: Vec<(i64, i64)> = {
         let mut st = db
@@ -291,4 +296,294 @@ fn knob_off_is_unchanged_and_bit_agrees() {
     // distance, so two near-tied candidates can swap places in the fused order;
     // the contract is the returned set.
     assert_eq!(ids(&on), ids(&base), "the prefilter keeps the top 10");
+}
+
+fn clock_2026() -> Clock {
+    Clock {
+        now: parse_instant(
+            "2026-10-21T15:00:00Z",
+            &Clock {
+                now: 0,
+                tz_offset_secs: 0,
+            },
+        )
+        .unwrap(),
+        tz_offset_secs: 0,
+    }
+}
+
+/// A database whose bit table predates an older binary's writes: one memory
+/// was stored without its bit row, and one was hard-forgotten by that binary
+/// (vector and row gone, bit row left). `meta.vec_bits` is still set, so only
+/// the row-count check can notice; the next bit recall must reconcile.
+#[test]
+fn stale_bit_table_is_reconciled_before_use() {
+    let dir = TempDir::new("vec-bits-stale");
+    let path = dir.join("s.db");
+    let emb: Arc<dyn Embedder> = Arc::new(HashEmbedder);
+    let mut e = Engine::open(&path, emb.clone())
+        .unwrap()
+        .with_clock(clock_2026());
+    e.cfg.vec_prefilter = "bit".into();
+    e.db.ensure_bits().unwrap();
+    let remember = |e: &Engine, s: &str| {
+        e.remember(RememberInput {
+            content: s.into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id
+    };
+    remember(&e, "Ana works at the harbor clinic in Lisbon.");
+    let fresh = remember(&e, "Dana bought a red bicycle in Faro.");
+    let ghost = remember(&e, "Eli keeps an old bike in Braga.");
+    e.db.sql()
+        .execute("DELETE FROM memories_bits WHERE rowid=?1", [fresh])
+        .unwrap();
+    e.db.sql()
+        .execute("DELETE FROM memories_vec WHERE rowid=?1", [ghost])
+        .unwrap();
+    e.db.sql()
+        .execute("DELETE FROM memories WHERE id=?1", [ghost])
+        .unwrap();
+    drop(e);
+
+    let mut e = Engine::open(&path, emb).unwrap().with_clock(clock_2026());
+    let query = |e: &Engine| {
+        e.recall(&RecallInput {
+            query: "where did Dana ride a bicycle".into(),
+            k: Some(10),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    e.cfg.vec_prefilter = "bit".into();
+    let on = query(&e);
+    e.cfg.vec_prefilter = "off".into();
+    let off = query(&e);
+    let ids = |o: &neocortex::engine::RecallOutput| -> Vec<i64> {
+        let mut v: Vec<i64> = o.memories.iter().map(|m| m.id).collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(ids(&on), ids(&off), "bit recall agrees with the exact scan");
+    assert!(
+        ids(&on).contains(&fresh),
+        "the memory written without bits is found"
+    );
+    assert!(
+        !ids(&on).contains(&ghost),
+        "a forgotten memory is not a hit"
+    );
+
+    let count = |t: &str| -> i64 {
+        e.db.sql()
+            .query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        count("memories_bits"),
+        count("memories_vec"),
+        "tables reconciled"
+    );
+    let blob: Vec<u8> =
+        e.db.sql()
+            .query_row(
+                "SELECT embedding FROM memories_vec WHERE rowid=?1",
+                [fresh],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let q = e.db.blob_to_vec(&blob).unwrap();
+    let hits = e.db.bits_knn(&q, 100, true).unwrap();
+    assert!(hits.contains(&fresh), "the bit scan sees the repaired row");
+    assert!(
+        !hits.contains(&ghost),
+        "no ghost candidate survives reconcile"
+    );
+}
+
+/// A read-only file with a stale bit table: `ensure_bits` must report the
+/// failed reconcile (so the caller takes the exact scan), and recall must still
+/// return the memory written without bits. The query shares no word with the
+/// memory, so the FTS channel cannot be the route that finds it.
+#[test]
+fn stale_bit_table_on_a_read_only_file_falls_back_to_the_exact_scan() {
+    let dir = TempDir::new("vec-bits-ro");
+    let path = dir.join("ro.db");
+    let emb: Arc<dyn Embedder> = Arc::new(HashEmbedder);
+    let mut e = Engine::open(&path, emb.clone())
+        .unwrap()
+        .with_clock(clock_2026());
+    e.cfg.vec_prefilter = "bit".into();
+    e.db.ensure_bits().unwrap();
+    let remember = |e: &Engine, s: &str| {
+        e.remember(RememberInput {
+            content: s.into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id
+    };
+    remember(&e, "Ana works at the harbor clinic in Lisbon.");
+    let fresh = remember(&e, "Dana bought a red bicycle in Faro.");
+    e.db.sql()
+        .execute("DELETE FROM memories_bits WHERE rowid=?1", [fresh])
+        .unwrap();
+    e.db.sql()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(e);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let mut e = Engine::open(&path, emb).unwrap().with_clock(clock_2026());
+    e.cfg.vec_prefilter = "bit".into();
+    let reconciled = e.db.ensure_bits();
+    let out = e.recall(&RecallInput {
+        query: "which vehicle did the woman purchase in the coastal town".into(),
+        k: Some(10),
+        ..Default::default()
+    });
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        reconciled.is_err(),
+        "a stale bit table on a read-only file reports the failed reconcile"
+    );
+    let out = out.expect("a stale bit table on a read-only file does not fail recall");
+    assert!(
+        out.memories.iter().any(|m| m.id == fresh),
+        "the exact scan finds the memory written without bits"
+    );
+}
+
+fn count_bits(db: &Db, id: i64) -> i64 {
+    db.sql()
+        .query_row(
+            "SELECT count(*) FROM memories_bits WHERE rowid=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// `has_bits` is probed per write, not cached per connection: a knob-off
+/// connection that wrote before another process created the table must write
+/// bits for its later memories.
+#[test]
+fn writer_follows_a_bit_table_created_by_another_connection() {
+    let dir = TempDir::new("vec-bits-cache");
+    let path = dir.join("c.db");
+    let emb: Arc<dyn Embedder> = Arc::new(HashEmbedder);
+    let a = Engine::open(&path, emb.clone())
+        .unwrap()
+        .with_clock(clock_2026());
+    let b = Engine::open(&path, emb).unwrap().with_clock(clock_2026());
+    let first = a
+        .remember(RememberInput {
+            content: "Ana works at the harbor clinic in Lisbon.".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    assert!(!a.db.has_bits(), "no table yet");
+    b.db.ensure_bits().unwrap();
+    let second = a
+        .remember(RememberInput {
+            content: "Ben moved to Porto last spring.".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    assert_eq!(
+        count_bits(&a.db, first),
+        1,
+        "the table backfills the earlier write"
+    );
+    assert_eq!(count_bits(&a.db, second), 1, "the later write has its bits");
+}
+
+/// A bit table dropped by another process must not fail a connection that
+/// reconciled earlier: its writes skip bits instead of erroring.
+#[test]
+fn dropped_bit_table_does_not_fail_a_writer_that_reconciled_earlier() {
+    let dir = TempDir::new("vec-bits-drop");
+    let path = dir.join("d.db");
+    let emb: Arc<dyn Embedder> = Arc::new(HashEmbedder);
+    let a = Engine::open(&path, emb.clone())
+        .unwrap()
+        .with_clock(clock_2026());
+    a.db.ensure_bits().unwrap();
+    let b = Engine::open(&path, emb).unwrap().with_clock(clock_2026());
+    b.db.sql()
+        .execute_batch("DROP TABLE memories_bits")
+        .unwrap();
+    let written = a.remember(RememberInput {
+        content: "Carla prefers oat milk in her coffee.".into(),
+        ..Default::default()
+    });
+    assert!(written.is_ok(), "remember survives a dropped bit table");
+}
+
+/// The count/max reconcile runs once per connection: a later `ensure_bits` on
+/// the same connection is the cheap existence probe, so a row missing from the
+/// table stays missing until the next connection reconciles.
+#[test]
+fn reconcile_runs_once_per_connection() {
+    let db = Db::open_in_memory_with_mode(VecMode::F32).unwrap();
+    let mut seed = 41u64;
+    let docs: Vec<Vec<f32>> = (0..20).map(|_| random_unit(&mut seed)).collect();
+    for (i, d) in docs.iter().enumerate() {
+        db.insert_memory_vec(i as i64 + 1, d).unwrap();
+    }
+    db.ensure_bits().unwrap();
+    db.sql()
+        .execute("DELETE FROM memories_bits WHERE rowid=5", [])
+        .unwrap();
+    db.ensure_bits().unwrap();
+    assert_eq!(
+        count_bits(&db, 5),
+        0,
+        "steady-state ensure_bits does not reconcile"
+    );
+}
+
+/// A reconcile that meets a busy writer gives up within the short lock wait
+/// (the caller falls back to the exact scan) instead of blocking the recall for
+/// the 5 s open timeout, and the next call completes the reconcile.
+#[test]
+fn reconcile_does_not_wait_out_a_busy_writer() {
+    let dir = TempDir::new("vec-bits-busy");
+    let path = dir.join("busy.db");
+    let emb: Arc<dyn Embedder> = Arc::new(HashEmbedder);
+    let w = Engine::open(&path, emb.clone())
+        .unwrap()
+        .with_clock(clock_2026());
+    w.db.ensure_bits().unwrap();
+    let id = w
+        .remember(RememberInput {
+            content: "Dana bought a red bicycle in Faro.".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    w.db.sql()
+        .execute("DELETE FROM memories_bits WHERE rowid=?1", [id])
+        .unwrap();
+    drop(w);
+
+    let reader = Engine::open(&path, emb).unwrap().with_clock(clock_2026());
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let start = std::time::Instant::now();
+    let busy = reader.db.ensure_bits();
+    let waited = start.elapsed();
+    lock.execute_batch("COMMIT").unwrap();
+    assert!(busy.is_err(), "a busy writer makes the reconcile fail");
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "the reconcile gave up after {waited:?}"
+    );
+    reader.db.ensure_bits().unwrap();
+    assert_eq!(count_bits(&reader.db, id), 1, "the retry repairs the table");
 }
