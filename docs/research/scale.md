@@ -436,6 +436,52 @@ One miss also sits on a real entity-resolution defect, found while checking: "C#
 "Quasar Signal uses C#" and every C++ fact share it). The relation text is right, but the entity name and its
 card are not. Not fixed here; open item TOOL-NAMES.
 
+## After nc-relpre: the relation prefilter A/B (2026-11-05)
+
+Lane nc-relpre ported the I6 relation-seed prefilter of the killed branch
+`lane-nc-fanout` (commit d97817f) as the opt-in `rel_prefilter` knob (default off;
+`eval --set rel_prefilter=on` replaces the global `relations_vec` KNN for the
+relation-fact seeds with a bounded read of the relations incident to the first 20 query
+anchors, anchor-less questions keep the global KNN; only this was ported - the hub cap and
+early truncation of nc-fanout were not).
+
+A/B on the existing 108,667-memory real-model world-10000 DB (`eval --load-db`, a fresh copy
+under `lanes/tmp/nc-relpre/db/` per run because `eval` records access, real UltraBERT f32,
+`taskset -c 0`, 600 queries):
+
+| round | cfg | acc@10 | recall | MRR | three-hop recall | p50 / p95 ms | expect_absent leaked |
+|---|---|---|---|---|---|---|---|
+| 1 | off | 1.000 | 0.972 | 0.861 | 0.812 | 599 / 1759 | 2/153 |
+| 1 | on | 1.000 | 0.974 | 0.866 | 0.829 | 836 / 6714 | 1/153 |
+| 2 | off | 1.000 | 0.972 | 0.861 | 0.812 | 3333 / 5540 | 2/153 |
+| 2 | on | 1.000 | 0.974 | 0.866 | 0.829 | 1890 / 4361 | 1/153 |
+| 3 | off | 1.000 | 0.972 | 0.861 | 0.812 | 704 / 1523 | 2/153 |
+| 3 | on | 1.000 | 0.974 | 0.866 | 0.829 | 471 / 905 | 1/153 |
+
+With the knob on, recall 0.972 -> 0.974, MRR 0.861 -> 0.866 and three-hop recall 0.812 -> 0.829
+on world-10000; acc@10 held at 1.000. The p50 did not move cleanly: the round-1 `on` pass ran at
+~15% CPU against 43% for its `off` partner (wall p50 load-dominated, p95 6714 ms) and the round-2
+`off` pass was the slowest of the set (p50 3333 ms); round 3 favours `on` (471 vs 704 ms).
+
+Release gates (briefs/common.md commands, `run_gates.sh`, default embedder, `--set
+rel_prefilter=<cfg>`, all ten runs exit 0):
+
+| set | off | on | gate |
+|---|---|---|---|
+| fixtures | 0.953 / 0.895 | 0.953 / 0.895 | pass (gate >= 0.953 / 0.895) |
+| holdout | 0.914 / 0.795 | 0.914 / 0.795 | pass (gate >= 0.909 / 0.790) |
+| multihop-holdout | acc@10 0.825 | 0.825 | pass (gate >= 0.825) |
+| multihop-holdout2 | acc@10 0.820 | 0.820 | pass (gate >= 0.82) |
+| world-300 | acc@10 1.000, p50 208 ms | 1.000, p50 235 ms | pass (gate >= 0.99) |
+
+Default decision (lane nc-relpre, 2026-11-05): **keep `rel_prefilter` off**. No accuracy loss
+with the knob on (acc@10 equal-or-better everywhere tested, tiny recall/MRR/three-hop gains on
+world-10000); the p50 gain did not hold across all rounds cleanly (round-1 `on` was load
+contaminated and slower, round-2 `off` was the outlier) and the knob was slightly slower on the
+small gate sets (fixtures p50 179 vs 71 ms, holdout 126 vs 73 ms, world-300 235 vs 208 ms), so the
+flip criterion (equal-or-better acc@10 on every set AND a p50 gain holding across all rounds) is
+not met. The knob stays opt-in via `eval --set rel_prefilter=on`; the default stays off.
+
 ## Reproduce
 
 ```bash

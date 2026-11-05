@@ -275,7 +275,11 @@ always win.
 The channel set is extensible: two measured experiments are built in but off by
 default (`--set w_tlink=…` temporal neighbours, `--set w_causal=…` why-question
 causal evidence; `--set causal_extract=1` also extracts one conservative
-"because" relation when you pass no relations). Recall records which memories
+"because" relation when you pass no relations). The relation-fact seed retriever
+is also a knob: `eval --set rel_prefilter=on` reads only the relations incident
+to the first 20 query anchors instead of scanning the global relation-vector
+index; it is off by default (see `docs/research/scale.md` for the 108k
+measurement). Recall records which memories
 it returned (totals plus a capped access history), applies a small retention
 weight (0.05) to salience and recent access, and `stats` reports a cold
 tier; nothing is ever evicted automatically.

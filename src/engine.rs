@@ -159,6 +159,12 @@ pub struct Config {
     pub vec_prefilter: String,
     /// Candidate depth multiplier of the bit prefilter (`N = n * k`).
     pub vec_prefilter_n: usize,
+    /// Relation-fact seed prefilter: when the question names entities, take
+    /// the relation-vector seeds from the live relations incident to the first
+    /// 20 anchors (indexed `src`/`dst` reads) instead of the global
+    /// `relations_vec` KNN. Anchor-less questions keep the global KNN. Off by
+    /// default: measured in `docs/research/scale.md`.
+    pub rel_prefilter: bool,
 }
 
 impl Default for Config {
@@ -208,6 +214,7 @@ impl Default for Config {
             anchor_tiers: String::new(),
             vec_prefilter: "off".to_string(),
             vec_prefilter_n: 10,
+            rel_prefilter: false,
         }
     }
 }

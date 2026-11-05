@@ -68,6 +68,103 @@ fn has_reason(out: &RecallOutput, id: i64, prefix: &str) -> bool {
         .is_some_and(|m| m.reasons.iter().any(|r| r.starts_with(prefix)))
 }
 
+/// A tiny relation graph where every relation is incident to the query anchor
+/// "Atlas", and the answer memory text does not name the anchor or the tool.
+fn relation_prefilter_fixture() -> (Engine, i64, i64) {
+    let mut e = engine(Arc::new(HashEmbedder));
+    // Access recording must not let the on/off comparison drift between calls.
+    e.cfg.w_retention = 0.0;
+    let answer = remember(&e, "The stack choice is settled.", |i| {
+        i.entities = vec![entity("Atlas"), entity("Rust")];
+        i.relations = vec![relation("Atlas", "uses", "Rust", "Atlas uses Rust")];
+    });
+    let sibling = remember(&e, "The build pipeline is documented.", |i| {
+        i.entities = vec![entity("Atlas"), entity("Go")];
+        i.relations = vec![relation("Atlas", "uses", "Go", "Atlas uses Go")];
+    });
+    (e, answer, sibling)
+}
+
+fn prefilter_query() -> RecallInput {
+    RecallInput {
+        query: "What does Atlas use?".into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn relation_prefilter_off_is_byte_identical() {
+    let (e, _, _) = relation_prefilter_fixture();
+    let base = serde_json::to_string(&e.recall(&prefilter_query()).unwrap()).unwrap();
+    let mut on = e;
+    on.cfg.rel_prefilter = true;
+    let _ = on.recall(&prefilter_query()).unwrap();
+    on.cfg.rel_prefilter = false;
+    let off = serde_json::to_string(&on.recall(&prefilter_query()).unwrap()).unwrap();
+    assert_eq!(off, base, "knob off restores the pre-existing output");
+}
+
+#[test]
+fn relation_prefilter_keeps_small_relation_sets_identical() {
+    let (off, answer, sibling) = relation_prefilter_fixture();
+    let (mut on, _, _) = relation_prefilter_fixture();
+    on.cfg.rel_prefilter = true;
+    let off = off.recall(&prefilter_query()).unwrap();
+    let on = on.recall(&prefilter_query()).unwrap();
+    assert_eq!(ids(&on), ids(&off), "the prefilter keeps the top-k ids");
+    assert_eq!(on.memories.len(), off.memories.len());
+    assert!(ids(&on).contains(&answer));
+    assert!(ids(&on).contains(&sibling));
+}
+
+#[test]
+fn relation_prefilter_finds_relation_only_answer() {
+    let (mut e, answer, _) = relation_prefilter_fixture();
+    e.cfg.rel_prefilter = true;
+    let out = e.recall(&prefilter_query()).unwrap();
+    assert!(
+        out.facts
+            .iter()
+            .any(|fact| fact.source == "Atlas" && fact.target == "Rust"),
+        "relation-backed fact missing: {out:?}"
+    );
+    assert!(
+        ids(&out).contains(&answer),
+        "the memory that evidences the relation is missing: {out:?}"
+    );
+}
+
+#[test]
+fn relation_prefilter_keeps_global_knn_for_anchorless_queries() {
+    // The question names no entity, so the prefilter has nothing to restrict
+    // the relation-vector arm to and the global KNN must still run.
+    let (off, _, _) = relation_prefilter_fixture();
+    let (mut on, _, _) = relation_prefilter_fixture();
+    on.cfg.rel_prefilter = true;
+    let query = RecallInput {
+        query: "Which stack was settled?".into(),
+        ..Default::default()
+    };
+    let off = off.recall(&query).unwrap();
+    let on = on.recall(&query).unwrap();
+    assert_eq!(
+        serde_json::to_string(&on).unwrap(),
+        serde_json::to_string(&off).unwrap(),
+        "anchor-less questions keep the global relation KNN"
+    );
+}
+
+#[test]
+fn relation_prefilter_knob_parses_and_defaults_off() {
+    let mut cfg = Config::default();
+    assert!(!cfg.rel_prefilter);
+    neocortex::eval::set_config(&mut cfg, "rel_prefilter", "on").unwrap();
+    assert!(cfg.rel_prefilter);
+    neocortex::eval::set_config(&mut cfg, "rel_prefilter", "off").unwrap();
+    assert!(!cfg.rel_prefilter);
+    assert!(neocortex::eval::set_config(&mut cfg, "rel_prefilter", "maybe").is_err());
+}
+
 #[test]
 fn keyword_recall_returns_matching_memory() {
     let engine = Engine::open_in_memory(Arc::new(HashEmbedder))
