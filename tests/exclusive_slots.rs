@@ -9,6 +9,7 @@ use neocortex::{
     engine::{Engine, RelationIn, RememberInput},
     temporal::Clock,
 };
+use rusqlite::OptionalExtension;
 use std::sync::Arc;
 
 const NOW: i64 = 1_700_000_000;
@@ -76,6 +77,43 @@ fn live_to(e: &Engine, src: &str, dst: &str) -> bool {
             )
             .unwrap();
     n > 0
+}
+
+/// The stored end of `src predicate dst`, when the row exists at all.
+fn valid_to(e: &Engine, src: &str, canonical: &str, dst: &str) -> Option<Option<i64>> {
+    e.db.sql()
+        .query_row(
+            "SELECT r.valid_to FROM relations r
+             JOIN predicates p ON p.id=r.predicate_id
+             JOIN entities es ON es.id=r.src
+             JOIN entities ed ON ed.id=r.dst
+             WHERE LOWER(es.name)=LOWER(?1) AND LOWER(ed.name)=LOWER(?2) AND p.canonical=?3
+             ORDER BY r.id DESC LIMIT 1",
+            rusqlite::params![src, dst, canonical],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+}
+
+/// Entity id of `name` (the write path stores the name it was given).
+fn eid(e: &Engine, name: &str) -> i64 {
+    e.db.sql()
+        .query_row("SELECT id FROM entities WHERE name=?1", [name], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+fn epoch(day: &str) -> i64 {
+    neocortex::temporal::parse_instant(
+        day,
+        &Clock {
+            now: NOW,
+            tz_offset_secs: 0,
+        },
+    )
+    .unwrap()
 }
 
 #[test]
@@ -256,4 +294,176 @@ fn control_subject_slot_still_ends_the_old_value() {
     );
     assert!(!current(&e, "Alice", "live in", "delhi"));
     assert!(current(&e, "Alice", "live in", "pune"));
+}
+
+/// A dated historical write ("Ann lived in Rome in 2019") says nothing about
+/// now: it is history up to the ingest stamp of the undated fact, and the
+/// undated fact stays current. Retiring Paris here was a false retirement.
+#[test]
+fn dated_history_never_retires_the_current_fact() {
+    let e = engine();
+    write(
+        &e,
+        "Ann lives in Paris.",
+        None,
+        vec![rel("Ann", "lives in", "Paris", true)],
+    );
+    write(
+        &e,
+        "Ann lived in Rome in 2019.",
+        Some("2019-01-01"),
+        vec![rel("Ann", "lives in", "Rome", true)],
+    );
+    assert!(current(&e, "Ann", "live in", "paris"));
+    assert!(!current(&e, "Ann", "live in", "rome"));
+    assert_eq!(
+        valid_to(&e, "Ann", "live in", "rome"),
+        Some(Some(NOW)),
+        "Rome is history up to the stamp of the undated Paris fact"
+    );
+}
+
+/// A closed historical interval can never replace a current fact, and keeps
+/// its own end.
+#[test]
+fn closed_history_never_retires_the_current_fact() {
+    let e = engine();
+    write(
+        &e,
+        "Ann lives in Paris.",
+        None,
+        vec![rel("Ann", "lives in", "Paris", true)],
+    );
+    let mut history = rel("Ann", "lives in", "Rome", true);
+    history.valid_from = Some("2019-01-01".into());
+    history.valid_to = Some("2021-01-01".into());
+    write(
+        &e,
+        "Ann lived in Rome from 2019 to 2021.",
+        None,
+        vec![history],
+    );
+    assert!(current(&e, "Ann", "live in", "paris"));
+    assert_eq!(
+        valid_to(&e, "Ann", "live in", "rome"),
+        Some(Some(epoch("2021-01-01")))
+    );
+}
+
+/// The same for an object-keyed slot: a dated past leadership does not end the
+/// current leader.
+#[test]
+fn dated_past_leadership_never_retires_the_current_leader() {
+    let e = engine();
+    write(
+        &e,
+        "Sasha leads the portal.",
+        None,
+        vec![rel("Sasha", "leads", "portal", true)],
+    );
+    let mut past = rel("Lars", "leads", "portal", true);
+    past.valid_from = Some("2022-01-01".into());
+    past.valid_to = Some("2023-01-01".into());
+    write(
+        &e,
+        "Lars led the portal from 2022 to 2023.",
+        None,
+        vec![past],
+    );
+    assert!(current(&e, "Sasha", "lead", "portal"));
+    assert_eq!(
+        valid_to(&e, "Lars", "lead", "portal"),
+        Some(Some(epoch("2023-01-01")))
+    );
+}
+
+/// A merge is not evidence about an unrelated slot: `lead` is keyed on the
+/// project and `use` is multi-valued, so a merge elsewhere changes nothing.
+#[test]
+fn a_merge_does_not_reapply_subject_slots() {
+    let e = engine();
+    write(
+        &e,
+        "Sam leads Project Alpha.",
+        Some("2026-01-10"),
+        vec![rel("Sam", "leads", "Project Alpha", true)],
+    );
+    write(
+        &e,
+        "Sam leads Project Beta.",
+        Some("2026-02-10"),
+        vec![rel("Sam", "leads", "Project Beta", true)],
+    );
+    write(
+        &e,
+        "Kim uses npm.",
+        Some("2026-01-10"),
+        vec![rel("Kim", "uses", "npm", true)],
+    );
+    write(
+        &e,
+        "Kim uses ESLint.",
+        Some("2026-02-10"),
+        vec![rel("Kim", "uses", "ESLint", true)],
+    );
+    write(
+        &e,
+        "Zed Qux works at Acme.",
+        Some("2026-01-10"),
+        vec![rel("Zed Qux", "works at", "Acme", false)],
+    );
+    write(
+        &e,
+        "Mira Vance works at Acme.",
+        Some("2026-01-10"),
+        vec![rel("Mira Vance", "works at", "Acme", false)],
+    );
+    let keep = eid(&e, "Zed Qux");
+    let gone = eid(&e, "Mira Vance");
+    e.merge_entities(&format!("e{keep}"), &format!("e{gone}"), false)
+        .unwrap();
+    assert!(current(&e, "Sam", "lead", "project alpha"));
+    assert!(current(&e, "Sam", "lead", "project beta"));
+    assert!(current(&e, "Kim", "use", "npm"));
+    assert!(current(&e, "Kim", "use", "eslint"));
+}
+
+/// A generic object is not a one-owner slot: two people can own a laptop.
+#[test]
+fn a_shared_generic_object_is_not_a_slot() {
+    let e = engine();
+    write(
+        &e,
+        "Alex owns a laptop.",
+        Some("2026-01-10"),
+        vec![rel("Alex", "owns", "laptop", true)],
+    );
+    write(
+        &e,
+        "Blake owns a laptop.",
+        Some("2026-02-10"),
+        vec![rel("Blake", "owns", "laptop", true)],
+    );
+    assert!(current(&e, "Alex", "own", "laptop"));
+    assert!(current(&e, "Blake", "own", "laptop"));
+}
+
+/// A named, definite object is: the repo has one owner.
+#[test]
+fn a_named_object_is_a_slot() {
+    let e = engine();
+    write(
+        &e,
+        "Ann owns the repo.",
+        Some("2026-01-10"),
+        vec![rel("Ann", "owns", "repo", true)],
+    );
+    write(
+        &e,
+        "Bo owns the repo.",
+        Some("2026-02-10"),
+        vec![rel("Bo", "owns", "repo", true)],
+    );
+    assert!(!current(&e, "Ann", "own", "repo"));
+    assert!(current(&e, "Bo", "own", "repo"));
 }

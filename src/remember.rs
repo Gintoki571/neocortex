@@ -291,8 +291,69 @@ fn words_of(text: &str) -> Vec<String> {
 /// keyed on the target. Every other exclusive predicate is keyed on the subject.
 /// shortcut: `use` is the only multi-valued-by-nature predicate; a list of such
 /// predicates belongs in the seed table when more show up.
-fn object_keyed(canonical: &str) -> bool {
+pub(crate) fn object_keyed(canonical: &str) -> bool {
     matches!(canonical, "lead" | "own")
+}
+
+/// A named thing rather than a common noun: "Atlas", "Project Alpha", "v2".
+/// Two people can own a laptop, one person owns a named repo, so only a named
+/// object can be a one-owner slot (H3-07 follow-up). After a merge there is no
+/// sentence left to read the article from, so this shape is the only evidence.
+pub(crate) fn named_object(name: &str) -> bool {
+    name.split_whitespace().count() > 1
+        || name.chars().any(|c| c.is_uppercase() || c.is_ascii_digit())
+}
+
+/// Is the write's object a unique one? "the repo", "Atlas" and "Project Alpha"
+/// name one thing; "a laptop" is one of many, so owning it is not a slot.
+pub(crate) fn unique_object(content: &str, name: &str) -> bool {
+    if named_object(name) {
+        return true;
+    }
+    let text = format!(" {} ", text::fold(content));
+    let needle = format!(" {} ", text::fold(name));
+    !text.match_indices(&needle).any(|(i, _)| {
+        let before = text[..i].trim_end();
+        before.ends_with(" a") || before.ends_with(" an")
+    })
+}
+
+/// Is the clause carrying `name` phrased as history ("Ann lived in Rome in
+/// 2019", "Lars led the portal from 2023 to 2024") rather than as an assertion
+/// about now? Cue: a past-tense verb in the same sentence. A false positive
+/// only keeps the current fact (the pre-lane behaviour), never retires one.
+fn says_past(content: &str, name: &str) -> bool {
+    /// Irregular past forms a suffix rule cannot catch (space-separated).
+    const IRREGULAR: &str = "was were had did led ran began held wrote built made took gave saw \
+         went came became left met paid sold told thought brought bought found got kept sent sat \
+         stood understood won lost spent grew drew flew threw knew spoke chose drove rose wore \
+         broke slept taught caught fought sought dealt meant felt heard read rode rang sang sank \
+         swam";
+    /// Words ending in "ed" that are not past verbs.
+    const NOT_VERBS: &str = "bed red need feed seed speed shed sled wed hundred sacred wicked \
+         naked indeed proceed exceed succeed embed breed greed creed freed agreed hatred kindred \
+         rugged jagged ragged";
+    let past = |sentence: &str| {
+        text::fold(sentence).split(' ').any(|w| {
+            IRREGULAR.split(' ').any(|v| v == w)
+                || (w.len() >= 4 && w.ends_with("ed") && !NOT_VERBS.split(' ').any(|v| v == w))
+        })
+    };
+    let name_words: Vec<&str> = name.split(' ').filter(|w| !w.is_empty()).collect();
+    if name_words.is_empty() {
+        return past(content);
+    }
+    let hits: Vec<&str> = content
+        .split(['.', '!', '?', ';', '\n'])
+        .filter(|s| {
+            let words = text::fold(s);
+            name_words.iter().all(|n| words.split(' ').any(|t| t == *n))
+        })
+        .collect();
+    if hits.is_empty() {
+        return past(content);
+    }
+    hits.iter().any(|s| past(s))
 }
 
 /// Does the relation start only at the ingest stamp of an undated memory (its
@@ -1840,12 +1901,17 @@ fn write_prepared(
                 "relation '{fact}': valid_to must be after valid_from"
             ));
         }
+        // The slot key: the subject, or the target for one-owner predicates.
+        // A one-owner slot only exists for a unique object: "Alex owns a
+        // laptop" and "Blake owns a laptop" are not the same slot, "Bo owns
+        // the repo" does end "Ann owns the repo" (H3-07 follow-up).
+        let by_object = !swap && object_keyed(&pred.canonical);
+        let is_slot = !by_object || unique_object(&content, dst_name);
         if polarity == 1
+            && is_slot
             && relation.exclusive != Some(false)
             && (relation.exclusive == Some(true) || resolved.exclusive)
         {
-            // The slot key: the subject, or the target for one-owner predicates.
-            let by_object = !swap && object_keyed(&pred.canonical);
             let key = if by_object { dst } else { subj };
             let mut st = db.sql().prepare(if by_object {
                 "SELECT r.id,r.valid_from,r.valid_to,r.src,r.dst,es.norm,ed.norm,r.fact
@@ -1949,18 +2015,26 @@ fn write_prepared(
                         params![rf, old],
                     )?;
                     ended_here.push(old);
-                } else if old_from > rf && rf != now && starts_at_ingest(db, old, old_from)? {
-                    // H3-02: the old start is only the ingest stamp of an undated
-                    // memory, so a dated write replaces it instead of being
-                    // history up to that stamp.
-                    db.sql().execute(
-                        "UPDATE relations SET expired_at=?1 WHERE id=?2",
-                        params![now, old],
-                    )?;
-                    ended_here.push(old);
                 } else if old_from > rf {
-                    // Backfill: the new fact is history up to the later one.
-                    if later.is_none_or(|(from, _)| old_from < from) {
+                    // H3-02: the old start is only the ingest stamp of an
+                    // undated memory, so a dated write replaces it instead of
+                    // being history up to that stamp - but only when the write
+                    // asserts the present. A closed interval or a historical
+                    // sentence ("Ann lived in Rome in 2019") is history about
+                    // the past and never retires what is true now (H3-02b).
+                    let replaces = rf != now
+                        && new_valid_to.is_none()
+                        && (!says_past(&content, &value_old_norm)
+                            || names_as_replaced(&content, &value_old_norm))
+                        && starts_at_ingest(db, old, old_from)?;
+                    if replaces {
+                        db.sql().execute(
+                            "UPDATE relations SET expired_at=?1 WHERE id=?2",
+                            params![now, old],
+                        )?;
+                        ended_here.push(old);
+                    } else if later.is_none_or(|(from, _)| old_from < from) {
+                        // Backfill: the new fact is history up to the later one.
                         later = Some((old_from, old));
                     }
                 }
