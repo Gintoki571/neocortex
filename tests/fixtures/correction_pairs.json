@@ -1,0 +1,327 @@
+{
+  "about": "Pairs (new, old) for the correction-hint rule (src/correction.rs). \"correction\": true = the new text corrects the old memory. Hits are cue + numeric value + same subject; misses are true corrections the rule is designed to skip (no numeric value, or no cue). Controls are near misses: build/version/year/id numbers, different subjects, same number without a cue.",
+  "true": [
+    [
+      "Correction: the Harbor ingest API accepts 4 MB per request, not 2 MB.",
+      "The Harbor ingest API accepts at most 2 MB per request."
+    ],
+    [
+      "Actually the batch size is 500 rows, not 200.",
+      "The import batch size is 200 rows."
+    ],
+    [
+      "Correction: the audit retention is 365 days, not 180.",
+      "Raw event audit retention is 180 days."
+    ],
+    [
+      "The retry limit changed from 3 to 5 attempts.",
+      "The retry limit is 3 attempts."
+    ],
+    [
+      "Correction: the portal launch is 2026-12-05, not 2026-11-14.",
+      "The portal launch is scheduled for 2026-11-14."
+    ],
+    [
+      "Beacon's session timeout is 30 minutes, no longer 15.",
+      "Beacon's session timeout is 15 minutes."
+    ],
+    [
+      "Instead of 8 pool workers we now run 12 pool workers.",
+      "The pool runs 8 pool workers."
+    ],
+    [
+      "Correction: the Atlas API limit is 300 requests per minute, not 100.",
+      "The Atlas API rate limit is 100 requests per minute per key."
+    ],
+    [
+      "Correction: Lantern has 14 pipelines now, not 12.",
+      "Lantern runs 12 pipelines."
+    ],
+    [
+      "Correction: the Lantern schema freeze moved to 2026-11-27, not 2026-11-20.",
+      "The Lantern schema migration freeze begins 2026-11-20."
+    ],
+    [
+      "Correction: the lunch order was 14 sandwiches, not 41.",
+      "Lunch order for the offsite is 41 sandwiches."
+    ],
+    [
+      "Correction again: the Harbor batch window is 23:00 to 01:00 UTC, not 22:00.",
+      "The Harbor batch window moved to 22:00 to 00:00 UTC."
+    ],
+    [
+      "Correction: the Postgres pool max is 20 connections, not 10.",
+      "Postgres pool max connections is 10."
+    ],
+    [
+      "Correction: the upload cap is 25 MB, not 10 MB.",
+      "The upload cap is 10 MB per file."
+    ],
+    [
+      "Actually the cache TTL is 90 seconds, not 60.",
+      "The cache TTL is 60 seconds."
+    ],
+    [
+      "Correction: the on-call rotation is 7 days, not 14.",
+      "On-call rotation is 14 days."
+    ],
+    [
+      "Correction: the vendor SLA is 99.9 percent, not 99.5.",
+      "Vendor SLA is 99.5 percent."
+    ],
+    [
+      "Correction: the Lantern ingest API limit is 8 MB per request, no longer 4 MB.",
+      "Lantern's ingest API limit is now 4 MB per request."
+    ],
+    [
+      "Correction: the 8 MB figure was also wrong; production enforces 6 MB per request.",
+      "Correction: the Lantern ingest API limit is 8 MB per request, the 4 MB figure was an old staging value."
+    ],
+    [
+      "Correction: Beacon API rate limit is 400 requests per minute, not 500.",
+      "The Beacon API rate limit is 500 requests per minute per key after the second partner onboarding."
+    ],
+    [
+      "Correction: the Atlas cache is SQLite 3.45, not 3.40.",
+      "Atlas uses SQLite 3.40 for its cache."
+    ],
+    [
+      "Correction: the alert threshold is 75 percent, not 80.",
+      "The alert threshold is 80 percent for disk usage."
+    ],
+    [
+      "Correction: we keep 30 days of logs, not 14.",
+      "Logs are kept for 14 days."
+    ],
+    [
+      "Correction: retries back off for 5 seconds, not 2.",
+      "Retries back off for 2 seconds."
+    ],
+    [
+      "The Harbor ingest worker count changed from 4 to 6.",
+      "The Harbor ingest worker count is 4."
+    ],
+    [
+      "Correction: the export bucket has 12 shards, not 16.",
+      "The export bucket has 16 shards."
+    ],
+    [
+      "Correction: the nightly job starts at 02:30, not 01:30.",
+      "The nightly job starts at 01:30 UTC."
+    ],
+    [
+      "Correction: the gateway listens on port 9443, not 8443.",
+      "The gateway service listens on port 8443 behind the load balancer."
+    ],
+    [
+      "Correction: the Dagster migration finished 2026-06-30, not 2026-06-20.",
+      "The Dagster migration finishes 2026-06-20."
+    ],
+    [
+      "Correction: the tests run in 4 shards now, instead of 2 shards.",
+      "CI tests run in 2 shards."
+    ],
+    [
+      "Priyanka now owns the schema registry.",
+      "Jorge Fuentes owns the schema registry."
+    ],
+    [
+      "The Harbor batch window moved to 22:00 to 00:00 UTC.",
+      "The Harbor batch window is 01:00 to 03:00 UTC."
+    ],
+    [
+      "Correction: the portal lead is Lars Haugen, not Sasha Lindqvist.",
+      "Sasha Lindqvist leads the portal project."
+    ],
+    [
+      "The retention moved from 90 days to 365 days.",
+      "Retention is 90 days."
+    ],
+    [
+      "Correction: the Lantern audit export is monthly, not weekly.",
+      "Lantern audit export runs weekly."
+    ],
+    [
+      "Correction: the database is Postgres, not MySQL.",
+      "Harbor stores raw events in MySQL."
+    ],
+    [
+      "Correction: the feature flag is off in production, not on.",
+      "The feature flag is on in production."
+    ],
+    [
+      "Correction: the sync job runs every 15 minutes, not every hour.",
+      "The sync job runs hourly."
+    ],
+    [
+      "Correction: the audit export runs on the second Sunday, not the first.",
+      "The audit export runs on the first Sunday."
+    ],
+    [
+      "Correction: Ines Park is the mobile lead, not Dima.",
+      "Dima leads the mobile team."
+    ]
+  ],
+  "controls": [
+    [
+      "Correction: build 13 now passes the smoke suite.",
+      "Build 12 now passes the smoke suite."
+    ],
+    [
+      "Correction: build 14 is the one that passes, not build 13.",
+      "Build 13 now passes."
+    ],
+    [
+      "Actually the build 9 artifact is the good one, not build 8.",
+      "Build 8 artifact failed the smoke test."
+    ],
+    [
+      "Correction: we shipped version 2.4, not version 2.3.",
+      "We shipped version 2.3 last week."
+    ],
+    [
+      "Correction: the v2 gateway is live, not v1.",
+      "v1 gateway is live in staging."
+    ],
+    [
+      "Correction: release 4 is the stable line, not release 3.",
+      "Release 3 is the stable line."
+    ],
+    [
+      "Correction: the 2026 budget review moved to March, not the 2025 cycle.",
+      "The 2025 budget review is in January."
+    ],
+    [
+      "Actually the 2027 planning offsite is in Lisbon, not Porto.",
+      "The 2026 planning offsite is in Porto."
+    ],
+    [
+      "Correction: the handbook was revised in 2024, not 2022.",
+      "The handbook was revised in 2022."
+    ],
+    [
+      "Correction: ticket 4411 is the duplicate, not 4412.",
+      "Ticket 4412 tracks the Harbor timeout."
+    ],
+    [
+      "Correction: issue 88 is closed, not issue 87.",
+      "Issue 87 is still open."
+    ],
+    [
+      "Correction: PR 512 merged, not 511.",
+      "PR 511 is still in review."
+    ],
+    [
+      "Correction: commit a1b2c3 is the fix, not 9f8e7d.",
+      "The fix is in commit 9f8e7d."
+    ],
+    [
+      "Correction: the sprint 24 retro moved to Friday, not sprint 23.",
+      "Sprint 23 retro is on Thursday."
+    ],
+    [
+      "Correction: CVE-2026-1123 is the one we patched, not CVE-2026-1122.",
+      "We patched CVE-2026-1122 last week."
+    ],
+    [
+      "Correction: incident 7 was the database one, not incident 6.",
+      "Incident 6 was the database outage."
+    ],
+    [
+      "Actually build 2026.11 is the release, not build 2026.10.",
+      "Build 2026.10 is the release."
+    ],
+    [
+      "Correction: the RFC 7231 rule applies, not RFC 7230.",
+      "RFC 7230 governs caching."
+    ],
+    [
+      "Correction: the m12 note is the current one, not m11.",
+      "m11 is the current design note."
+    ],
+    [
+      "Correction: rev 42 is deployed, not rev 41.",
+      "Rev 41 is deployed in staging."
+    ],
+    [
+      "Correction: the 2023 migration guide replaced the 2019 one.",
+      "The 2019 migration guide is current."
+    ],
+    [
+      "Correction: step 3 runs before step 2.",
+      "Step 2 runs first."
+    ],
+    [
+      "Correction: build 3.13 is the target, not build 3.12.",
+      "Build 3.12 is the target."
+    ],
+    [
+      "Correction: the cafeteria closes at 8, not 9.",
+      "The Harbor deploy window opens at 9."
+    ],
+    [
+      "Actually the lunch budget is 12 euros, not 15.",
+      "Team offsite runs 15 people."
+    ],
+    [
+      "Correction: the gateway has 3 replicas, not 2.",
+      "Atlas API has 2 replicas in staging."
+    ],
+    [
+      "Correction: Ines Park leads 3 squads, not 2.",
+      "Ines Park is on the payments team."
+    ],
+    [
+      "Correction: the Lisbon office has 40 desks, not 30.",
+      "Porto office opened with 30 desks."
+    ],
+    [
+      "Actually the Beacon deploy freeze is Friday, not Monday.",
+      "Atlas deploy freeze is on Monday."
+    ],
+    [
+      "Correction: Atlas uses 4 workers, not 6.",
+      "Beacon uses 6 workers for builds."
+    ],
+    [
+      "The Harbor batch window is 22:00 to 00:00 UTC.",
+      "The Harbor batch window is 01:00 to 03:00 UTC."
+    ],
+    [
+      "Lantern runs 12 pipelines in the EU region.",
+      "Lantern runs 12 pipelines in the US region."
+    ],
+    [
+      "We will move the freeze to 2026-12-01 next spring.",
+      "The freeze is on 2026-11-20."
+    ],
+    [
+      "Lars Haugen has 2 open reviews this week.",
+      "Lars Haugen had 4 open reviews last week."
+    ],
+    [
+      "Correction: the portal rehearsal is on 2026-11-30.",
+      "The portal launch is 2026-12-05."
+    ],
+    [
+      "Actually I think the cache holds 500 items.",
+      "The cache holds 500 items at most."
+    ],
+    [
+      "Correction: the 2 MB limit applies to uploads, not to exports.",
+      "The 2 MB limit applies to uploads."
+    ],
+    [
+      "Correction: Dima is on the ledger team in 2026, not 2025.",
+      "Dima moved to the ledger team in 2025."
+    ],
+    [
+      "Correction: the 2 Lisbon flights are on Tuesday, not Wednesday.",
+      "The Lisbon flights leave Tuesday."
+    ],
+    [
+      "Actually the 3 Atlas hotfixes landed, not the 5 planned.",
+      "Atlas planned 5 hotfixes for the week."
+    ]
+  ]
+}

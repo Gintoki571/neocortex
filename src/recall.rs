@@ -1858,6 +1858,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                     Some(to) => temporal::duration(row.9, to, &clock),
                     None => format!("ongoing since {}", temporal::fmt_date(row.9, &clock)),
                 }),
+                maybe_superseded_by: None,
             });
         }
     }
@@ -2097,6 +2098,12 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             engine.cfg.hint_tau,
         )?
     };
+    if engine.cfg.correction_hints {
+        for m in memories.iter_mut().filter(|m| !m.ended) {
+            m.maybe_superseded_by =
+                crate::correction::later_correction(&engine.db, m.id, &m.content, m.valid_from)?;
+        }
+    }
     Ok(RecallOutput {
         memories,
         facts,
@@ -3046,6 +3053,7 @@ pub fn entity(engine: &Engine, name: &str, limit: usize) -> Result<EntityOutput>
                 score: 0.0,
                 reasons: vec![],
                 duration: None,
+                maybe_superseded_by: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3347,6 +3355,7 @@ fn representative(engine: &Engine, ids: &[i64]) -> Result<Option<MemoryHit>> {
                 score: 0.0,
                 reasons: Vec::new(),
                 duration: None,
+                maybe_superseded_by: None,
             })
         })
         .optional()?;
@@ -3639,6 +3648,7 @@ mod hint_tests {
             score: 1.0,
             reasons: Vec::new(),
             duration: None,
+            maybe_superseded_by: None,
         };
         assert!(hint(&f, &[&chain], &[], &[], &[memory], 0.40).is_empty());
     }
