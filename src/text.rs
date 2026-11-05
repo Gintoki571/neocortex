@@ -920,7 +920,7 @@ pub fn norm_predicate(p: &str) -> String {
         .join(" ")
 }
 
-fn lemma_verb(w: &str) -> String {
+pub(crate) fn lemma_verb(w: &str) -> String {
     // "married" stays an adjective: "married to", not "marry to".
     if w == "married" {
         return w.to_string();

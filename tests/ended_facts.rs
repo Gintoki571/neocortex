@@ -46,6 +46,22 @@ fn project(name: &str) -> EntityIn {
     }
 }
 
+fn place(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("place".into()),
+        ..Default::default()
+    }
+}
+
+fn org(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("org".into()),
+        ..Default::default()
+    }
+}
+
 fn rel(src: &str, predicate: &str, dst: &str, exclusive: bool) -> RelationIn {
     RelationIn {
         source: src.into(),
@@ -272,4 +288,220 @@ fn h3_11_question_without_still_is_unchanged() {
             .any(|l| l.contains("→ npm") && l.contains("ended")),
         "a question without a status cue showed the ended fact:\n{shown}"
     );
+}
+
+// ------------------------------------------------------------- H3-12
+
+#[test]
+fn h3_12_approves_does_not_end_reviews() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract(&e, "Tomasz Nowak no longer approves payment-adjacent code.");
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "approves ended reviews fact: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+#[test]
+fn h3_12_no_longer_only_ends_nothing() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract(
+        &e,
+        "Tomasz Nowak no longer only reviews payment-adjacent code.",
+    );
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "no longer only ended fact: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+#[test]
+fn h3_12_same_verb_reviews_ends_fact() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract(&e, "Tomasz Nowak no longer reviews payment-adjacent code.");
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "same verb reviews failed to end fact: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+#[test]
+fn h3_12_stopped_using_npm_ends_uses_npm() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Atlas uses npm for building packages.".into(),
+            entities: vec![project("Atlas"), tool("npm")],
+            relations: vec![rel("Atlas", "uses", "npm", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Atlas stopped using npm.".into(),
+            entities: vec![project("Atlas"), tool("npm")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "stopped using did not end uses: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+#[test]
+fn h3_12_left_acme_ends_works_at_acme() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Ivan works at Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Ivan left Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "left did not end works at: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+#[test]
+fn h3_12_no_longer_lives_in_pune_ends_lives_in_pune() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Carol lives in Pune.".into(),
+            entities: vec![person("Carol"), place("Pune")],
+            relations: vec![rel("Carol", "lives in", "Pune", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Carol no longer lives in Pune.".into(),
+            entities: vec![person("Carol"), place("Pune")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "no longer lives in did not end lives in: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+#[test]
+fn h3_12_no_longer_works_with_does_not_end_works_at() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Ivan works at Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+
+    let out2 = e
+        .remember(RememberInput {
+            content: "Ivan no longer works with Ana.".into(),
+            entities: vec![person("Ivan"), person("Ana")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!out2.invalidated_relations.contains(&rid));
+    assert_eq!(relation_end(&e, rid), None);
+
+    let out3 = e
+        .remember(RememberInput {
+            content: "Ivan no longer works with Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        !out3.invalidated_relations.contains(&rid),
+        "works with ended works at: {out3:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+#[test]
+fn h3_12_retraction_with_relations_passed_by_caller_is_unchanged() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Ivan works at Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid1 = out1.relations[0].id;
+
+    let out2 = e
+        .remember(RememberInput {
+            content: "Ivan joined Globex; he left Acme.".into(),
+            entities: vec![person("Ivan"), org("Globex"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Globex", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid1),
+        "old relation not ended: {out2:?}"
+    );
+    let rid2 = out2.relations[0].id;
+    assert!(
+        !out2.invalidated_relations.contains(&rid2),
+        "new relation ended itself: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid1), Some(NOW));
+    assert_eq!(relation_end(&e, rid2), None);
+}
+
+#[test]
+fn h3_12_coordinated_pair_retraction_unchanged() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Acme Corp and Northwind are partners since 2023.".into(),
+            entities: vec![org("Acme Corp"), org("Northwind")],
+            relations: vec![rel("Acme Corp", "partners with", "Northwind", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Acme Corp and Northwind are no longer partners.".into(),
+            entities: vec![org("Acme Corp"), org("Northwind")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "pair partners not ended: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
 }
