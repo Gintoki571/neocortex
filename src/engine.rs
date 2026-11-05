@@ -215,7 +215,7 @@ impl Default for Config {
             update_candidate: 0.75,
             hop_scorer: "off".to_string(),
             prose_margin: f64::INFINITY,
-            bridge_pull: false,
+            bridge_pull: true,
             rerank_top: 0,
             w_rerank: 0.5,
             hint_tau: 0.40,
