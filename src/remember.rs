@@ -260,6 +260,10 @@ fn time_tail(words: &[(usize, usize, &str)], i: usize) -> bool {
             next.is_some_and(|n| TIME_WORDS.contains(&n) || n.chars().all(|c| c.is_ascii_digit()))
         }
         "as" => next == Some("of"),
+        // "no longer reviews X since August 2026": a date opens a time tail.
+        "since" | "until" | "from" => {
+            next.is_some_and(|n| TIME_WORDS.contains(&n) || n.chars().any(|c| c.is_ascii_digit()))
+        }
         "at" => next.is_some_and(|n| {
             n.chars().any(|c| c.is_ascii_digit())
                 || matches!(
@@ -617,18 +621,37 @@ fn word_occurrences(lower: &str, needle: &str) -> Vec<(usize, usize)> {
 /// Bob" shares Alice).
 fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetraction> {
     let lower = content.to_lowercase();
+    // Keep hyphens, apostrophes and dots inside a word (like `extract::ngrams`):
+    // "payment-adjacent" is one object, not two, so a hyphenated name does not
+    // exhaust the two-word lookahead after the cue (H3-09).
     let words: Vec<(usize, usize, &str)> = {
+        let chars: Vec<(usize, char)> = lower.char_indices().collect();
         let mut out = Vec::new();
-        let mut start = None;
-        for (i, ch) in lower.char_indices() {
-            if ch.is_alphanumeric() {
-                start.get_or_insert(i);
-            } else if let Some(s) = start.take() {
-                out.push((s, i, &lower[s..i]));
+        let mut i = 0;
+        while i < chars.len() {
+            let (start, c) = chars[i];
+            if !c.is_alphanumeric() {
+                i += 1;
+                continue;
             }
-        }
-        if let Some(s) = start {
-            out.push((s, lower.len(), &lower[s..]));
+            let mut end = start + c.len_utf8();
+            let mut j = i + 1;
+            while j < chars.len() {
+                let (pos, ch) = chars[j];
+                if ch.is_alphanumeric()
+                    || (matches!(ch, '\'' | '’' | '-' | '.')
+                        && chars
+                            .get(j + 1)
+                            .is_some_and(|&(_, next)| next.is_alphanumeric()))
+                {
+                    end = pos + ch.len_utf8();
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            out.push((start, end, &lower[start..end]));
+            i = j;
         }
         out
     };

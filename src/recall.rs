@@ -2026,6 +2026,22 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             facts = fresh;
         }
     }
+    // H3-11: a yes/no "still" question that names both ends of a relation gets
+    // the ended relation between them, marked ended with its end date, so the
+    // answer can say "no, ended <date>". Live rows never come from this path.
+    if !negated {
+        let ended = ended_pair_facts(engine, &query_text, &query_alias_entities, cutoff)?;
+        let fresh: Vec<FactHit> = ended
+            .into_iter()
+            .filter(|f| !facts.iter().any(|x| x.id == f.id && !x.memory))
+            .collect();
+        if !fresh.is_empty() {
+            let mut merged = fresh;
+            merged.extend(facts);
+            merged.truncate(8);
+            facts = merged;
+        }
+    }
     // Ordering and duration questions want the intervals themselves, oldest
     // first, with the elapsed time spelled out. Other queries keep relevance
     // order.
@@ -2786,6 +2802,63 @@ fn named_side(
         (true, false) | (false, true) => NamedSide::Dst,
     };
     Some((side, before))
+}
+
+/// A yes/no question about the present ("is npm still used", "are they
+/// currently on call"): the status cue the ended-pair channel needs.
+fn status_yes_no(query: &str) -> bool {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .collect();
+    matches!(
+        words.first().map(String::as_str),
+        Some("is" | "are" | "was" | "were" | "does" | "do" | "did" | "has" | "have")
+    ) && words
+        .iter()
+        .any(|w| matches!(w.as_str(), "still" | "anymore" | "currently"))
+}
+
+/// H3-11: the ended relations between two entities the question names, most
+/// recent first (at most two). Live rows are excluded by the end condition.
+fn ended_pair_facts(
+    engine: &Engine,
+    query: &str,
+    anchors: &HashSet<i64>,
+    cutoff: i64,
+) -> Result<Vec<FactHit>> {
+    if !status_yes_no(query) {
+        return Ok(Vec::new());
+    }
+    let mut ids: Vec<i64> = anchor_mentions(engine, query, anchors)?
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let marks = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT r.id FROM relations r
+         WHERE r.polarity=1 AND r.src IN ({marks}) AND r.dst IN ({marks})
+           AND (r.expired_at IS NOT NULL OR (r.valid_to IS NOT NULL AND r.valid_to<=?))
+         ORDER BY r.id DESC LIMIT 2"
+    );
+    let mut bind: Vec<i64> = ids.clone();
+    bind.extend(ids.iter().copied());
+    bind.push(cutoff);
+    let mut st = engine.db.sql().prepare(&sql)?;
+    let rel_ids: Vec<i64> = st
+        .query_map(params_from_iter(bind.iter()), |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    paths::facts_by_ids(&engine.db, &rel_ids, cutoff, 2)
 }
 
 /// Live rows of the asked family touching a named entity on the side the
