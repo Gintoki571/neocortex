@@ -214,6 +214,19 @@ fn h3_13_past_slot_questions_retrieve_ended_memory_but_current_does_not() {
 }
 
 #[test]
+fn h3_13_past_state_boost_requires_the_asked_predicate() {
+    let e = engine();
+    trial_handover(&e);
+    let out = recall(&e, "which tool did Tunde Kalu use");
+    let old = out.memories.iter().find(|m| m.id == 1).unwrap();
+    assert!(
+        old.score < 2.0,
+        "unrelated ended predicate was boosted: {}",
+        old.score
+    );
+}
+
+#[test]
 fn h3_13_negated_retraction_is_not_resurrected_as_live() {
     let e = engine();
     trial_handover(&e);
