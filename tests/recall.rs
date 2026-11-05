@@ -69,6 +69,65 @@ fn has_reason(out: &RecallOutput, id: i64, prefix: &str) -> bool {
 }
 
 #[test]
+fn typed_bridge_pull_adds_an_answer_typed_relation() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Noah manages Mira.", |i| {
+        i.entities = vec![
+            EntityIn {
+                name: "Noah".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Mira".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+        ];
+        i.relations = vec![relation("Noah", "manages", "Mira", "Noah manages Mira")];
+    });
+    remember(&e, "Mira lives in Oslo.", |i| {
+        i.entities = vec![
+            EntityIn {
+                name: "Mira".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Oslo".into(),
+                kind: Some("place".into()),
+                ..Default::default()
+            },
+        ];
+        i.relations = vec![relation("Mira", "lives in", "Oslo", "Mira lives in Oslo")];
+    });
+    e.cfg.w_sempath = 0.0;
+    let off = e
+        .recall(&RecallInput {
+            query: "Where does Noah's colleague live?".into(),
+            k: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(off.facts.iter().any(|fact| fact.target.contains("Oslo")));
+
+    e.cfg.bridge_pull = true;
+    let on = e
+        .recall(&RecallInput {
+            query: "Where does Noah's colleague live?".into(),
+            k: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        on.facts.iter().any(|fact| fact.target.contains("Oslo")),
+        "{:?}",
+        on.facts
+    );
+    assert!(on.facts.iter().any(|fact| fact.target.contains("Oslo")));
+}
+
+#[test]
 fn keyword_recall_returns_matching_memory() {
     let engine = Engine::open_in_memory(Arc::new(HashEmbedder))
         .unwrap()
