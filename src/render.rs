@@ -287,13 +287,19 @@ pub fn render_entity(out: &EntityOutput, fmt: Fmt<'_>) -> String {
                 format!("[e{}] {}{kind}{desc}", c.id, c.name)
             })
             .collect();
-        // H2-13: a flagged bare first name lists every person, the card included.
+        // H2-13: a flagged bare first name lists every homonym, the card
+        // included. V3: a very common name shows 10 and counts the rest.
         let label = if out.status.is_some() {
             "ambiguous"
         } else {
             "also"
         };
-        s.push_str(&format!("{label}: {}\n", items.join(" · ")));
+        let more = out
+            .candidates_more
+            .filter(|n| *n > 0)
+            .map(|n| format!(" · and {n} more"))
+            .unwrap_or_default();
+        s.push_str(&format!("{label}: {}{more}\n", items.join(" · ")));
     }
     if let Some(c) = &out.card.community {
         s.push_str(&format!(
@@ -697,6 +703,7 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
             past_facts: vec![fact(4, "Delhi", 50, Some(100), true)],
             similar: vec![(9, "Mother".into(), 0.81)],
             candidates: Vec::new(),
+            candidates_more: None,
             status: None,
             timeline: vec![hit(42, "event", "Moved to Pune.", 100, None, false)],
         };
@@ -728,6 +735,7 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
                 description: "product designer".into(),
                 score: None,
             }],
+            candidates_more: None,
             status: None,
             timeline: Vec::new(),
         };
@@ -739,6 +747,31 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
     }
 
     #[test]
+    fn entity_profile_caps_the_homonym_line() {
+        let out = EntityOutput {
+            card: card(3, "Jasmine Person3", "person", &[]),
+            current_facts: Vec::new(),
+            past_facts: Vec::new(),
+            similar: Vec::new(),
+            candidates: vec![EntityCandidate {
+                id: 3,
+                name: "Jasmine Person3".into(),
+                kind: "person".into(),
+                description: String::new(),
+                score: None,
+            }],
+            candidates_more: Some(33),
+            status: Some("ambiguous".into()),
+            timeline: Vec::new(),
+        };
+        assert_eq!(
+            render_entity(&out, &fake),
+            "[e3] Jasmine Person3 (person)\n\
+             ambiguous: [e3] Jasmine Person3 (person) · and 33 more\n"
+        );
+    }
+
+    #[test]
     fn entity_timeline_truncates_long_memory_lines() {
         let out = EntityOutput {
             card: card(3, "Mom", "person", &[]),
@@ -746,6 +779,7 @@ next: follow e42 Mira Lindqvist for where live — chain ends at a person · fol
             past_facts: Vec::new(),
             similar: Vec::new(),
             candidates: Vec::new(),
+            candidates_more: None,
             status: None,
             timeline: vec![hit(42, "note", &"x".repeat(300), 100, None, false)],
         };

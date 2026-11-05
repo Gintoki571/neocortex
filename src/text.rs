@@ -101,7 +101,48 @@ pub fn norm_name(s: &str) -> String {
     if let Some(last) = words.last_mut() {
         *last = singularize(last);
     }
-    words.join(" ")
+    canon_versions(&words.join(" "))
+}
+
+/// A version token: an optional `v` before digits (and dots), "v16", "016",
+/// "3.12". VERSIONS-V1 folds the spelling before any name comparison, so
+/// "Postgres 16", "Postgres v16" and "Postgres 016" share one key; "v2 API"
+/// keeps its leading version word, so it stays a different name from "API".
+pub fn is_version_token(token: &str) -> bool {
+    let core = token.strip_prefix('v').unwrap_or(token);
+    !core.is_empty()
+        && core.chars().any(|c| c.is_ascii_digit())
+        && core.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// Canonical spelling of every version token in a normalised name: drop the
+/// `v` prefix and leading zeros per dot component ("v016" -> "16", "03.012" ->
+/// "3.12"). Non-version tokens are untouched.
+fn canon_versions(norm: &str) -> String {
+    norm.split_whitespace()
+        .map(|token| {
+            if !is_version_token(token) {
+                return token.to_string();
+            }
+            let core = token.strip_prefix('v').unwrap_or(token);
+            core.split('.')
+                .map(|part| {
+                    if part.is_empty() {
+                        String::new()
+                    } else {
+                        let trimmed = part.trim_start_matches('0');
+                        if trimmed.is_empty() {
+                            "0".to_string()
+                        } else {
+                            trimmed.to_string()
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Sorted token set of a raw name with no singularising: "Novak Labs" never
@@ -1023,6 +1064,17 @@ mod tests {
             ("C++", "c plus plus"),
             ("F#", "f sharp"),
             ("Node.js", "node js"),
+            // VERSIONS-V1: the version spelling folds to one key.
+            ("Postgres 16", "postgres 16"),
+            ("Postgres v16", "postgres 16"),
+            ("Postgres V16", "postgres 16"),
+            ("Postgres 016", "postgres 16"),
+            ("Node 18", "node 18"),
+            ("Node v18", "node 18"),
+            ("Kafka 03.012", "kafka 3 12"),
+            // A leading version word is part of the name, not a variant.
+            ("v2 API", "2 api"),
+            ("API v1", "api 1"),
         ] {
             assert_eq!(norm_name(input), want, "input {input:?}");
         }

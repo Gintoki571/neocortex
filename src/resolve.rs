@@ -468,7 +468,9 @@ pub(crate) fn near_name(
     }
     // H3-06: a version or number sibling is a different entity, not a near
     // name, so it is never reported as ambiguous and an exclusive slot ends it.
-    if number_siblings(a_norm, b_norm) {
+    // EX-07: a version label is also not ambiguous with its bare product name
+    // ("Postgres 14" vs "Postgres"/"PostgreSQL").
+    if number_siblings(a_norm, b_norm) || version_label_of_bare_head(a_norm, b_norm) {
         return Verdict::Below;
     }
     if text::name_blocker(a_norm, b_norm).is_some() {
@@ -512,6 +514,37 @@ pub(crate) fn number_siblings(a: &str, b: &str) -> bool {
     let only_a: Vec<&str> = ta.difference(&tb).copied().collect();
     let only_b: Vec<&str> = tb.difference(&ta).copied().collect();
     !only_a.is_empty() && !only_b.is_empty() && only_a.iter().chain(&only_b).all(|t| is_number(t))
+}
+
+/// EX-07: a name is a version label of the other when it is the other name
+/// plus a trailing run of version tokens ("Postgres 14" vs "Postgres"), or
+/// that bare head spelled as the same product ("PostgreSQL"). The pair is
+/// distinct and unflagged - a version is a different entity, not an ambiguous
+/// near name. A leading version token ("v2 API" vs "API") is not this pattern.
+fn version_label_of_bare_head(a: &str, b: &str) -> bool {
+    let head_without_versions = |s: &str| -> Option<String> {
+        let words: Vec<&str> = s.split_whitespace().collect();
+        let mut n = words.len();
+        while n > 0 && text::is_version_token(words[n - 1]) {
+            n -= 1;
+        }
+        (n > 0 && n < words.len()).then(|| words[..n].join(" "))
+    };
+    let (a_head, b_head) = (head_without_versions(a), head_without_versions(b));
+    match (a_head, b_head) {
+        (Some(head), None) => same_product(&head, b),
+        (None, Some(head)) => same_product(&head, a),
+        _ => false,
+    }
+}
+
+/// The label's head names the same product: the same words, or a one-word
+/// spelling close enough to be the same name ("Postgres"/"PostgreSQL").
+fn same_product(head: &str, bare: &str) -> bool {
+    head == bare
+        || (!head.contains(' ')
+            && !bare.contains(' ')
+            && text::jaro_winkler(&text::translit_norm(head), &text::translit_norm(bare)) >= 0.93)
 }
 
 /// ER-08: a name-layer `Merge` between typo-sized names is automatic only for
@@ -1049,12 +1082,7 @@ const ORG_TYPES: &[&str] = &[
 ];
 
 /// A person is never a container: "Paris Hilton" is not part of "Paris".
-const PERSON_TYPES: &[&str] = &["person", "people", "human"];
-
-/// True for a person entity type (the types that corroborate identity).
-pub(crate) fn is_person_type(kind: &str) -> bool {
-    PERSON_TYPES.contains(&kind)
-}
+pub(crate) const PERSON_TYPES: &[&str] = &["person", "people", "human"];
 
 /// Largest candidate pool for one containment lookup: a token shared by more
 /// entities is a hub and would only add noise.
@@ -1660,6 +1688,23 @@ mod tests {
         v[0] = cos;
         v[1] = (1.0 - cos * cos).sqrt();
         v
+    }
+
+    #[test]
+    fn version_label_of_a_bare_head_is_not_a_near_name() {
+        assert!(version_label_of_bare_head("postgres 14", "postgres"));
+        assert!(version_label_of_bare_head("postgres", "postgres 16"));
+        assert!(version_label_of_bare_head("postgres 14", "postgresql"));
+        assert!(version_label_of_bare_head("room 101", "room"));
+        // A leading version word is part of the name, not a label.
+        assert!(!version_label_of_bare_head("2 api", "api"));
+        // Two labels of the same head are number siblings, handled elsewhere.
+        assert!(!version_label_of_bare_head("postgres 14", "postgres 16"));
+        // A suffix word is a name, not a version token.
+        assert!(!version_label_of_bare_head(
+            "novak group north",
+            "novak group"
+        ));
     }
 
     #[test]

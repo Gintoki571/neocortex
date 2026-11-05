@@ -90,7 +90,7 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 |---|---|
 | `remember <content...>` | store a memory; flags below |
 | `recall <query...>` | retrieve memories, facts and entities |
-| `entity <name\|eID>` | profile (with its community), current/past facts and timeline of one entity; a first name several people share returns `status: ambiguous` and lists them all as `candidates` |
+| `entity <name\|eID>` | profile (with its community), current/past facts and timeline of one entity; a bare name shared by several homonyms returns `status: ambiguous` and lists up to 10 as `candidates` (`candidates_more` counts the rest) |
 | `invalidate <mID\|rID>` | end a memory or relation at a time, keeping it as history |
 | `forget <mID>` | retire a memory; its sole-evidence relations are retracted (`--hard` deletes it with vectors and mentions) |
 | `merge <keep> <merge>` | merge one entity into another (`--force` crosses types) |
@@ -334,6 +334,12 @@ also render the interval with a computed duration ("3 years 2 months",
   A one-edit short surname with no corroborating neighbour ("Jonas
   Webber"/"Jonas Weber") is reported as `ambiguous` too; pass `distinct_from`
   when they are different people, or `same_as` when it is one person's typo.
+- Version spellings: "Postgres 16", "Postgres v16" and "Postgres 016" are one
+  name (a leading `v` and leading zeros fold away). Different versions stay
+  different entities ("Postgres 14"/"16"), and a version is not ambiguous with
+  its bare product name ("Postgres", "PostgreSQL"). A slash-joined pair in
+  text ("Postgres 14/16 distinct") becomes the two version entities. A leading
+  version word is part of the name: "v2 API" is not "API".
 - Same name + conflicting description: the match keeps `ambiguous` status with
   a ranked candidate; neocortex never pastes one description over the other.
 - Same name among homonyms: a typed mention of a single match is a normal
