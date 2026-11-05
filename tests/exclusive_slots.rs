@@ -350,6 +350,33 @@ fn closed_history_never_retires_the_current_fact() {
     );
 }
 
+#[test]
+fn closed_history_does_not_apply_a_replacement_cue_to_current_use() {
+    let e = engine();
+    write(
+        &e,
+        "Atlas uses npm.",
+        None,
+        vec![rel("Atlas", "uses", "npm", true)],
+    );
+    let mut history = rel("Atlas", "uses", "Yarn", true);
+    history.valid_from = Some("2024-01-01".into());
+    history.valid_to = Some("2025-01-01".into());
+    e.remember(RememberInput {
+        content: "Atlas used Yarn from 2024 to 2025, replaced npm.".into(),
+        valid_from: Some("2024-01-01".into()),
+        valid_to: Some("2025-01-01".into()),
+        relations: vec![history],
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(current(&e, "Atlas", "use", "npm"));
+    assert_eq!(
+        valid_to(&e, "Atlas", "use", "yarn"),
+        Some(Some(epoch("2025-01-01")))
+    );
+}
+
 /// The same for an object-keyed slot: a dated past leadership does not end the
 /// current leader.
 #[test]

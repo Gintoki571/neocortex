@@ -1909,6 +1909,7 @@ fn write_prepared(
         let is_slot = !by_object || unique_object(&content, dst_name);
         if polarity == 1
             && is_slot
+            && valid_to.is_none()
             && relation.exclusive != Some(false)
             && (relation.exclusive == Some(true) || resolved.exclusive)
         {
@@ -2023,6 +2024,7 @@ fn write_prepared(
                     // sentence ("Ann lived in Rome in 2019") is history about
                     // the past and never retires what is true now (H3-02b).
                     let replaces = rf != now
+                        && valid_to.is_none()
                         && new_valid_to.is_none()
                         && (!says_past(&content, &value_old_norm)
                             || names_as_replaced(&content, &value_old_norm))
@@ -2180,7 +2182,7 @@ fn write_prepared(
     // relation the sentence names, or report candidates when the pair is
     // ambiguous. The relations this memory just evidenced are its own
     // assertion and are never retracted by its prose.
-    if duplicate_of.is_none() {
+    if duplicate_of.is_none() && valid_to.is_none() {
         crate::wtiming::begin(crate::wtiming::RETRACTIONS);
         let own: Vec<i64> = rel_results.iter().map(|r: &RelationResult| r.id).collect();
         let mut sink = RetractionSink {
