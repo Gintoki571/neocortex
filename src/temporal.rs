@@ -869,7 +869,14 @@ fn weekday_plural(tok: &str) -> bool {
 /// "previously", "before", "formerly", "history", "changed", "did ... use").
 pub fn history_intent(text: &str) -> bool {
     let lower = text.to_lowercase();
-    for phrase in ["used to", "in the past", "at first", "no longer"] {
+    for phrase in [
+        "used to",
+        "in the past",
+        "at first",
+        "no longer",
+        "former",
+        "formerly",
+    ] {
         if has_phrase(&lower, phrase) {
             return true;
         }
@@ -895,14 +902,60 @@ pub fn history_intent(text: &str) -> bool {
     let toks: Vec<&str> = toks.iter().map(|&(s, e)| &lower[s..e]).collect();
     for (i, tok) in toks.iter().enumerate() {
         if *tok == "did"
-            && toks[i + 1..(i + 6).min(toks.len())]
-                .iter()
-                .any(|t| *t == "use" || *t == "used")
+            && toks[i + 1..(i + 6).min(toks.len())].iter().any(|t| {
+                matches!(
+                    *t,
+                    "use" | "used" | "lead" | "manage" | "review" | "work" | "live"
+                )
+            })
         {
             return true;
         }
     }
-    false
+    past_state_intent(text)
+}
+
+/// Whether a question asks which value held before the current state.
+pub fn past_state_intent(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "used to",
+        "former",
+        "formerly",
+        "previously",
+        "before",
+        "in the past",
+    ]
+    .iter()
+    .any(|phrase| has_phrase(&lower, phrase))
+        || {
+            let toks = words(&lower);
+            toks.iter().enumerate().any(|(i, &(start, end))| {
+                &lower[start..end] == "led"
+                    && !toks.get(i + 1).is_some_and(|&(a, b)| &lower[a..b] == "by")
+            })
+        }
+        || {
+            let toks = words(&lower);
+            toks.iter().enumerate().any(|(i, &(start, end))| {
+                matches!(&lower[start..end], "was" | "were")
+                    && toks[i + 1..(i + 6).min(toks.len())]
+                        .iter()
+                        .any(|&(a, b)| &lower[a..b] == "when")
+            })
+        }
+        || {
+            let toks = words(&lower);
+            toks.iter().enumerate().any(|(i, &(start, end))| {
+                &lower[start..end] == "did"
+                    && toks[i + 1..(i + 6).min(toks.len())].iter().any(|&(a, b)| {
+                        matches!(
+                            &lower[a..b],
+                            "lead" | "manage" | "review" | "work" | "live" | "own" | "use"
+                        )
+                    })
+            })
+        }
 }
 
 /// YYYY-MM-DD in the clock's local offset.
@@ -1870,6 +1923,11 @@ mod tests {
             "did I use Postgres",
             "no longer working there",
             "not interested anymore",
+            "which trial did Tunde lead",
+            "the trial that Tunde led",
+            "who used to lead the trial",
+            "who is the former lead",
+            "who was leading when the trial ended",
         ] {
             assert!(history_intent(text), "history_intent({text:?})");
         }

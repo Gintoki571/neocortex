@@ -319,7 +319,7 @@ Record a change instead of a contradiction:
  "relations": [{"source": "Mom", "predicate": "lives in", "target": "Pune", "exclusive": true}]}
 ```
 
-Recall before deciding: `neocortex recall "what did we decide about storage" --history`
+Recall before deciding: `neocortex recall "what did we decide about storage" --history`. Past-state phrasing (for example, "who used to lead", "who formerly owned", or "the project I led") retrieves ended facts with their end dates; current-state questions continue to prefer live facts.
 
 Write absolute dates; neocortex resolves relative dates in the machine's local
 timezone (`NEOCORTEX_TZ` overrides it).

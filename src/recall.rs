@@ -1313,6 +1313,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let until = parse_bound(input.until.as_deref(), &clock)?;
     let window = temporal::find_window(&input.query, &clock);
     let history_query = temporal::history_intent(&input.query);
+    let past_state_query = temporal::past_state_intent(&input.query);
     // Planned memories stay out of current answers unless the question is
     // about plans, and an ordering/duration question is a history question:
     // it needs the ended intervals to compute an answer.
@@ -1949,8 +1950,11 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             if !history {
                 score *= engine.cfg.expired_penalty;
             } else if as_of.is_none() {
-                // "where did X live before": the past state is the answer.
-                score *= engine.cfg.history_boost;
+                score *= if past_state_query {
+                    engine.cfg.history_boost.max(4.0)
+                } else {
+                    engine.cfg.history_boost
+                };
             }
         }
         if window

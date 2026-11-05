@@ -164,6 +164,63 @@ fn h3_09_a_different_object_does_not_end_the_fact() {
     assert_eq!(relation_end(&e, rid), None);
 }
 
+// ------------------------------------------------------------- H3-13
+
+fn trial_handover(e: &Engine) {
+    e.remember(RememberInput {
+        content: "Tunde Kalu led the Harbor trial.".into(),
+        valid_from: Some("2026-01-10".into()),
+        entities: vec![person("Tunde Kalu"), project("Harbor trial")],
+        relations: vec![rel("Tunde Kalu", "led", "Harbor trial", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        content: "Amara Nwosu now leads the Harbor trial.".into(),
+        valid_from: Some("2026-02-10".into()),
+        entities: vec![person("Amara Nwosu"), project("Harbor trial")],
+        relations: vec![rel("Amara Nwosu", "leads", "Harbor trial", true)],
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+#[test]
+fn h3_13_past_slot_questions_retrieve_ended_memory_but_current_does_not() {
+    let e = engine();
+    trial_handover(&e);
+    for query in [
+        "which trial did Tunde Kalu lead",
+        "the trial that Tunde Kalu led",
+        "who used to lead the Harbor trial",
+        "who is the former lead of the Harbor trial",
+    ] {
+        let out = recall(&e, query);
+        assert_eq!(
+            out.memories.first().map(|m| m.id),
+            Some(1),
+            "{query}: {:?}",
+            out.memories
+        );
+        assert!(
+            out.facts.iter().any(|fact| fact.id == 1 && fact.ended),
+            "{query}: {:?}",
+            out.facts
+        );
+    }
+    let current = recall(&e, "who leads the Harbor trial");
+    assert_eq!(current.memories.first().map(|m| m.id), Some(2));
+    assert!(!current.facts.iter().any(|fact| fact.id == 1));
+}
+
+#[test]
+fn h3_13_negated_retraction_is_not_resurrected_as_live() {
+    let e = engine();
+    trial_handover(&e);
+    let out = recall(&e, "Tunde Kalu did not lead the Harbor trial");
+    assert!(!out.facts.iter().any(|fact| fact.id == 1 && !fact.ended));
+}
+
 // ------------------------------------------------------------- H3-11
 
 /// Atlas used npm, then switched to pnpm: the npm fact is ended. Eight other
