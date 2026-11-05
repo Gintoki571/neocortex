@@ -154,6 +154,92 @@ fn relation_prefilter_keeps_global_knn_for_anchorless_queries() {
     );
 }
 
+// Ensure the 800-cap + cosine>=0.5 filter does not drop the only relation
+// that answers a question, even when 850 newer relations crowd it out.
+#[test]
+fn relation_prefilter_cap_buried_answer() {
+    let _guard = TempDir::new("neocortex-verify-cap");
+    let mut e = Engine::open_in_memory(Arc::new(HashEmbedder)).unwrap();
+
+    // The one old answering relation, dated 2020 (the prefilter pool keeps
+    // the 800 newest incident relations, so this one falls out).
+    let answer = e
+        .remember(RememberInput {
+            content: "The qzibble toolchain decision is recorded.".into(),
+            entities: vec![entity("Atlas"), entity("Rust")],
+            relations: vec![RelationIn {
+                source: "Atlas".into(),
+                predicate: "uses".into(),
+                target: "Rust".into(),
+                fact: Some("Atlas uses Rust".into()),
+                ..Default::default()
+            }],
+            valid_from: Some("2020-01-01".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+
+    // 850 newer incident relations on the same anchor, none token-matching
+    // the question's content words except the shared "atlas".
+    for n in 0..850 {
+        e.remember(RememberInput {
+            content: format!("Build note {n}: pipeline segment {n} documented."),
+            entities: vec![entity("Atlas"), entity(&format!("Go{n}"))],
+            relations: vec![RelationIn {
+                source: "Atlas".into(),
+                predicate: "depends on".into(),
+                target: format!("Go{n}"),
+                fact: Some(format!("Atlas depends on Go{n}")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    let query = RecallInput {
+        query: "What does Atlas use?".into(),
+        ..Default::default()
+    };
+
+    let off = e.recall(&query).unwrap();
+    e.cfg.rel_prefilter = true;
+    let on = e.recall(&query).unwrap();
+
+    let fact_hit = |o: &neocortex::engine::RecallOutput| {
+        o.facts
+            .iter()
+            .any(|f| f.source == "Atlas" && f.target == "Rust")
+    };
+    eprintln!(
+        "off: answer memory in top-k = {}(Atlas->Rust fact = {})",
+        off.memories.iter().any(|m| m.id == answer),
+        fact_hit(&off)
+    );
+    eprintln!(
+        "on:  answer memory in top-k = {}(Atlas->Rust fact = {})",
+        on.memories.iter().any(|m| m.id == answer),
+        fact_hit(&on)
+    );
+    eprintln!(
+        "on.facts = {:?}",
+        on.facts
+            .iter()
+            .map(|f| (&f.source, &f.predicate, &f.target))
+            .collect::<Vec<_>>()
+    );
+
+    assert!(
+        fact_hit(&on),
+        "rel_prefilter dropped the only relation that answers the question"
+    );
+    assert!(
+        on.memories.iter().any(|m| m.id == answer),
+        "rel_prefilter dropped the answer memory from the context"
+    );
+}
+
 #[test]
 fn relation_prefilter_knob_parses_and_defaults_off() {
     let mut cfg = Config::default();
