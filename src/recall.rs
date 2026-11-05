@@ -2984,12 +2984,13 @@ pub(crate) fn resolve_entity(engine: &Engine, name: &str) -> Result<i64> {
 pub fn entity(engine: &Engine, name: &str, limit: usize) -> Result<EntityOutput> {
     let limit = limit.min(200);
     let id = resolve_entity(engine, name)?;
-    let homonyms = first_name_homonyms(engine, name)?;
-    let ambiguous = homonyms.len() >= 2;
-    let candidates = if ambiguous {
-        homonyms
+    let (homonyms, homonym_total) = first_name_homonyms(engine, name, id)?;
+    let ambiguous = homonym_total >= 2;
+    let (candidates, candidates_more) = if ambiguous {
+        let more = homonym_total.saturating_sub(homonyms.len());
+        (homonyms, (more > 0).then_some(more))
     } else {
-        entity_candidates(engine, name, id)?
+        (entity_candidates(engine, name, id)?, None)
     };
     let now = engine.clock().now;
     let mut card = card(engine, id)?;
@@ -3056,25 +3057,47 @@ pub fn entity(engine: &Engine, name: &str, limit: usize) -> Result<EntityOutput>
         past_facts: past.into_iter().take(limit).collect(),
         similar,
         candidates,
+        candidates_more,
         status: ambiguous.then(|| "ambiguous".to_string()),
         timeline,
     })
 }
 
-/// H2-13: every person entity whose first name is the bare `name` (`Maya` ->
-/// "Maya Chen", "Maya Lindqvist"), most-mentioned first. Empty for a multi-word
-/// name, which names one person.
-fn first_name_homonyms(engine: &Engine, name: &str) -> Result<Vec<EntityCandidate>> {
+/// H2-13/V2/V3: every entity the bare `name` can mean: the people whose first
+/// name it is, plus any entity named exactly that (a project or tool called
+/// "Jasmine" is a homonym of the people, not invisible). The resolved card
+/// `chosen` comes first, then the most-mentioned others, capped at
+/// `HOMONYM_LIMIT`; the count is the full total so the caller can say
+/// "and N more". Empty for a multi-word name, which names one entity.
+fn first_name_homonyms(
+    engine: &Engine,
+    name: &str,
+    chosen: i64,
+) -> Result<(Vec<EntityCandidate>, usize)> {
     let n = text::norm_name(name);
     if n.is_empty() || n.contains(' ') {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
-    let mut st = engine.db.sql().prepare(
-        "SELECT id, name, type, description FROM entities
-         WHERE norm=?1 OR substr(norm,1,length(?1)+1)=?1||' '
-         ORDER BY mention_count DESC, id LIMIT 50",
+    let persons = crate::resolve::PERSON_TYPES
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let filter = format!(
+        "(norm=?1 OR substr(norm,1,length(?1)+1)=?1||' ')
+         AND (norm=?1 OR type IN ({persons}))"
+    );
+    let total: i64 = engine.db.sql().query_row(
+        &format!("SELECT COUNT(*) FROM entities WHERE {filter}"),
+        [&n],
+        |r| r.get(0),
     )?;
-    let rows = st.query_map([&n], |r| {
+    let mut st = engine.db.sql().prepare(&format!(
+        "SELECT id, name, type, description FROM entities
+         WHERE {filter}
+         ORDER BY (id=?2) DESC, mention_count DESC, id LIMIT {HOMONYM_LIMIT}"
+    ))?;
+    let rows = st.query_map(rusqlite::params![&n, chosen], |r| {
         Ok(EntityCandidate {
             id: r.get(0)?,
             name: r.get(1)?,
@@ -3083,12 +3106,13 @@ fn first_name_homonyms(engine: &Engine, name: &str) -> Result<Vec<EntityCandidat
             score: None,
         })
     })?;
-    Ok(rows
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|c| crate::resolve::is_person_type(&c.kind))
-        .collect())
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((rows, usize::try_from(total).unwrap_or(0)))
 }
+
+/// V3: a very common first name lists too many homonyms; the card shows 10 and
+/// reports the rest as a count.
+const HOMONYM_LIMIT: usize = 10;
 
 /// H2-13: the other people a name can mean. A bare first name (`Maya`) or a
 /// name prefix (`Maya L`) that is not the exact alias of one entity matches

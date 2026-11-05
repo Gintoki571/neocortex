@@ -588,6 +588,10 @@ pub struct EntityOutput {
     /// name prefix that is not the exact alias of one entity (H2-13).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<EntityCandidate>,
+    /// V3: homonyms beyond the listed `candidates` (the list is capped at 10
+    /// for a very common first name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates_more: Option<usize>,
     /// "ambiguous" when a bare first name is shared by 2+ people (H2-13); the
     /// card is the best guess and `candidates` lists every one of them.
     #[serde(skip_serializing_if = "Option::is_none")]

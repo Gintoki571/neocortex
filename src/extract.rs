@@ -598,6 +598,26 @@ fn word_candidates(
                 k += 1;
             } else if is_number(w) && (k + 1 >= words.len() || !is_proper_word(words[k + 1].text)) {
                 last = k;
+                // EX-07: "Postgres 14/16" is two version siblings, one per
+                // version. Only a slash-joined pair after a span head: a
+                // fraction or date without a product name is not split.
+                if let Some(next) = words.get(k + 1) {
+                    // A common noun before the pair is a date or a fraction
+                    // ("Meeting 10/12"), not a product version.
+                    if is_number(next.text)
+                        && k > i
+                        && !is_common_noun(words[k - 1].text)
+                        && text[words[k].end..next.start] == *"/"
+                    {
+                        let head = &text[words[i].start..words[k - 1].end];
+                        cands.push(Candidate {
+                            name: format!("{head} {}", next.text),
+                            hint: "version",
+                            start: words[i].start,
+                            end: next.end,
+                        });
+                    }
+                }
                 break;
             } else {
                 break;
@@ -1551,6 +1571,33 @@ mod tests {
         let got = names("We visited Apt 3B.", &|_| false);
         assert!(got.contains(&"Apt 3B".to_string()), "{got:?}");
         assert!(!got.contains(&"Visited Apt".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn slash_joined_versions_split_after_a_product_name() {
+        // EX-07: "14/16" after a product name is two version siblings.
+        let got = names("Postgres 14/16 distinct", &|_| false);
+        assert!(got.contains(&"Postgres 14".to_string()), "{got:?}");
+        assert!(got.contains(&"Postgres 16".to_string()), "{got:?}");
+        assert!(!got.iter().any(|n| n.contains('/')), "{got:?}");
+        let got = names("We deploy Apache Kafka 3.6/3.7 tonight.", &|_| false);
+        assert!(got.contains(&"Apache Kafka 3.6".to_string()), "{got:?}");
+        assert!(got.contains(&"Apache Kafka 3.7".to_string()), "{got:?}");
+        // Fractions and dates keep their old behaviour: no product head, no
+        // split (a bare pair is not even a span; a common-noun head keeps the
+        // old "Meeting 10" span and gains no "Meeting 12").
+        for text in ["3/4 of the fleet", "on 10/12"] {
+            let got = names(text, &|_| false);
+            assert!(got.is_empty(), "{text:?}: {got:?}");
+        }
+        let got = names("Meeting 10/12 moved to Thursday.", &|_| false);
+        assert!(
+            !got.iter().any(|n| n.ends_with(" 12")),
+            "no split sibling: {got:?}"
+        );
+        // A slash the span loop already breaks on (no whitespace gap) is untouched.
+        let got = names("The Q3/4 report is ready.", &|_| false);
+        assert!(!got.iter().any(|n| n.contains(" 4")), "{got:?}");
     }
 
     #[test]

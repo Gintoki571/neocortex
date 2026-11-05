@@ -261,6 +261,171 @@ fn h3_06_controls_keep_labels_flagged_and_unique_names_resolved() {
     assert_eq!(resolution(&again, "Postgres").id, pg);
 }
 
+// VERSIONS-V1: "Postgres 16", "Postgres v16" and "Postgres 016" are the same
+// version in three spellings, so they resolve to one entity (alias), while
+// "Postgres 14"/"Postgres 16" stay distinct (H3-06).
+#[test]
+fn versions_v1_spelling_variants_are_one_entity() {
+    let e = engine();
+    let first = remember_named(
+        &e,
+        "Harbor stores raw events in Postgres 16.",
+        vec![org("Harbor"), tool("Postgres 16")],
+        vec![],
+    );
+    let pg = resolution(&first, "Postgres 16").id;
+    // Read side: the variant resolves before any write ever used it.
+    assert_eq!(e.entity("Postgres v16", 5).unwrap().card.id, pg);
+    for name in ["Postgres v16", "Postgres 016", "Postgres V16"] {
+        let out = remember_named(
+            &e,
+            &format!("Harbor benchmarked {name} on the reporting replica."),
+            vec![tool(name)],
+            vec![],
+        );
+        let res = resolution(&out, name);
+        assert_eq!(res.id, pg, "{name} must resolve to Postgres 16");
+        assert!(
+            res.status == "alias" || res.status == "matched",
+            "{name}: {res:?}"
+        );
+        assert!(res.candidates.is_empty(), "{name}: {res:?}");
+    }
+    let entities = sql_i64(
+        &e,
+        "SELECT COUNT(*) FROM entities WHERE norm IN ('postgres 16','postgres v16','postgres 016')",
+    );
+    assert_eq!(entities, Some(1), "one entity, not one per spelling");
+}
+
+#[test]
+fn versions_v1_controls_stay_distinct() {
+    let e = engine();
+    // Different versions stay different entities (and unflagged, H3-06).
+    remember_named(
+        &e,
+        "Ingest runs Python 3.12.",
+        vec![tool("Python 3.12")],
+        vec![],
+    );
+    let py = remember_named(
+        &e,
+        "API runs Python 3.13.",
+        vec![tool("Python 3.13")],
+        vec![],
+    );
+    let res = resolution(&py, "Python 3.13");
+    assert_eq!(res.status, "new", "{res:?}");
+    assert!(res.candidates.is_empty(), "{res:?}");
+
+    // Letter labels are unchanged: still flagged, still separate.
+    let apt = remember_named(&e, "Sam lives in Apt 3B.", vec![place("Apt 3B")], vec![]);
+    let apt_id = resolution(&apt, "Apt 3B").id;
+    let apt2 = remember_named(&e, "Lee lives in Apt 3C.", vec![place("Apt 3C")], vec![]);
+    let res = resolution(&apt2, "Apt 3C");
+    assert_eq!(res.status, "ambiguous", "{res:?}");
+    assert_ne!(res.id, apt_id);
+
+    // A "v" before a product name is not a version token: "v2 API" is not
+    // "API" (unchanged behaviour).
+    let api = remember_named(
+        &e,
+        "API is the public interface.",
+        vec![tool("API")],
+        vec![],
+    );
+    let api_id = resolution(&api, "API").id;
+    let v2 = remember_named(
+        &e,
+        "v2 API is the public interface.",
+        vec![tool("v2 API")],
+        vec![],
+    );
+    let res = resolution(&v2, "v2 API");
+    assert_ne!(res.id, api_id, "v2 API is a different name, not an alias");
+    // Unchanged: the pair is not near at all (JW 0), so it is a plain new
+    // entity, never merged and never flagged.
+    assert_eq!(res.status, "new", "{res:?}");
+    assert!(res.candidates.is_empty(), "{res:?}");
+
+    // "Node 18"/"Node v18" is the V1 case on another product.
+    let node = remember_named(&e, "Builds run on Node 18.", vec![tool("Node 18")], vec![]);
+    let node_id = resolution(&node, "Node 18").id;
+    let v18 = remember_named(
+        &e,
+        "Builds run on Node v18.",
+        vec![tool("Node v18")],
+        vec![],
+    );
+    assert_eq!(resolution(&v18, "Node v18").id, node_id);
+}
+
+// EX-07: a slash-joined version pair after a product name is two version
+// siblings ("Postgres 14" and "Postgres 16"). The dogfood ambiguity came from
+// the bare product card ("Postgres"/"PostgreSQL"), which a version label is
+// not near-merged with.
+#[test]
+fn ex07_slash_joined_versions_split_into_two_siblings() {
+    let e = engine();
+    let head = remember_named(
+        &e,
+        "Postgres is our main database.",
+        vec![tool("Postgres")],
+        vec![],
+    );
+    let head_id = resolution(&head, "Postgres").id;
+    let out = remember_named(&e, "Postgres 14/16 distinct", vec![], vec![]);
+    let names: Vec<&str> = out.entities.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        names.contains(&"Postgres 14"),
+        "first sibling missing: {names:?}"
+    );
+    assert!(
+        names.contains(&"Postgres 16"),
+        "second sibling missing: {names:?}"
+    );
+    for name in ["Postgres 14", "Postgres 16"] {
+        let res = resolution(&out, name);
+        assert_eq!(res.status, "new", "{name}: {res:?}");
+        assert!(res.candidates.is_empty(), "{name}: {res:?}");
+        assert_ne!(res.id, head_id, "{name} must not merge into Postgres");
+    }
+    assert_eq!(
+        sql_i64(&e, "SELECT COUNT(*) FROM entities"),
+        Some(3),
+        "{out:#?}"
+    );
+
+    // A differently spelled bare head is still a product, not a near name.
+    let f = engine();
+    remember_named(
+        &f,
+        "PostgreSQL is the production database.",
+        vec![tool("PostgreSQL")],
+        vec![],
+    );
+    let out = remember_named(&f, "Postgres 14/16 distinct", vec![], vec![]);
+    for name in ["Postgres 14", "Postgres 16"] {
+        let res = resolution(&out, name);
+        assert_eq!(res.status, "new", "{name}: {res:?}");
+        assert!(res.candidates.is_empty(), "{name}: {res:?}");
+    }
+}
+
+#[test]
+fn ex07_fractions_and_dates_are_not_split() {
+    let e = engine();
+    let out = remember_named(&e, "3/4 of the fleet was rebuilt on 10/12.", vec![], vec![]);
+    for r in &out.entities {
+        assert!(
+            !r.name.contains("3 4") && !r.name.contains("10 12"),
+            "a fraction/date must not become version siblings: {:#?}",
+            out.entities
+        );
+        assert!(!r.name.starts_with('3'), "{:#?}", out.entities);
+    }
+}
+
 #[test]
 fn er07_person_tokens_block_the_automatic_merge() {
     let e = engine();

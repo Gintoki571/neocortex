@@ -1530,6 +1530,72 @@ fn entity_lookup_of_a_shared_first_name_lists_the_other_person() {
 }
 
 #[test]
+fn entity_lookup_includes_a_non_person_card_named_like_the_token() {
+    let e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Jasmine is the analytics project.", |i| {
+        i.entities = vec![EntityIn {
+            name: "Jasmine".into(),
+            kind: Some("project".into()),
+            ..Default::default()
+        }];
+    });
+    remember(&e, "Jasmine Diaz leads the analytics project.", |i| {
+        i.entities = vec![EntityIn {
+            name: "Jasmine Diaz".into(),
+            kind: Some("person".into()),
+            ..Default::default()
+        }];
+    });
+    remember(&e, "Jasmine Court hosts the standup.", |i| {
+        i.entities = vec![EntityIn {
+            name: "Jasmine Court".into(),
+            kind: Some("place".into()),
+            ..Default::default()
+        }];
+    });
+    let out = e.entity("Jasmine", 10).unwrap();
+    assert_eq!(out.card.name, "Jasmine");
+    assert_eq!(out.status.as_deref(), Some("ambiguous"), "{out:#?}");
+    // V2: the non-person card named exactly like the token is listed, not
+    // only the people whose first name it is.
+    assert!(
+        out.candidates.iter().any(|c| c.id == out.card.id),
+        "{out:#?}"
+    );
+    assert!(out.candidates.iter().any(|c| c.name == "Jasmine Diaz"));
+    // A place that only starts with the token is a prefix match, not a homonym.
+    assert!(
+        !out.candidates.iter().any(|c| c.name == "Jasmine Court"),
+        "{out:#?}"
+    );
+}
+
+#[test]
+fn entity_lookup_caps_the_homonym_list_and_reports_the_rest() {
+    let e = engine(Arc::new(HashEmbedder));
+    for i in 0..12 {
+        remember(
+            &e,
+            &format!("Jasmine Person{i} works on pipeline {i}."),
+            |inp| {
+                inp.entities = vec![EntityIn {
+                    name: format!("Jasmine Person{i}"),
+                    kind: Some("person".into()),
+                    ..Default::default()
+                }];
+            },
+        );
+    }
+    let out = e.entity("Jasmine", 10).unwrap();
+    assert_eq!(out.status.as_deref(), Some("ambiguous"), "{out:#?}");
+    assert_eq!(out.candidates.len(), 10, "list is capped: {out:#?}");
+    assert_eq!(out.candidates_more, Some(2), "{out:#?}");
+    // The card itself stays in the capped list, so "the card included" holds
+    // even when it is not among the most-mentioned ten.
+    assert_eq!(out.candidates[0].id, out.card.id, "{out:#?}");
+}
+
+#[test]
 fn entity_lookup_of_a_unique_first_name_is_unflagged() {
     let e = engine(Arc::new(HashEmbedder));
     remember(&e, "Jun Park owns the billing service.", |i| {

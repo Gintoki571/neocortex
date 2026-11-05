@@ -58,6 +58,10 @@ Store something when it will still matter next week:
   entity; it splits off a new card). Real different people with the same name
   and type are separate entities: do not `merge_entities` them without
   checking the facts on both cards.
+- **Version spellings are one name**: "Postgres 16", "Postgres v16" and
+  "Postgres 016" resolve to one entity, while "Postgres 14" and "Postgres 16"
+  are different versions (and a version is not its bare product name). Text
+  like "Postgres 14/16" is stored as two version entities.
 - **Symbol names are names**: "C#", "C++", "F#" and "C" are distinct tool
   entities (normalised "c sharp", "c plus plus", "f sharp"); pass them exactly
   and never merge them. A database written before this rule may still hold them
@@ -242,10 +246,12 @@ When to use each:
 - `aggregate`: how-many, which-ones and list questions over one relation ("who
   works at Acme", "how many pets"). `source` or `target` fixes one end. Negated
   facts come back under `negative`, not in the count.
-- `entity`: everything known about one person, place or project. A bare first
-  name shared by several people returns the best card plus `candidates` (and an
-  `also:` line in text output) with `status: "ambiguous"`, listing every one
-  of them: ask again with the full name before answering about that person.
+- `entity`: everything known about one person, place or project. A bare name
+  shared by several homonyms (people with that first name, plus any entity
+  named exactly that) returns the best card plus `candidates` (an `also:` or
+  `ambiguous:` line in text output) with `status: "ambiguous"`, listing up to
+  10 of them and counting the rest in `candidates_more`: ask again with the
+  full name before answering about that person.
 - `overview`: orienting in an unfamiliar knowledge base, or `query` to see one
   topic's neighbourhood. Not a source of individual facts.
 - `invalidate`: a fact stopped being true at a time (`at`, default now). Prefer
