@@ -157,9 +157,10 @@ and `next:` when present.
 - `[1 of N current]` appears only on a single-valued predicate (seeded: lives
   in, works at, married to, reports to, ...; or one you flagged `exclusive:
   true`) when more than one value is still live. It means two facts disagree:
-  invalidate the stale one. Multi-valued predicates (uses, depends on, owns,
-  likes) never carry it; their several current values are ordinary. JSON has
-  the same count in `current_values`.
+  invalidate the stale one. Multi-valued predicates (uses, depends on, likes)
+  never carry it; their several current values are ordinary. `owns` and `leads`
+  are keyed on the object instead: a named repo has one owner, two people can
+  own a laptop. JSON has the same count in `current_values`.
 - `[planned]` / `[recurring]` mark a future plan or a rule; neither is a current
   fact. A range with `ended` is **history**: true then, not now. `retracted`
   means the source was forgotten, not that the fact stopped being true.

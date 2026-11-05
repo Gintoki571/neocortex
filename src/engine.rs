@@ -1307,34 +1307,77 @@ fn merge_duplicate_relations(db: &Db) -> Result<()> {
     Ok(())
 }
 
-/// Re-apply exclusive invalidation after a merge: per `(src, exclusive
-/// predicate)` the newest `valid_from` wins; older rows end where it starts.
-/// Equal starts keep the earlier-created row (the fact already established in
-/// the store - a re-asserted row keeps its original id) and system-retire the
-/// later one.
+fn unique_object_relation(db: &Db, relation: i64, name: &str) -> Result<bool> {
+    let mut st = db.sql().prepare(
+        "SELECT m.content
+         FROM relation_evidence re
+         JOIN memories m ON m.id=re.memory_id
+         WHERE re.relation_id=?1",
+    )?;
+    for content in st.query_map([relation], |r| r.get::<_, String>(0))? {
+        if crate::remember::unique_object(&content?, name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Re-apply exclusive invalidation after a merge, with the write path's slot
+/// key: one-owner predicates (`lead`, `own`) key on the object, every other
+/// exclusive predicate on the subject, and `use` is multi-valued so a merge
+/// (which has no text) never ends a tool. Per slot the newest `valid_from`
+/// wins; older rows end where it starts. Equal starts keep the earlier-created
+/// row (the fact already established in the store - a re-asserted row keeps its
+/// original id) and system-retire the later one.
 fn reapply_exclusivity(db: &Db, now: i64) -> Result<Vec<i64>> {
-    let groups: Vec<(i64, i64)> = {
+    type Live = (i64, i64, i64, i64, i64, String, String);
+    let rows: Vec<Live> = {
         let mut st = db.sql().prepare(
-            "SELECT r.src,r.predicate_id FROM relations r
+            "SELECT r.id,r.src,r.dst,r.valid_from,COALESCE(NULLIF(p.group_id,0),p.id),
+                    p.canonical,ed.name
+             FROM relations r
              JOIN predicates p ON p.id=r.predicate_id
-             WHERE p.exclusive<>0 AND r.expired_at IS NULL AND r.valid_to IS NULL
-             GROUP BY r.src,r.predicate_id HAVING count(*)>1",
+             JOIN entities ed ON ed.id=r.dst
+             WHERE p.exclusive<>0 AND r.polarity=1
+               AND r.expired_at IS NULL AND r.valid_to IS NULL",
         )?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })?;
         rows.collect::<rusqlite::Result<_>>()?
     };
+    let mut slots: std::collections::BTreeMap<(i64, i64), Vec<(i64, i64)>> =
+        std::collections::BTreeMap::new();
+    for (id, src, dst, from, group, canonical, dst_name) in rows {
+        // `use` is multi-valued and its replacement gate is the write's text.
+        if canonical == "use" {
+            continue;
+        }
+        let by_object = crate::remember::object_keyed(&canonical);
+        // `lead` is always one-owner-per-object. `own` follows the write path:
+        // only evidence that names a unique object creates a slot; generic
+        // objects such as "a laptop" remain multi-owner.
+        if by_object && canonical == "own" && !unique_object_relation(db, id, &dst_name)? {
+            continue;
+        }
+        let key = if by_object { dst } else { src };
+        slots.entry((key, group)).or_default().push((id, from));
+    }
     let mut invalidated = Vec::new();
-    for (src, pid) in groups {
-        let rows: Vec<(i64, i64)> = {
-            let mut st = db.sql().prepare(
-                "SELECT id,valid_from FROM relations
-                 WHERE src=?1 AND predicate_id=?2
-                   AND expired_at IS NULL AND valid_to IS NULL
-                 ORDER BY valid_from DESC, id ASC",
-            )?;
-            let rows = st.query_map(rusqlite::params![src, pid], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
+    for rows in slots.values() {
+        if rows.len() < 2 {
+            continue;
+        }
+        let mut rows = rows.clone();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let (winner, newest) = rows[0];
         for (rid, from) in &rows[1..] {
             if *from == newest {
