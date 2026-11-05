@@ -615,6 +615,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "vec_prefilter",
     "vec_prefilter_n",
     "correction_hints",
+    "rel_prefilter",
 ];
 
 fn boolean(key: &str, value: &str) -> Result<bool> {
@@ -687,6 +688,7 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         }
         "vec_prefilter_n" => cfg.vec_prefilter_n = number(key, value)?.max(1.0) as usize,
         "correction_hints" => cfg.correction_hints = boolean(key, value)?,
+        "rel_prefilter" => cfg.rel_prefilter = boolean(key, value)?,
         other => {
             return Err(crate::err!(
                 "unknown config key '{other}'; valid: {}",

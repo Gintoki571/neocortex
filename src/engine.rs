@@ -166,6 +166,12 @@ pub struct Config {
     /// text corrects (`possible_supersedes`) and `recall` marks them. Proposes
     /// only; nothing is ended. Off: no output changes.
     pub correction_hints: bool,
+    /// Relation-fact seed prefilter: when the question names entities, take
+    /// the relation-vector seeds from the live relations incident to the first
+    /// 20 anchors (indexed `src`/`dst` reads) instead of the global
+    /// `relations_vec` KNN. Anchor-less questions keep the global KNN. Off by
+    /// default: measured in `docs/research/scale.md`.
+    pub rel_prefilter: bool,
 }
 
 impl Default for Config {
@@ -217,6 +223,7 @@ impl Default for Config {
             vec_prefilter: "off".to_string(),
             vec_prefilter_n: 10,
             correction_hints: false,
+            rel_prefilter: false,
         }
     }
 }

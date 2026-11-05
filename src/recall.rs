@@ -599,7 +599,16 @@ struct RelationSeedOptions<'a> {
     query_entities: &'a HashSet<i64>,
     fact_entity_boost: f64,
     fact_memory_seed: f64,
+    /// Restrict the relation-vector arm to relations incident to the question
+    /// anchors (`Config.rel_prefilter`).
+    prefilter: bool,
 }
+
+/// Anchors whose incident relations the prefilter may read, and the upper
+/// bound on that relation set (a hub anchor would otherwise cost more than the
+/// global KNN).
+const REL_PREFILTER_SEEDS: usize = 20;
+const REL_PREFILTER_CAP: usize = 800;
 
 #[allow(clippy::too_many_arguments)]
 fn relation_seeds_with_config(
@@ -654,7 +663,55 @@ fn relation_seeds_with_config(
             add(*relation_id, *src, *dst, score)?;
         }
     }
-    {
+    if options.prefilter && !options.query_entities.is_empty() {
+        // The question names entities, so the relation-fact seeds live on
+        // their incident relations. Point-read the vector of each (bounded)
+        // incident relation instead of scanning the whole `relations_vec`.
+        let mut seeds: Vec<i64> = options.query_entities.iter().copied().collect();
+        seeds.sort_unstable();
+        seeds.truncate(REL_PREFILTER_SEEDS);
+        let marks = std::iter::repeat_n("?", seeds.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id,src,dst,valid_from,valid_to,expired_at FROM relations
+             WHERE (src IN ({marks}) OR dst IN ({marks}))
+             ORDER BY valid_from DESC, id DESC LIMIT {REL_PREFILTER_CAP}"
+        );
+        let mut st = db.sql().prepare(&sql)?;
+        let mut rows = st.query(params_from_iter(seeds.iter().chain(seeds.iter())))?;
+        let mut vector_st = db
+            .sql()
+            .prepare_cached("SELECT embedding FROM relations_vec WHERE rowid=?1")?;
+        let mut scored: Vec<(i64, i64, i64, f32)> = Vec::new();
+        while let Some(r) = rows.next()? {
+            let id: i64 = r.get(0)?;
+            let src: i64 = r.get(1)?;
+            let dst: i64 = r.get(2)?;
+            let vf: i64 = r.get(3)?;
+            let vt: Option<i64> = r.get(4)?;
+            let expired: Option<i64> = r.get(5)?;
+            if !relation_visible(vf, vt, expired, now, history, as_of) {
+                continue;
+            }
+            let Some(v) = vector_st
+                .query_row([id], |r| r.get::<_, Vec<u8>>(0))
+                .optional()?
+                .and_then(|blob| db.blob_to_vec(&blob))
+            else {
+                continue;
+            };
+            let cosine = rank::cosine(query_vec, &v);
+            if cosine >= 0.5 {
+                scored.push((id, src, dst, cosine));
+            }
+        }
+        scored.sort_by(|a, b| b.3.total_cmp(&a.3).then(a.0.cmp(&b.0)));
+        scored.truncate(10);
+        for (id, src, dst, cosine) in scored {
+            add(id, src, dst, f64::from(cosine) * 0.5)?;
+        }
+    } else {
         let mut st = db.sql().prepare(&format!(
             "SELECT rowid,1-distance FROM relations_vec
              WHERE embedding MATCH {} AND k=10 ORDER BY distance",
@@ -1482,6 +1539,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             query_entities: &query_alias_entities,
             fact_entity_boost: engine.cfg.fact_entity_boost,
             fact_memory_seed: engine.cfg.fact_memory_seed,
+            prefilter: engine.cfg.rel_prefilter,
         },
     )?;
     let relation_support = !relation_entities.is_empty() || !relation_memories.is_empty();
