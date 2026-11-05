@@ -138,6 +138,9 @@ pub struct Config {
     /// it beats the best chain with another terminal by this score margin.
     /// Infinity (default) = off: measured +1 mh2 query at 0, no gain on a blind set.
     pub prose_margin: f64,
+    /// Pull up to two answer-typed relations from returned bridge entities.
+    /// Off by default because this is an experimental retrieval channel.
+    pub bridge_pull: bool,
     /// Rerank the top N fused memory candidates with the cross-encoder
     /// (0 = off). Without a model directory `recall` ignores it.
     pub rerank_top: usize,
@@ -206,6 +209,7 @@ impl Default for Config {
             update_candidate: 0.75,
             hop_scorer: "off".to_string(),
             prose_margin: f64::INFINITY,
+            bridge_pull: false,
             rerank_top: 0,
             w_rerank: 0.5,
             hint_tau: 0.40,

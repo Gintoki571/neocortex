@@ -827,6 +827,188 @@ fn wh_frame(query: &str, anchors: &HashSet<String>) -> Option<WhFrame> {
     })
 }
 
+fn bridge_answer_type(query: &str) -> Option<&'static str> {
+    let words = text::tokens(query);
+    if words.iter().any(|w| w == "who" || w == "whom") {
+        return Some("person");
+    }
+    if words.iter().any(|w| {
+        matches!(
+            w.as_str(),
+            "where" | "city" | "town" | "country" | "place" | "location"
+        )
+    }) {
+        return Some("place");
+    }
+    if words
+        .iter()
+        .any(|w| matches!(w.as_str(), "company" | "organization" | "org"))
+    {
+        return Some("org");
+    }
+    if words
+        .iter()
+        .any(|w| matches!(w.as_str(), "language" | "tool" | "framework" | "database"))
+    {
+        return Some("tool");
+    }
+    None
+}
+
+/// Pull the answer-typed edge of a small set of returned bridge entities.
+/// This deliberately bypasses relation KNN: the bridge is already grounded
+/// by a returned memory, while the terminal predicate may be paraphrased.
+#[allow(clippy::too_many_arguments)]
+fn bridge_pull_facts(
+    engine: &Engine,
+    query: &str,
+    query_vec: &[f32],
+    chains: &[paths::PathHit],
+    memories: &[MemoryHit],
+    anchors: &HashSet<i64>,
+    cutoff: i64,
+    existing: &HashSet<i64>,
+) -> Result<(Vec<FactHit>, Vec<i64>)> {
+    let Some(answer_type) = bridge_answer_type(query) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut bridges = Vec::new();
+    for chain in chains {
+        if let Some(step) = chain.steps.last() {
+            let id = step_end(step);
+            if !anchors.contains(&id) && !bridges.contains(&id) {
+                bridges.push(id);
+            }
+        }
+    }
+    for memory in memories.iter().take(5) {
+        let mut st = engine
+            .db
+            .sql()
+            .prepare("SELECT entity_id FROM mentions WHERE memory_id=?1")?;
+        for id in st.query_map([memory.id], |r| r.get::<_, i64>(0))? {
+            let id = id?;
+            if !anchors.contains(&id) && !bridges.contains(&id) {
+                bridges.push(id);
+            }
+        }
+    }
+    bridges.truncate(3);
+    if bridges.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut degree = Vec::new();
+    let mut st = engine.db.sql().prepare(
+        "SELECT entity_id,COUNT(*) FROM (
+             SELECT src AS entity_id FROM relations
+             WHERE expired_at IS NULL AND (valid_to IS NULL OR valid_to>?1)
+             UNION ALL
+             SELECT dst AS entity_id FROM relations
+             WHERE expired_at IS NULL AND (valid_to IS NULL OR valid_to>?1)
+         ) GROUP BY entity_id",
+    )?;
+    for row in st.query_map([cutoff], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as usize))
+    })? {
+        degree.push(row?);
+    }
+    degree.sort_by_key(|(_, count)| *count);
+    let p99 = degree
+        .get((degree.len() * 99).div_ceil(100).saturating_sub(1))
+        .map(|(_, count)| *count)
+        .unwrap_or(usize::MAX);
+
+    let query_words: HashSet<String> = text::tokens(query).into_iter().collect();
+    let mut ranked: Vec<(usize, f64, i64, i64)> = Vec::new();
+    let mut already_present = 0;
+    for bridge in bridges {
+        let count = degree
+            .iter()
+            .find_map(|(id, count)| (*id == bridge).then_some(*count))
+            .unwrap_or(0);
+        if count > p99 {
+            continue;
+        }
+        let mut st = engine.db.sql().prepare(
+            "SELECT r.id,
+                    COALESCE(NULLIF(r.predicate_text,''),NULLIF(p.display,''),p.canonical),
+                    r.valid_from
+             FROM relations r
+             JOIN predicates p ON p.id=r.predicate_id
+             JOIN entities s ON s.id=r.src
+             JOIN entities d ON d.id=r.dst
+             WHERE r.polarity=1 AND r.expired_at IS NULL
+               AND (r.valid_to IS NULL OR r.valid_to>?1) AND r.valid_from<=?1
+               AND ((r.src=?2 AND d.type=?3) OR (r.dst=?2 AND s.type=?3))
+             ORDER BY r.valid_from DESC LIMIT 2",
+        )?;
+        for row in st.query_map(params![cutoff, bridge, answer_type], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (id, predicate, valid_from) = row?;
+            if existing.contains(&id) {
+                already_present += 1;
+                continue;
+            }
+            let overlap = text::tokens(&predicate)
+                .into_iter()
+                .filter(|word| query_words.contains(word))
+                .count();
+            let cosine = engine
+                .db
+                .sql()
+                .query_row(
+                    "SELECT embedding FROM relations_vec WHERE rowid=?1",
+                    [id],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .ok()
+                .and_then(|blob| engine.db.blob_to_vec(&blob))
+                .map(|vec| f64::from(rank::cosine(query_vec, &vec)))
+                .unwrap_or(0.0);
+            ranked.push((overlap, cosine, valid_from, id));
+        }
+    }
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.total_cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
+    let ids: Vec<i64> = ranked.into_iter().take(2).map(|(_, _, _, id)| id).collect();
+    let facts = paths::facts_by_ids(&engine.db, &ids, cutoff, 2)?;
+    let mut evidence = Vec::new();
+    for id in &ids {
+        if let Some(memory_id) = engine
+            .db
+            .sql()
+            .query_row(
+                "SELECT memory_id FROM relation_evidence WHERE relation_id=?1
+                 ORDER BY memory_id DESC LIMIT 1",
+                [id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            evidence.push(memory_id);
+        }
+    }
+    if std::env::var_os("NEOCORTEX_DEBUG_FACTS").is_some() {
+        eprintln!(
+            "bridge_pull pulled={} kept={} already-present={}",
+            ids.len(),
+            facts.len(),
+            already_present
+        );
+    }
+    Ok((facts, evidence))
+}
+
 fn step_end(step: &paths::Step) -> i64 {
     if step.memory.is_some() {
         if step.dst < 1 {
@@ -1945,23 +2127,74 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // The last hop of the best paths is often the only place the answer
     // appears ("Liam Vijappa lives in Denver"), and that relation belongs to an
     // entity the neighbourhood search never reached. Render it explicitly.
+    let existing_facts: HashSet<i64> = facts.iter().map(|fact| fact.id).collect();
+    let (pulled, evidence_ids) = if engine.cfg.bridge_pull && !negated {
+        bridge_pull_facts(
+            engine,
+            &query_text,
+            &query_vec,
+            &top_chains,
+            &memories,
+            &query_alias_entities,
+            cutoff,
+            &existing_facts,
+        )?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    if !evidence_ids.is_empty() {
+        let rows_to_add = fetch_rows(&engine.db, &evidence_ids)?;
+        for id in evidence_ids {
+            if let Some(memory) = memories.iter_mut().find(|memory| memory.id == id) {
+                if !memory.reasons.iter().any(|reason| reason == "bridge#1") {
+                    memory.reasons.push("bridge#1".into());
+                }
+                continue;
+            }
+            let Some(row) = rows_to_add.get(&id) else {
+                continue;
+            };
+            if !eligible(row, as_of, history, input, since, until, now, planned_ok) {
+                continue;
+            }
+            memories.push(MemoryHit {
+                id,
+                kind: row.2.clone(),
+                content: row.1.clone(),
+                valid_from: row.9,
+                valid_to: row.10,
+                ended: is_ended(row, cutoff),
+                superseded_by: row.12,
+                tags: row.3.split_whitespace().map(str::to_string).collect(),
+                score: 0.0,
+                reasons: vec!["bridge#1".into()],
+                duration: None,
+                maybe_superseded_by: None,
+            });
+        }
+    }
     let mut facts = if negated {
         facts
             .into_iter()
             .filter(|fact| fact.polarity == 0 || paths::has_negation_cue(&fact.fact))
             .collect()
-    } else if top_chains.is_empty() {
-        facts
     } else {
-        let prose = paths::prose_facts(&engine.db, &sem_hits, engine.cfg.prose_margin, cutoff)?
-            .into_iter()
-            .filter(|fact| {
-                rows.get(&fact.id).is_some_and(|row| {
-                    eligible(row, as_of, history, input, since, until, now, planned_ok)
-                })
-            });
-        let mut merged: Vec<FactHit> = prose.collect();
-        merged.extend(paths::facts(&engine.db, &top_chains, cutoff, 8)?);
+        let mut merged = pulled;
+        if !top_chains.is_empty() {
+            let prose = paths::prose_facts(&engine.db, &sem_hits, engine.cfg.prose_margin, cutoff)?
+                .into_iter()
+                .filter(|fact| {
+                    rows.get(&fact.id).is_some_and(|row| {
+                        eligible(row, as_of, history, input, since, until, now, planned_ok)
+                    })
+                });
+            merged.extend(prose);
+            for fact in paths::facts(&engine.db, &top_chains, cutoff, 8)? {
+                if !merged.iter().any(|existing| existing.id == fact.id) {
+                    merged.push(fact);
+                }
+            }
+        }
         for fact in facts {
             if !merged.iter().any(|x| x.id == fact.id && !x.memory) {
                 merged.push(fact);
