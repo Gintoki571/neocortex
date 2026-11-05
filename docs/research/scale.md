@@ -583,6 +583,52 @@ small gate sets (fixtures p50 179 vs 71 ms, holdout 126 vs 73 ms, world-300 235 
 flip criterion (equal-or-better acc@10 on every set AND a p50 gain holding across all rounds) is
 not met. The knob stays opt-in via `eval --set rel_prefilter=on`; the default stays off.
 
+## 8. Memory KNN Prefilter Scale Evaluation (nc-bitscale2, 2026-11-05)
+
+Does the sign-bit prefilter (`Config.vec_prefilter = "bit"`, keeping derived `memories_bits`
+with Hamming top-N candidates and exact vector rerank) justify becoming the default at scale?
+Measurement lane nc-bitscale2 evaluated 3 paired interleaved rounds (off, bit, off, bit, ...)
+at 108,667 memories (real UltraBERT-150M model, int8 vectors, world-10000.json) and 293,305
+memories (hash embedder, int8 vectors, world-293k.json) on 1 core (`taskset -c 0`, 600 queries):
+
+### 108k (Real model, UltraBERT-150M)
+
+- One-off table build: DB 261.32 -> 274.80 MB (+13.49 MB, +5.16%, ~130 B/memory).
+- Accuracy: **100% identical** across all 600 queries and all categories (acc@10 1.000,
+  recall 0.972, MRR 0.861).
+- 1-core p50 latency across 3 paired rounds:
+  - Round 1: 601.08 -> 444.63 ms (-26.0%)
+  - Round 2: 477.43 -> 419.33 ms (-12.2%)
+  - Round 3: 523.49 -> 428.09 ms (-18.2%)
+  - Mean p50: 534.00 -> 430.68 ms (-19.3%). Peak RSS ~763 MiB flat.
+
+### 293k (Hash embedder, NEOCORTEX_EMBEDDER=hash)
+
+- One-off table build: DB 728.48 -> 764.68 MB (+36.20 MB, +4.97%, ~129 B/memory).
+- Accuracy: **Regresses** under sign-bit quantization:
+  - Overall: acc@10 0.838 -> 0.810 (-0.028), recall 0.764 -> 0.759, MRR 0.577 -> 0.568.
+  - Regressions: temporal-window 0.850 -> 0.650 (-0.200), history 0.641 -> 0.449 (-0.192),
+    aggregation 0.817 -> 0.750 (-0.067).
+  - Cause: hash embedder vectors are non-negative and sparse; binary sign quantization maps
+    positive coordinates to 1, losing cosine angle fidelity and dropping candidate recall.
+- 1-core p50 latency across 3 paired rounds:
+  - Round 1: 1050.70 -> 876.38 ms (-16.6%)
+  - Round 2: 1170.97 -> 791.83 ms (-32.4%)
+  - Round 3: 1045.54 -> 816.91 ms (-21.9%)
+  - Mean p50: 1089.07 -> 828.37 ms (-23.9%). Peak RSS ~438 MiB flat.
+
+### Recommendation
+
+**Keep `vec_prefilter` default as `off`**. While `bit` consistently cuts p50 latency by 12-26%
+at 108k and 16-32% at 293k, it breaks accuracy on hash-embedder databases (acc@10 0.838 -> 0.810).
+The knob should remain opt-in (`--set vec_prefilter=bit` or `NEOCORTEX_VEC_PREFILTER=bit`)
+specifically for real-model deployments where accuracy is invariant.
+```
+
+---
+
+Orchestrator note: real-model deployments are the case that matters (identical accuracy, -19% p50 at 108k); the hash-embedder loss comes from sign bits on non-negative sparse vectors. A real-model-only default needs a real-model 293k DB first (open item BIT-DEFAULT).
+
 ## Reproduce
 
 ```bash
