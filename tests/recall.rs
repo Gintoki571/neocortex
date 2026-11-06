@@ -2616,3 +2616,184 @@ fn a_why_question_without_causes_is_unchanged() {
     assert_eq!(ids(&on), ids(&base));
     assert!(on.facts.iter().all(|f| f.source != "retry storm"));
 }
+
+/// Reverse-hop fixture: the question's answer frame is `where` (a place), the
+/// bridge "Mira" is returned by the lexical channel, and the terminal
+/// relation "studied at" is paraphrase-free but ranked nowhere by the forward
+/// channels because the answer memory shares no word with the question.
+fn rev_hop_fixture() -> Engine {
+    let mut e = engine(Arc::new(HashEmbedder));
+    e.cfg.w_retention = 0.0;
+    e.cfg.w_sempath = 0.0;
+    remember(&e, "Noor Haddad mentors under Mira Lindqvist.", |i| {
+        i.entities = vec![
+            EntityIn {
+                name: "Noor Haddad".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Mira Lindqvist".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+        ];
+        i.relations = vec![relation(
+            "Mira Lindqvist",
+            "mentors",
+            "Noor Haddad",
+            "Mira Lindqvist mentors Noor Haddad",
+        )];
+    });
+    remember(&e, "Mira Lindqvist studied at Kestrel Polytechnic.", |i| {
+        i.entities = vec![
+            EntityIn {
+                name: "Mira Lindqvist".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Kestrel Polytechnic".into(),
+                kind: Some("organization".into()),
+                ..Default::default()
+            },
+        ];
+        i.relations = vec![relation(
+            "Mira Lindqvist",
+            "studied at",
+            "Kestrel Polytechnic",
+            "Mira Lindqvist studied at Kestrel Polytechnic",
+        )];
+    });
+    // Unrelated padding so the terminal memory is not trivially first.
+    for n in 0..6 {
+        remember(&e, &format!("Routine note {n} about scheduling."), |_| {});
+    }
+    e
+}
+
+fn rev_hop_query() -> RecallInput {
+    RecallInput {
+        query: "Where did the engineer who guides Noor's early career get schooled?".into(),
+        k: Some(3),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn rev_hop_default_is_off() {
+    let e = engine(Arc::new(HashEmbedder));
+    assert!(!e.cfg.rev_hop, "Config::default().rev_hop should be off");
+    let mut cfg = Config::default();
+    neocortex::eval::set_config(&mut cfg, "rev_hop", "on").unwrap();
+    assert!(cfg.rev_hop);
+    neocortex::eval::set_config(&mut cfg, "rev_hop", "off").unwrap();
+    assert!(!cfg.rev_hop);
+    assert!(neocortex::eval::set_config(&mut cfg, "rev_hop", "maybe").is_err());
+}
+
+#[test]
+fn rev_hop_reaches_a_terminal_fact_the_forward_channels_miss() {
+    let mut e = rev_hop_fixture();
+    e.cfg.rev_hop = false;
+    let off = e.recall(&rev_hop_query()).unwrap();
+    e.cfg.rev_hop = true;
+    let on = e.recall(&rev_hop_query()).unwrap();
+    let reached = |o: &RecallOutput| {
+        o.facts
+            .iter()
+            .any(|fact| fact.target == "Kestrel Polytechnic")
+            || o.memories
+                .iter()
+                .any(|m| m.content.contains("Kestrel Polytechnic"))
+    };
+    eprintln!(
+        "off facts={:?}",
+        off.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "on facts={:?}",
+        on.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+    assert!(
+        reached(&on),
+        "rev_hop should reach the terminal relation: {:?}",
+        on.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rev_hop_off_is_byte_identical() {
+    let mut e = rev_hop_fixture();
+    e.cfg.rev_hop = false;
+    let a = e.recall(&rev_hop_query()).unwrap();
+    let b = e.recall(&rev_hop_query()).unwrap();
+    assert_eq!(
+        serde_json::to_string(&a).unwrap(),
+        serde_json::to_string(&b).unwrap()
+    );
+}
+
+#[test]
+fn rev_hop_caps_facts_and_never_floods_from_a_hub() {
+    const REV_HUB: usize = 200;
+    let mut e = engine(Arc::new(HashEmbedder));
+    e.cfg.w_retention = 0.0;
+    e.cfg.w_sempath = 0.0;
+    // The anchor entity is a hub: 250 live relations to places.
+    remember(&e, "Noor Haddad is on the staff.", |i| {
+        i.entities = vec![EntityIn {
+            name: "Noor Haddad".into(),
+            kind: Some("person".into()),
+            ..Default::default()
+        }];
+    });
+    for n in 0..250 {
+        let place = format!("Town{n}");
+        remember(&e, &format!("Noor Haddad visited {place}."), |i| {
+            i.entities = vec![
+                EntityIn {
+                    name: "Noor Haddad".into(),
+                    kind: Some("person".into()),
+                    ..Default::default()
+                },
+                EntityIn {
+                    name: place.clone(),
+                    kind: Some("place".into()),
+                    ..Default::default()
+                },
+            ];
+            i.relations = vec![relation(
+                "Noor Haddad",
+                "visited",
+                &place,
+                &format!("Noor Haddad visited {place}"),
+            )];
+        });
+    }
+    let query = RecallInput {
+        query: "Where did Noor Haddad travel?".into(),
+        k: Some(5),
+        ..Default::default()
+    };
+    e.cfg.rev_hop = false;
+    let off: Vec<i64> = e
+        .recall(&query)
+        .unwrap()
+        .facts
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    e.cfg.rev_hop = true;
+    let out = e.recall(&query).unwrap();
+    assert!(
+        out.facts.len() <= 8,
+        "rev_hop must keep the fact list capped: {}",
+        out.facts.len()
+    );
+    let added = out.facts.iter().filter(|f| !off.contains(&f.id)).count();
+    assert!(
+        added == 0,
+        "a hub bridge (> {REV_HUB} relations) must not contribute candidates, {added} added"
+    );
+}

@@ -141,6 +141,11 @@ pub struct Config {
     /// Pull up to two answer-typed relations from returned bridge entities.
     /// Off by default because this is an experimental retrieval channel.
     pub bridge_pull: bool,
+    /// Reverse-hop answer-type pull: read only the answer frame (`where`,
+    /// `who`, `which company`), then walk back from the returned bridge
+    /// entities over live relations whose far end has the asked type, and
+    /// merge at most two of those facts. Off by default: experimental.
+    pub rev_hop: bool,
     /// Rerank the top N fused memory candidates with the cross-encoder
     /// (0 = off). Without a model directory `recall` ignores it.
     pub rerank_top: usize,
@@ -216,6 +221,7 @@ impl Default for Config {
             hop_scorer: "off".to_string(),
             prose_margin: f64::INFINITY,
             bridge_pull: true,
+            rev_hop: false,
             rerank_top: 0,
             w_rerank: 0.5,
             hint_tau: 0.40,

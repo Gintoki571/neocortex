@@ -585,6 +585,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "w_sempath",
     "prose_margin",
     "bridge_pull",
+    "rev_hop",
     "name_part_hop",
     "rrf_k",
     "alpha",
@@ -644,6 +645,7 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "w_sempath" => cfg.w_sempath = number(key, value)?,
         "prose_margin" => cfg.prose_margin = number(key, value)?,
         "bridge_pull" => cfg.bridge_pull = boolean(key, value)?,
+        "rev_hop" => cfg.rev_hop = boolean(key, value)?,
         "name_part_hop" => cfg.name_part_hop = number(key, value)?,
         "hop_scorer" => cfg.hop_scorer = value.to_string(),
         "anchor_tiers" => {
