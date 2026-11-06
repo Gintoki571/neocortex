@@ -794,6 +794,9 @@ fn cmd_eval(globals: &Globals, args: &[String]) -> CmdResult {
             "--load-db" => {
                 opts.load_db = Some(PathBuf::from(value(args, &mut i, "--load-db")?));
             }
+            "--haystack" => {
+                opts.haystack = Some(PathBuf::from(value(args, &mut i, "--haystack")?));
+            }
             other if other.starts_with("--set=") => {
                 sets.push(other["--set=".len()..].to_string());
             }
@@ -813,12 +816,18 @@ fn cmd_eval(globals: &Globals, args: &[String]) -> CmdResult {
             other if other.starts_with("--load-db=") => {
                 opts.load_db = Some(PathBuf::from(&other["--load-db=".len()..]));
             }
+            other if other.starts_with("--haystack=") => {
+                opts.haystack = Some(PathBuf::from(&other["--haystack=".len()..]));
+            }
             other => return Err(usage(format!("unknown eval flag: {other}"))),
         }
         i += 1;
     }
     if opts.save_db.is_some() && opts.load_db.is_some() {
         return Err(usage("--save-db and --load-db are mutually exclusive"));
+    }
+    if opts.haystack.is_some() && opts.load_db.is_some() {
+        return Err(usage("--haystack and --load-db are mutually exclusive"));
     }
     // eval builds its own databases; it must never open (or migrate) the
     // user's memory, so --db/$NEOCORTEX_DB are ignored here.
@@ -928,7 +937,8 @@ Commands:
                            (--n 10000 --queries 200 --db PATH)
   eval <fixtures.json>     evaluate retrieval quality (--ablation --failures
                            --set key=value --sweep key=v1,v2
-                           --limit-queries N --save-db PATH --load-db PATH)
+                           --limit-queries N --save-db PATH --load-db PATH
+                           --haystack DB)
   quantize-model <dir> <out> [--dtype q8|q4k]
                            write a quantized copy of the f32 model (q8: ~1/4 the size)
   mcp                      run the MCP stdio server

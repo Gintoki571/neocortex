@@ -119,6 +119,8 @@ pub struct EvalOptions {
     pub save_db: Option<PathBuf>,
     /// Skip ingestion and evaluate against this database.
     pub load_db: Option<PathBuf>,
+    /// Copy this existing database and ingest the set into the copy.
+    pub haystack: Option<PathBuf>,
 }
 
 fn keys_path(db: &Path) -> PathBuf {
@@ -158,6 +160,230 @@ fn load(fixtures: &Path) -> Result<(Fixture, i64)> {
     )
     .ok_or_else(|| crate::err!("invalid fixture now '{}'", data.now))?;
     Ok((data, now))
+}
+
+/// A copied haystack database. An ephemeral copy (no `--save-db`) is deleted
+/// on drop; a `--save-db` copy is the file the caller asked to keep.
+struct HaystackTarget {
+    path: PathBuf,
+    ephemeral: bool,
+}
+
+impl HaystackTarget {
+    fn prepare(source: &Path, opts: &EvalOptions) -> Result<HaystackTarget> {
+        if let Some(path) = &opts.save_db {
+            copy_haystack(source, path)?;
+            return Ok(HaystackTarget {
+                path: path.clone(),
+                ephemeral: false,
+            });
+        }
+        let path = ephemeral_haystack_path();
+        copy_haystack(source, &path)?;
+        Ok(HaystackTarget {
+            path,
+            ephemeral: true,
+        })
+    }
+}
+
+impl Drop for HaystackTarget {
+    fn drop(&mut self) {
+        if self.ephemeral {
+            remove_db_files(&self.path);
+        }
+    }
+}
+
+fn remove_db_files(path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    let _ = std::fs::remove_file(keys_path(path));
+}
+
+fn ephemeral_haystack_path() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // std::env::temp_dir() honours TMPDIR, so lanes keep the copy under
+    // lanes/tmp instead of the system temp quota.
+    std::env::temp_dir().join(format!(
+        "neocortex-haystack-{}-{nanos}.db",
+        std::process::id()
+    ))
+}
+
+fn probe_haystack(src: &Path) -> Result<()> {
+    let conn = rusqlite::Connection::open(src)
+        .map_err(|e| crate::err!("--haystack {} cannot be read: {e}", src.display()))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(200));
+    if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+        let msg = e.to_string().to_lowercase();
+        if msg.contains("lock") || msg.contains("busy") {
+            return Err(crate::err!("--haystack {} is locked: {e}", src.display()));
+        }
+        return Err(crate::err!(
+            "--haystack {} cannot be read: {e}",
+            src.display()
+        ));
+    }
+    let check = conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    });
+    let _ = conn.execute_batch("ROLLBACK");
+    drop(conn);
+    check.map_err(|e| crate::err!("--haystack {} cannot be read: {e}", src.display()))?;
+    Ok(())
+}
+
+fn copy_haystack(src: &Path, dst: &Path) -> Result<()> {
+    if !src.exists() {
+        return Err(crate::err!("--haystack {} does not exist", src.display()));
+    }
+    if !src.is_file() {
+        return Err(crate::err!("--haystack {} is not a file", src.display()));
+    }
+    if src == dst {
+        return Err(crate::err!(
+            "--haystack copy target {} already exists",
+            dst.display()
+        ));
+    }
+    if let (Ok(a), Ok(b)) = (src.canonicalize(), dst.canonicalize()) {
+        if a == b {
+            return Err(crate::err!(
+                "--haystack copy target {} already exists",
+                dst.display()
+            ));
+        }
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        if PathBuf::from(format!("{}{suffix}", dst.display())).exists() {
+            return Err(crate::err!(
+                "--haystack copy target {} already exists",
+                dst.display()
+            ));
+        }
+    }
+    if keys_path(dst).exists() {
+        return Err(crate::err!(
+            "--haystack copy target {} already exists",
+            dst.display()
+        ));
+    }
+    // A writer holding the source is not safe to copy (main + WAL could
+    // race), so a locked source fails here instead of yielding a stale copy.
+    probe_haystack(src)?;
+    if let Some(dir) = dst.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::copy(src, dst)?;
+    // The -wal holds committed frames the main file alone misses.
+    let src_wal = PathBuf::from(format!("{}-wal", src.display()));
+    if src_wal.exists() {
+        let dst_wal = PathBuf::from(format!("{}-wal", dst.display()));
+        std::fs::copy(&src_wal, &dst_wal)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+struct HaystackCounts {
+    memories: i64,
+    entities: i64,
+    relations: i64,
+    min_valid: Option<i64>,
+    max_valid: Option<i64>,
+}
+
+fn haystack_counts(engine: &Engine) -> Result<HaystackCounts> {
+    let memories: i64 = engine
+        .db
+        .sql()
+        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?;
+    let entities: i64 = engine
+        .db
+        .sql()
+        .query_row("SELECT count(*) FROM entities", [], |r| r.get(0))?;
+    let relations: i64 = engine
+        .db
+        .sql()
+        .query_row("SELECT count(*) FROM relations", [], |r| r.get(0))?;
+    let (min_valid, max_valid): (Option<i64>, Option<i64>) = engine.db.sql().query_row(
+        "SELECT min(valid_from), max(valid_from) FROM memories",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(HaystackCounts {
+        memories,
+        entities,
+        relations,
+        min_valid,
+        max_valid,
+    })
+}
+
+fn print_haystack_counts(tag: &str, source: &Path, set_now: i64, counts: &HaystackCounts) {
+    let clock = Clock {
+        now: set_now,
+        tz_offset_secs: 0,
+    };
+    let dates = match (counts.min_valid, counts.max_valid) {
+        (Some(a), Some(b)) => {
+            format!(
+                "{}..{}",
+                temporal::fmt_date(a, &clock),
+                temporal::fmt_date(b, &clock)
+            )
+        }
+        _ => "empty".to_string(),
+    };
+    eprintln!(
+        "haystack {tag}: source={} memories={} entities={} relations={} dates={} set_now={}",
+        source.display(),
+        counts.memories,
+        counts.entities,
+        counts.relations,
+        dates,
+        temporal::fmt_date(set_now, &clock)
+    );
+}
+
+fn open_haystack(
+    now: i64,
+    emb: Arc<dyn Embedder>,
+    opts: &EvalOptions,
+) -> Result<(Engine, HaystackTarget)> {
+    if opts.load_db.is_some() {
+        return Err(crate::err!(
+            "--haystack and --load-db are mutually exclusive"
+        ));
+    }
+    let source = opts
+        .haystack
+        .clone()
+        .ok_or_else(|| crate::err!("--haystack needs a database path"))?;
+    if !source.exists() {
+        return Err(crate::err!(
+            "--haystack {} does not exist",
+            source.display()
+        ));
+    }
+    let target = HaystackTarget::prepare(&source, opts)?;
+    let clock = Clock {
+        now,
+        tz_offset_secs: 0,
+    };
+    let engine = Engine::open(&target.path, emb)?.with_clock(clock);
+    let before = haystack_counts(&engine)?;
+    print_haystack_counts("before", &source, now, &before);
+    Ok((engine, target))
 }
 
 fn open(now: i64, emb: Arc<dyn Embedder>, opts: &EvalOptions) -> Result<Engine> {
@@ -500,6 +726,27 @@ pub fn run_eval(
     opts: &EvalOptions,
 ) -> Result<EvalReport> {
     let (data, now) = load(fixtures)?;
+    if opts.haystack.is_some() {
+        let (mut engine, target) = open_haystack(now, emb, opts)?;
+        engine.cfg = cfg;
+        let source = opts.haystack.clone().unwrap();
+        let queries = limited(data.queries, opts.limit_queries);
+        let (ids, keys, ingestion_ms) = ingest(&engine, data.memories)?;
+        if let Some(path) = &opts.save_db {
+            save_keys(path, &ids)?;
+            eprintln!(
+                "database saved to {} ({} memories)",
+                path.display(),
+                keys.len()
+            );
+        }
+        let after = haystack_counts(&engine)?;
+        print_haystack_counts("after", &source, now, &after);
+        let report = evaluate(&engine, &queries, &ids, &keys, ingestion_ms)?;
+        drop(engine);
+        drop(target);
+        return Ok(report);
+    }
     let mut engine = open(now, emb, opts)?;
     engine.cfg = cfg;
     let queries = limited(data.queries, opts.limit_queries);
@@ -550,6 +797,28 @@ pub fn sweep_with(
     opts: &EvalOptions,
 ) -> Result<Vec<(String, EvalReport)>> {
     let (data, now) = load(fixtures)?;
+    if opts.haystack.is_some() {
+        let (mut engine, target) = open_haystack(now, emb, opts)?;
+        engine.cfg = base;
+        let source = opts.haystack.clone().unwrap();
+        let queries = limited(data.queries, opts.limit_queries);
+        let (ids, keys, ingestion_ms) = ingest(&engine, data.memories)?;
+        if let Some(path) = &opts.save_db {
+            save_keys(path, &ids)?;
+        }
+        let after = haystack_counts(&engine)?;
+        print_haystack_counts("after", &source, now, &after);
+        let mut out = Vec::with_capacity(variants.len());
+        for (name, cfg) in variants {
+            engine.cfg = cfg;
+            *engine.snapshot_cache.lock().unwrap() = None;
+            let report = evaluate(&engine, &queries, &ids, &keys, ingestion_ms)?;
+            out.push((name, report));
+        }
+        drop(engine);
+        drop(target);
+        return Ok(out);
+    }
     let mut engine = open(now, emb, opts)?;
     engine.cfg = base;
     let queries = limited(data.queries, opts.limit_queries);
