@@ -105,7 +105,7 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 | `export [--out FILE]` | write memories as JSON Lines (`--include-forgotten`) |
 | `import <file.jsonl>` | replay a JSON Lines export through `remember` |
 | `bench [--n N] [--queries N] [--db PATH]` | synthetic remember/recall latency report |
-| `eval <fixtures.json> [--ablation] [--failures] [--set key=value] [--sweep key=v1,v2]` | evaluate retrieval quality |
+| `eval <fixtures.json> [--ablation] [--failures] [--set key=value] [--sweep key=v1,v2] [--haystack DB]` | evaluate retrieval quality; `--haystack DB` copies `DB` (never modified) and ingests the set into the copy so a small set is scored inside a large store |
 | `mcp` | run the MCP stdio server |
 
 `remember` flags: `--kind --tags --importance --scope --source --session --when
