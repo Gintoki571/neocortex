@@ -99,7 +99,7 @@ entities: [e1] Mom (person; aka mother) · [e2] Pune (place)
 | `stats` | counts, database size, embedder, cold-tier hint |
 | `migrate-vectors --to int8` | rewrite the four vector tables from f32 to int8 in one transaction, then VACUUM (databases stay f32 unless migrated) |
 | `reindex` | rebuild the graph projection from the relational tables |
-| `validate` | report integrity problems (exit 1 when any) |
+| `validate` | report integrity problems (exit 1 when any); a stale entity key names the `merge` command that fixes it |
 | `cypher <query>` | read-only Cypher over the graph projection |
 | `import-remem <path>` | one-shot import of a ReMem v3 database |
 | `export [--out FILE]` | write memories as JSON Lines (`--include-forgotten`) |
@@ -381,9 +381,11 @@ also render the interval with a computed duration ("3 years 2 months",
   written by an older build gains predicates and aliases added since (the
   `mentor` pair, `accountable to`) without a re-import; a predicate or alias
   the agent created itself is never taken over. The reconcile writes only when
-  something is missing, so a database another process is writing, or one opened
-  read-only, still opens (`stats`, `recall`, `validate` only read) and is
-  repaired on the next writable open.
+  something is missing, and the additive tables are probed before their DDL
+  runs, so a database another process is writing, or one opened read-only,
+  still opens (`stats`, `recall`, `validate` only read) and is repaired on the
+  next writable open. (A no-op `CREATE INDEX IF NOT EXISTS` takes SQLite's
+  write lock, so running it on every open made readers queue behind writers.)
 
 ## Quality
 

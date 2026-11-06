@@ -1166,9 +1166,32 @@ impl Engine {
             out.push(format!("{unnamed} projection nodes have no name"));
         }
         for (id, name, norm, now) in self.db.stale_symbol_keys()? {
-            out.push(format!(
-                "entity e{id} {name:?} is keyed {norm:?}, expected {now:?} (older symbol key shares a row)"
-            ));
+            // The re-key leaves a row alone when another row already owns
+            // `(norm, type, homonym)`. Name that row and the command that joins
+            // the two, so an operator can act on the report (EX-06b).
+            let holder: Option<(i64, String)> = c
+                .query_row(
+                    "SELECT id,name FROM entities
+                     WHERE norm=?1
+                       AND type=(SELECT type FROM entities WHERE id=?2)
+                       AND homonym=(SELECT homonym FROM entities WHERE id=?2)
+                       AND id<>?2
+                     ORDER BY id LIMIT 1",
+                    rusqlite::params![now, id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            out.push(match holder {
+                Some((other, other_name)) => format!(
+                    "entity e{id} {name:?} is keyed {norm:?}, expected {now:?} \
+                     (e{other} {other_name:?} already has that key); \
+                     run: neocortex merge e{other} e{id}"
+                ),
+                None => format!(
+                    "entity e{id} {name:?} is keyed {norm:?}, expected {now:?} \
+                     (older symbol key; the next writable open re-keys it)"
+                ),
+            });
         }
         if count("SELECT count(*) FROM memories_vec")? != memories {
             out.push("memory vectors do not match memories".into());
