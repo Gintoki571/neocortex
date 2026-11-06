@@ -1991,7 +1991,10 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // Set when the question is a predecessor frame and at least one ended
     // candidate was anchor-linked to the successor (H3-13b). Only then does
     // relevance outrank the chronological paging; without the structured
-    // signal the oldest-first order stays, exactly as before.
+    // signal the oldest-first order stays, exactly as before. An ordering
+    // question that merely carries a past-tense cue ("which project did
+    // Tessa first lead") keeps its date sort: the ended pair it can reach is
+    // not what the question asks for, and `predecessor_frame` is false there.
     let mut predecessor_hit = false;
     for f in fused {
         let Some(row) = rows.get(&f.id) else { continue };
@@ -2021,7 +2024,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                     )?;
                 score *= if past_state_query {
                     if ended_pair {
-                        predecessor_hit = true;
+                        predecessor_hit = predecessor_frame;
                         engine.cfg.history_boost.max(4.0)
                     } else {
                         1.0
@@ -2430,15 +2433,18 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             };
         }
     }
-    // An ordering question wants the intervals themselves, oldest first —
-    // unless a predecessor hit was found: then relevance (with the 4x boost)
-    // wins, because the answer is the holder whose relation ended when the
-    // successor's began, not the oldest memory in the corpus (H3-13b). The
-    // same fallback applies to the predecessor frame when nothing hit.
+    // An ordering question wants the intervals themselves, oldest first. So
+    // does a predecessor frame whose ended predecessor never materialised (no
+    // ended candidate the question anchors to the successor). Only a
+    // predecessor frame that did find it keeps relevance order, because the
+    // answer is the holder whose relation ended when the successor's began,
+    // not the oldest memory in the corpus (H3-13b). An explicit sequence cue
+    // ("first", "after <date>") still sorts even when a past-tense verb put an
+    // ended pair in view: the question asks which one came first.
     // A duration question asks about one interval ("how long was the offsite"),
     // so it keeps relevance order: sorting it by date put unrelated older
     // memories above the answer.
-    if (ordering || predecessor_frame) && !predecessor_hit {
+    if ordering || (predecessor_frame && !predecessor_hit) {
         memories.sort_by_key(|m| (m.valid_from, m.id));
         facts.sort_by_key(|f| (f.valid_from, f.id));
     }

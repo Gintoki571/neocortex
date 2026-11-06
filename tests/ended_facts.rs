@@ -430,6 +430,93 @@ fn h3_13b_relative_clause_and_before_successor_ownership_ranks_ended_memory_in_t
     assert!(m1_lunch.is_none() || m1_lunch.unwrap().score < 2.0);
 }
 
+/// The verifier's ordering corpus (nc-h313b verify1 section 3b): three
+/// projects Tessa Nakamura led, oldest first, then a handover that ends the
+/// newest one. An ordering question that also carries a past-tense cue must
+/// still answer with the chronologically first project.
+fn tessa_ordering_corpus(e: &Engine) {
+    for (project_name, day) in [
+        ("Elm rollout", "2023-02-01"),
+        ("Aspen refresh", "2023-09-01"),
+        ("Rowan migration", "2024-01-05"),
+    ] {
+        e.remember(RememberInput {
+            content: format!("Tessa Nakamura led the {project_name}."),
+            valid_from: Some(day.into()),
+            entities: vec![person("Tessa Nakamura"), project(project_name)],
+            relations: vec![rel("Tessa Nakamura", "leads", project_name, true)],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    e.remember(RememberInput {
+        content: "Emil Sorensen took over as lead of the Rowan migration.".into(),
+        valid_from: Some("2025-01-05".into()),
+        entities: vec![person("Emil Sorensen"), project("Rowan migration")],
+        relations: vec![rel("Emil Sorensen", "leads", "Rowan migration", true)],
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+/// The answer to an ordering question: the chronologically first project,
+/// "Elm rollout" (m1). The ended Rowan fact (m3) must not outrank it just
+/// because the question carries a past-tense verb.
+#[test]
+fn h3_13b_ordering_question_with_past_tense_cue_keeps_date_order() {
+    let e = engine();
+    tessa_ordering_corpus(&e);
+    for query in [
+        // R1, R3, R4, R5, R9, R11 from verify1 section 3b.
+        "which project did Tessa Nakamura first lead",
+        "the first project that Tessa Nakamura led",
+        "which project did Tessa Nakamura lead after 2023-03-01",
+        "which project did Tessa Nakamura lead before May",
+        "which project did Tessa Nakamura lead before Aspen refresh",
+        "which project did Tessa Nakamura lead first, Elm or Rowan",
+    ] {
+        let out = recall(&e, query);
+        assert_eq!(
+            out.memories.first().map(|m| m.id),
+            Some(1),
+            "{query}: expected the earliest project first, got {:?}",
+            out.memories
+                .iter()
+                .take(5)
+                .map(|m| (m.id, &m.content, m.score))
+                .collect::<Vec<_>>()
+        );
+    }
+    // R10: "who did Tessa lead before Emil" names the old holder, but its
+    // object ("who") is the asked side and the named subject is Tessa, so it
+    // stays an ordering question. It must not put the ended fact first.
+    let out = recall(&e, "who did Tessa Nakamura lead before Emil Sorensen");
+    assert!(
+        !out.memories.iter().take(1).any(|m| m.id == 3),
+        "R10 put the ended Rowan fact first: {:?}",
+        out.memories
+            .iter()
+            .take(5)
+            .map(|m| (m.id, &m.content, m.score))
+            .collect::<Vec<_>>()
+    );
+    // Controls: the two target frames still put the ended memory in the top 3,
+    // and the current-state question still answers with the successor.
+    for query in [
+        "the Rowan migration that Tessa Nakamura led",
+        "who led the Rowan migration before Emil Sorensen",
+    ] {
+        let out = recall(&e, query);
+        let rank = out.memories.iter().position(|m| m.id == 3).map(|i| i + 1);
+        assert!(
+            rank.is_some_and(|r| r <= 3),
+            "{query}: ended memory rank is {rank:?}, expected <= 3"
+        );
+    }
+    let cur = recall(&e, "who leads the Rowan migration");
+    assert_eq!(cur.memories.first().map(|m| m.id), Some(4));
+}
+
 // ------------------------------------------------------------- H3-11
 
 /// Atlas used npm, then switched to pnpm: the npm fact is ended. Eight other
