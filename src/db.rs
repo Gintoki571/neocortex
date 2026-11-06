@@ -34,7 +34,26 @@ const INT8_LEVELS: f32 = 127.0;
 
 /// Busy timeout of an open: another process may be mid-transaction, and a
 /// command must wait for it rather than fail.
-const OPEN_BUSY: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const OPEN_BUSY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Busy timeout of a write transaction. A writer only ever waits behind
+/// another writer's transaction, which is milliseconds of work, so waiting is
+/// always better than losing the write. The open budget (5 s) is not enough on
+/// a machine whose CPU or disk stalls the lock holder: the concurrent-writer
+/// tests still failed with "database is locked" during another process's IO
+/// storm (OPS-FLAKE), while 8 writers pass this budget under pure CPU load at
+/// load avg 90. Reads keep the short budget, so a recall never pays this wait
+/// (`recall` records access with [`Db::write_within`] and `OPEN_BUSY`).
+const WRITE_BUSY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Busy timeout while loading the bundled graphqlite extension into an
+/// already-initialised database. The load replays the extension's schema DDL,
+/// and a no-op `CREATE INDEX IF NOT EXISTS` takes the write lock, so a busy
+/// writer would otherwise stall every open for its whole busy timeout (twice,
+/// measured 10 s) and the concurrent-writer tests flaked (OPS-FLAKE). The
+/// extension tolerates a blocked DDL (the tables already exist); the full wait
+/// is kept for a fresh file, whose graph schema still has to be created.
+const LOAD_BUSY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The seeded-ontology reconcile is best-effort (see [`Db::seed_predicates`]),
 /// so it waits far less than an open may: a database another process is
@@ -242,7 +261,26 @@ impl Db {
             }
         }
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
+        // Loading the bundled graphqlite extension runs its schema DDL, and a
+        // no-op `CREATE INDEX IF NOT EXISTS` takes the write lock (OPS-FLAKE):
+        // with a writer active, every open then waited its whole busy timeout
+        // twice and the concurrent-writer tests flaked. When the graph schema
+        // is already there the DDL has nothing to create, so the load may fail
+        // fast: open stays a read, and an uncontended open repairs anything a
+        // skip left behind. A brand-new file keeps the full wait, because its
+        // graph tables still have to be created.
+        let graph_ready: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes')",
+            [],
+            |r| r.get(0),
+        )?;
+        if graph_ready {
+            conn.busy_timeout(LOAD_BUSY)?;
+        }
         let g = graphqlite::Connection::from_rusqlite(conn)?;
+        if graph_ready {
+            g.sqlite_connection().busy_timeout(OPEN_BUSY)?;
+        }
         let mut db = Db {
             g,
             vec: VecMode::F32,
@@ -308,37 +346,87 @@ impl Db {
                 "ALTER TABLE schema_meta ADD COLUMN vec_mode TEXT NOT NULL DEFAULT 'f32'",
             )?;
         }
-        self.sql().execute_batch(
-            "CREATE TABLE IF NOT EXISTS memory_links (
-               a INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-               b INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-               weight REAL NOT NULL,
-               PRIMARY KEY (a, b),
-               CHECK (a < b)
-             );
-             CREATE INDEX IF NOT EXISTS idx_memory_links_b ON memory_links(b);
-             CREATE TABLE IF NOT EXISTS memory_access (
-               memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-               at INTEGER NOT NULL,
-               PRIMARY KEY (memory_id, at)
-             );
-             CREATE INDEX IF NOT EXISTS idx_memory_access_at ON memory_access(at);
-             CREATE TABLE IF NOT EXISTS name_tokens (
-               token TEXT NOT NULL,
-               entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-               PRIMARY KEY (token, entity_id)
-             );
-             CREATE INDEX IF NOT EXISTS idx_name_tokens_entity ON name_tokens(entity_id);
-             CREATE TABLE IF NOT EXISTS name_part (
-               a INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-               b INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
-               weight REAL NOT NULL,
-               PRIMARY KEY (a, b),
-               CHECK (a < b)
-             );
-             CREATE INDEX IF NOT EXISTS idx_name_part_b ON name_part(b);
-             CREATE INDEX IF NOT EXISTS idx_rel_subj ON relations(subj, predicate_id);",
-        )?;
+        // Probe with reads and run only the DDL that is missing. A no-op
+        // `CREATE INDEX IF NOT EXISTS` still takes the write lock in SQLite,
+        // so the old unconditional batch made every open - `recall` included -
+        // queue behind writers and fail at the busy timeout under load
+        // (OPS-FLAKE). In steady state an open now runs no write at all.
+        let tables = [
+            (
+                "memory_links",
+                "CREATE TABLE IF NOT EXISTS memory_links (
+                   a INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                   b INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                   weight REAL NOT NULL,
+                   PRIMARY KEY (a, b),
+                   CHECK (a < b)
+                 );",
+            ),
+            (
+                "memory_access",
+                "CREATE TABLE IF NOT EXISTS memory_access (
+                   memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                   at INTEGER NOT NULL,
+                   PRIMARY KEY (memory_id, at)
+                 );",
+            ),
+            (
+                "name_tokens",
+                "CREATE TABLE IF NOT EXISTS name_tokens (
+                   token TEXT NOT NULL,
+                   entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                   PRIMARY KEY (token, entity_id)
+                 );",
+            ),
+            (
+                "name_part",
+                "CREATE TABLE IF NOT EXISTS name_part (
+                   a INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                   b INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                   weight REAL NOT NULL,
+                   PRIMARY KEY (a, b),
+                   CHECK (a < b)
+                 );",
+            ),
+        ];
+        let indexes = [
+            (
+                "idx_memory_links_b",
+                "CREATE INDEX IF NOT EXISTS idx_memory_links_b ON memory_links(b);",
+            ),
+            (
+                "idx_memory_access_at",
+                "CREATE INDEX IF NOT EXISTS idx_memory_access_at ON memory_access(at);",
+            ),
+            (
+                "idx_name_tokens_entity",
+                "CREATE INDEX IF NOT EXISTS idx_name_tokens_entity ON name_tokens(entity_id);",
+            ),
+            (
+                "idx_name_part_b",
+                "CREATE INDEX IF NOT EXISTS idx_name_part_b ON name_part(b);",
+            ),
+            (
+                "idx_rel_subj",
+                "CREATE INDEX IF NOT EXISTS idx_rel_subj ON relations(subj, predicate_id);",
+            ),
+        ];
+        let mut ddl = String::new();
+        for (table, sql) in tables {
+            if !self.table_exists(table)? {
+                ddl.push_str(sql);
+                ddl.push('\n');
+            }
+        }
+        for (index, sql) in indexes {
+            if !self.index_exists(index)? {
+                ddl.push_str(sql);
+                ddl.push('\n');
+            }
+        }
+        if !ddl.is_empty() {
+            self.sql().execute_batch(&ddl)?;
+        }
         // B5 name tokens are derived from entities.norm; a database written
         // before the table existed is backfilled once (the empty-table probe
         // is a primary-key lookup, so a normal open writes nothing).
@@ -464,6 +552,17 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Read-only probe before running `CREATE INDEX IF NOT EXISTS`, which takes
+    /// the write lock even when the index already exists.
+    fn index_exists(&self, name: &str) -> Result<bool> {
+        let n: i64 = self.sql().query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Fill `name_tokens` for every entity that predates the table (B5).
     fn backfill_name_tokens(&self) -> Result<()> {
         let rows: Vec<(i64, String)> = {
@@ -580,10 +679,13 @@ impl Db {
             }
         }
         self.backfill_bits()?;
-        self.sql().execute(
-            "INSERT OR REPLACE INTO meta(key,value) VALUES('vec_bits','1')",
-            [],
-        )?;
+        self.write_within(BITS_BUSY, |db| {
+            db.sql().execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('vec_bits','1')",
+                [],
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -605,9 +707,13 @@ impl Db {
     /// Fill `BITS_TABLE` from `memories_vec` in rowid batches (never holds more
     /// than one batch of vectors); rows already present are skipped, so a
     /// partial table is completed rather than trusted. Bit rows whose vector
-    /// is gone are deleted first, so they cannot take candidate slots.
+    /// is gone are deleted first, so they cannot take candidate slots. Every
+    /// batch takes the short [`BITS_BUSY`] budget explicitly: `Db::write`
+    /// would set the patient write budget and a recall waiting on a writer
+    /// must fall back to the exact scan instead of blocking
+    /// (`reconcile_does_not_wait_out_a_busy_writer`).
     fn backfill_bits(&self) -> Result<()> {
-        self.write(|db| {
+        self.write_within(BITS_BUSY, |db| {
             db.sql().execute(
                 &format!(
                     "DELETE FROM {BITS_TABLE} WHERE rowid NOT IN (SELECT rowid FROM memories_vec)"
@@ -643,7 +749,7 @@ impl Db {
                 return Ok(());
             }
             last = rows.last().map(|r| r.0).unwrap_or(last);
-            self.write(|db| {
+            self.write_within(BITS_BUSY, |db| {
                 let mut st = db.sql().prepare(&format!(
                     "INSERT INTO {BITS_TABLE}(rowid,embedding,live) VALUES (?1,vec_bit(?2),?3)"
                 ))?;
@@ -1647,11 +1753,35 @@ impl Db {
 
     /// Run `f` inside BEGIN IMMEDIATE .. COMMIT; rolls back on error (including
     /// a failed COMMIT). A call already inside a transaction joins it, so an
-    /// importer can wrap many writes in one atomic unit.
+    /// importer can wrap many writes in one atomic unit. The write waits up to
+    /// [`WRITE_BUSY`], not the shorter open budget.
     pub fn write<T>(&self, f: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+        self.write_within(WRITE_BUSY, f)
+    }
+
+    /// [`Db::write`] with an explicit lock budget. A read path that records a
+    /// best-effort write (access history) passes [`OPEN_BUSY`]: the caller's
+    /// answer must not wait long for a writer it does not need; the bit-table
+    /// reconcile passes its own [`BITS_BUSY`] the same way. The connection
+    /// returns to the [`OPEN_BUSY`] default afterwards, so a caller that wants
+    /// a shorter wait for the whole region sets it again around its own
+    /// statements. A call already inside a transaction joins it and leaves the
+    /// budget alone.
+    pub fn write_within<T>(
+        &self,
+        budget: std::time::Duration,
+        f: impl FnOnce(&Db) -> Result<T>,
+    ) -> Result<T> {
         if !self.sql().is_autocommit() {
             return f(self);
         }
+        self.sql().busy_timeout(budget)?;
+        let out = self.write_locked(f);
+        self.sql().busy_timeout(OPEN_BUSY)?;
+        out
+    }
+
+    fn write_locked<T>(&self, f: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
         self.sql().execute_batch("BEGIN IMMEDIATE")?;
         match f(self) {
             Ok(v) => match self.sql().execute_batch("COMMIT") {

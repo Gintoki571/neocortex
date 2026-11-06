@@ -2169,7 +2169,12 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // statement keeps only the most recent `access_keep` timestamps.
     let returned_memory_ids: Vec<i64> = memories.iter().map(|memory| memory.id).collect();
     if !returned_memory_ids.is_empty() {
-        let _ = engine.db.write(|db| {
+        // Best effort and on the read path: a writer holding the lock must not
+        // delay the answer, so this keeps the short open budget instead of the
+        // patient write budget.
+        let _ = engine
+            .db
+            .write_within(crate::db::OPEN_BUSY, |db| {
             let marks = std::iter::repeat_n("?", returned_memory_ids.len())
                 .collect::<Vec<_>>()
                 .join(",");

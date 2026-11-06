@@ -452,7 +452,8 @@ fn old_caps_plural_keys_are_rekeyed_on_open() {
 }
 
 /// A database holding both "DB" and "DBs" keeps both rows: the re-key never
-/// merges, and `validate` names the stale one.
+/// merges, and `validate` names the stale one together with the exact merge
+/// command that fixes it (EX-06b).
 #[test]
 fn caps_plural_rekey_conflict_is_left_for_validate() {
     let dir = TempDir::new("caps-plural-conflict");
@@ -474,6 +475,7 @@ fn caps_plural_rekey_conflict_is_left_for_validate() {
             )
             .unwrap();
     }
+    let mut ids = None;
     for _ in 0..2 {
         let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
         let rows: Vec<(String, String)> = engine
@@ -493,10 +495,34 @@ fn caps_plural_rekey_conflict_is_left_for_validate() {
             ],
             "nothing is merged or deleted"
         );
-        assert!(engine
-            .validate()
-            .unwrap()
+        let (db_id, dbs_id): (i64, i64) = engine
+            .db
+            .sql()
+            .query_row(
+                "SELECT (SELECT id FROM entities WHERE name='DB'),
+                        (SELECT id FROM entities WHERE name='DBs')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        // The report names the row that already holds the expected key and the
+        // command an operator runs to fix it, with the real ids.
+        let report = engine.validate().unwrap();
+        let line = report
             .iter()
-            .any(|l| l.contains("\"DBs\"") && l.contains("is keyed")));
+            .find(|l| l.contains("\"DBs\"") && l.contains("is keyed"))
+            .unwrap_or_else(|| panic!("no stale-key line in {report:?}"));
+        assert!(
+            line.contains(&format!("run: neocortex merge e{db_id} e{dbs_id}")),
+            "{line}"
+        );
+        ids = Some((db_id, dbs_id));
     }
+    // The hint is the fix: merging exactly those ids clears the report.
+    let (db_id, dbs_id) = ids.unwrap();
+    let engine = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
+    engine
+        .merge_entities(&format!("e{db_id}"), &format!("e{dbs_id}"), false)
+        .unwrap();
+    assert_eq!(engine.validate().unwrap(), Vec::<String>::new());
 }

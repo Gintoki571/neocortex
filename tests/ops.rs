@@ -364,6 +364,75 @@ fn concurrent_writers_and_reader_leave_one_consistent_database() {
     assert_eq!(stats["live_memories"], 60, "{stats}");
 }
 
+/// Opening a database whose schema is already current is a read: it must not
+/// take the write lock, because `recall` and every second writer open must be
+/// able to read while another process is mid-transaction. The per-open DDL
+/// used to run no-op `CREATE INDEX IF NOT EXISTS` statements, and SQLite
+/// takes the write lock for those even when the index exists - so every open
+/// queued behind the writers and timed out under load (OPS-FLAKE).
+#[test]
+fn opening_a_current_schema_database_does_not_wait_for_a_writer() {
+    let dir = TempDir::new("ops-open-locked");
+    let db = dir.join("memory.db");
+    drop(engine(&db)); // steady state: schema, seeds and additive tables exist
+
+    let holder = rusqlite::Connection::open(&db).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(!holder.is_autocommit(), "the writer holds the write lock");
+
+    let start = std::time::Instant::now();
+    let reader = engine(&db);
+    let elapsed = start.elapsed();
+    // The unconditional DDL waited out two 5 s busy timeouts here (10 s).
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "open waited {elapsed:?} for a writer: it runs write-locking DDL"
+    );
+    assert!(
+        !holder.is_autocommit(),
+        "the open only finished because the writer released the lock"
+    );
+    assert_eq!(reader.stats().unwrap().memories, 0);
+    holder.execute_batch("ROLLBACK").unwrap();
+}
+
+/// A write waits out a slow writer instead of losing the memory: the write
+/// budget is longer than the open budget. The lock is held for longer than the
+/// 5 s the write used to share with the open, which is what failed when the
+/// host stalled a writer during another process's IO storm (OPS-FLAKE).
+#[test]
+fn a_write_waits_out_a_slow_writer_instead_of_failing() {
+    let dir = TempDir::new("ops-write-budget");
+    let db = dir.join("memory.db");
+    drop(engine(&db)); // steady state: the open itself runs no write
+
+    let holder = rusqlite::Connection::open(&db).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let release = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        holder.execute_batch("ROLLBACK").unwrap();
+    });
+    ready_rx.recv().unwrap();
+
+    let start = std::time::Instant::now();
+    let id = engine(&db)
+        .remember(RememberInput {
+            content: "a slow writer must not cost an agent its memory".into(),
+            ..RememberInput::default()
+        })
+        .expect("the write gives up at the 5 s open budget")
+        .id;
+    let waited = start.elapsed();
+    release.join().unwrap();
+    assert!(id > 0);
+    assert!(
+        waited >= std::time::Duration::from_secs(5),
+        "the write never queued behind the slow writer ({waited:?})"
+    );
+}
+
 // --------------------------------------------------- audit regressions
 
 /// #8: the exact-duplicate guarantee is a database constraint, so concurrent
