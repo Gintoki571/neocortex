@@ -62,6 +62,14 @@ fn org(name: &str) -> EntityIn {
     }
 }
 
+fn group(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("group".into()),
+        ..Default::default()
+    }
+}
+
 fn rel(src: &str, predicate: &str, dst: &str, exclusive: bool) -> RelationIn {
     RelationIn {
         source: src.into(),
@@ -121,6 +129,19 @@ fn retract(e: &Engine, content: &str) -> neocortex::engine::RememberOutput {
         ..Default::default()
     })
     .unwrap()
+}
+
+/// Ingest a "leads the team" relation and return its id.
+fn tomasz_leads_team(e: &Engine) -> i64 {
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak leads the team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("team")],
+            relations: vec![rel("Tomasz Nowak", "leads", "team", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    out.relations[0].id
 }
 
 // ------------------------------------------------------------- H3-09
@@ -478,6 +499,171 @@ fn h3_12_retraction_with_relations_passed_by_caller_is_unchanged() {
     );
     assert_eq!(relation_end(&e, rid1), Some(NOW));
     assert_eq!(relation_end(&e, rid2), None);
+}
+
+/// S01: "heads" is outside the predicate ontology (it is also a role noun), so
+/// the retraction matcher carries the heads/leads synonym pair explicitly.
+#[test]
+fn h3_12_no_longer_heads_ends_leads() {
+    let e = engine();
+    let rid = tomasz_leads_team(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer heads the team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("team")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "heads did not end leads: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// R02: the same synonym in the past tense.
+#[test]
+fn h3_12_no_longer_headed_ends_leads() {
+    let e = engine();
+    let rid = tomasz_leads_team(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer headed the team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("team")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "headed did not end leads: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// R01: the same verb still ends, so the synonym path did not replace it.
+#[test]
+fn h3_12_no_longer_leads_ends_leads() {
+    let e = engine();
+    let rid = tomasz_leads_team(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer leads the team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("team")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "leads did not end leads: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// X01: an -ly adverb between the cue and the verb is not part of the verb.
+#[test]
+fn h3_12_adverb_between_cue_and_verb_ends() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer actively reviews payment-adjacent code.".into(),
+            entities: vec![person("Tomasz Nowak")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "adverb hid the verb: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// X02: the adverb is stripped, the preposition still tells "works at" apart.
+#[test]
+fn h3_12_no_longer_works_remotely_ends_works_at() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Ivan works at Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Ivan no longer works remotely at Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "remotely hid works at: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// N02: "no longer just X" negates exclusivity, like "no longer only X".
+#[test]
+fn h3_12_no_longer_just_does_not_end() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer just reviews payment-adjacent code.".into(),
+            entities: vec![person("Tomasz Nowak")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "no longer just ended the fact: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+/// The run/manage synonym pair: a second entry in the table, and its negative
+/// side, so the table cannot silently over-match.
+#[test]
+fn h3_12_no_longer_runs_ends_manages() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak manages the platform team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("platform team")],
+            relations: vec![rel("Tomasz Nowak", "manages", "platform team", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer runs the platform team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("platform team")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "runs did not end manages: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// A synonym pair never matches outside itself: "oversees" is paired with
+/// "supervises", so it must not end "reviews".
+#[test]
+fn h3_12_oversees_does_not_end_reviews() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract(&e, "Tomasz Nowak no longer oversees payment-adjacent code.");
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "oversees ended reviews: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
 }
 
 #[test]

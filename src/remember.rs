@@ -75,6 +75,16 @@ const RETRACTIONS: &[(&[&str], &str)] = &[
     (&["ya", "no"], ""),
 ];
 
+/// Verb lemmas that state the same predicate for retraction matching but are
+/// not aliased in the predicate ontology ("head" is also a role noun, so
+/// `resolve` refuses to alias it to "lead"). Symmetric; a pair only matches
+/// when the rest of the phrase agrees, so "works with" still misses "works at".
+const RETRACTION_VERB_SYNONYMS: &[(&str, &str)] = &[
+    ("head", "lead"),
+    ("run", "manage"),
+    ("oversee", "supervise"),
+];
+
 /// A clause boundary or a conjunction means the phrase and the target are not
 /// in the same retraction.
 const RETRACTION_BREAKS: &[&str] = &[
@@ -468,7 +478,7 @@ fn infer_negated(text: &str, predicate: &str, group: &str, target: &str, source:
                 if let Some(cue_end) = cue_before(&words, verb_pos) {
                     if words[cue_end..verb_pos]
                         .iter()
-                        .all(|w| NEGATION_FILLERS.contains(&w.as_str()))
+                        .all(|w| NEGATION_FILLERS.contains(&w.as_str()) || adverb(w))
                     {
                         return true;
                     }
@@ -489,20 +499,23 @@ fn infer_negated(text: &str, predicate: &str, group: &str, target: &str, source:
                 .map(String::as_str)
                 .eq(phrase.iter().copied())
             {
+                let no_longer = phrase.last().is_some_and(|w| *w == "longer");
                 let gap = &words[start + phrase.len()..target_pos];
                 if gap.len() <= 3
-                    && !gap
-                        .iter()
-                        .any(|w| w == "only" || RETRACTION_BREAKS.contains(&w.as_str()))
-                    && !(start > 0 && words[start - 1] == "only")
+                    && !gap.iter().any(|w| {
+                        scope_word(w, no_longer) || RETRACTION_BREAKS.contains(&w.as_str())
+                    })
+                    && !(start > 0 && scope_word(&words[start - 1], no_longer))
                 {
                     // If the retraction group is generic, any verb in the gap
                     // must match the predicate's verb.
                     if retract_group.is_empty() {
-                        let non_prep = gap.iter().find(|w| !PREPOSITIONS.contains(&w.as_str()));
+                        let non_prep = gap
+                            .iter()
+                            .find(|w| !PREPOSITIONS.contains(&w.as_str()) && !adverb(w));
                         if let Some(vw) = non_prep {
                             let pred_v = predicate.split_whitespace().next().unwrap_or("");
-                            if text::lemma_verb(vw) != text::lemma_verb(pred_v) {
+                            if !same_verb(vw, pred_v) {
                                 continue;
                             }
                         }
@@ -563,6 +576,52 @@ fn cue_before(words: &[String], verb_pos: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// True for a word that modifies a verb rather than naming it ("no longer
+/// actively reviews"). A phrase whose only verb word ends in -ly ("applies")
+/// keeps it: an adverb needs a verb to modify.
+fn adverb(w: &str) -> bool {
+    w.len() > 3 && w.ends_with("ly") && w != "only"
+}
+
+/// "no longer only X" and "no longer just X" negate exclusivity, not the
+/// assertion, so they end nothing. "just" is a scope word only after a
+/// "no longer" cue.
+fn scope_word(w: &str, no_longer: bool) -> bool {
+    w == "only" || (no_longer && w == "just")
+}
+
+/// The verb phrase between the cue and the object, normalised. Prepositions
+/// are kept (they separate "works at" from "works with"); -ly adverbs are
+/// dropped when a verb word remains ("no longer actively reviews" ->
+/// "reviews"). `None` when the gap names no verb at all.
+fn verb_phrase(words: &[(usize, usize, &str)]) -> Option<String> {
+    let mut kept: Vec<&str> = words.iter().map(|w| w.2).collect();
+    let mut has_verb = false;
+    for w in &kept {
+        if !PREPOSITIONS.contains(w) && !adverb(w) {
+            has_verb = true;
+        }
+    }
+    if has_verb {
+        kept.retain(|w| !adverb(w));
+    }
+    if kept.is_empty() || kept.iter().all(|w| PREPOSITIONS.contains(w)) {
+        return None;
+    }
+    let vnorm = text::norm_predicate(&kept.join(" "));
+    (!vnorm.is_empty()).then_some(vnorm)
+}
+
+/// True when two verb words state the same predicate: the same lemma, or a
+/// retraction synonym pair ("heads"/"leads").
+fn same_verb(a: &str, b: &str) -> bool {
+    let (a, b) = (text::lemma_verb(a), text::lemma_verb(b));
+    a == b
+        || RETRACTION_VERB_SYNONYMS.iter().any(|(x, y)| {
+            (*x == a.as_str() && *y == b.as_str()) || (*x == b.as_str() && *y == a.as_str())
+        })
 }
 
 /// A retraction the text states without agent-supplied relations: the
@@ -806,7 +865,16 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
             }
             let phrase_start = words[p].0;
             let phrase_end = words[p + plen - 1].1;
-            let max_end = words.get(p + plen + 2).map(|w| w.1).unwrap_or(usize::MAX);
+            // The object may start up to three words after the cue; an -ly
+            // adverb modifies the verb and does not use up the lookahead
+            // ("no longer works remotely at Acme").
+            let max_end = words
+                .iter()
+                .skip(p + plen)
+                .filter(|w| !adverb(w.2))
+                .nth(2)
+                .map(|w| w.1)
+                .unwrap_or(usize::MAX);
             let mut object_span = spans
                 .spans
                 .iter()
@@ -838,20 +906,14 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
             };
             let mut candidate = spans.ambiguous.contains(&(object_start, object_end));
             let mut verb: Option<String> = None;
+            let no_longer = phrase.last().is_some_and(|w| *w == "longer");
             if there_match {
                 let vwords = &words[p + plen..there_pos];
-                if vwords.iter().any(|w| w.2 == "only") {
+                if vwords.iter().any(|w| scope_word(w.2, no_longer)) {
                     continue;
                 }
-                if group.is_empty()
-                    && !vwords.is_empty()
-                    && !vwords.iter().all(|w| PREPOSITIONS.contains(&w.2))
-                {
-                    let vstr = vwords.iter().map(|w| w.2).collect::<Vec<_>>().join(" ");
-                    let vnorm = text::norm_predicate(&vstr);
-                    if !vnorm.is_empty() {
-                        verb = Some(vnorm);
-                    }
+                if group.is_empty() {
+                    verb = verb_phrase(vwords);
                 }
             } else if object_start >= phrase_end {
                 // A span may start before the name it normalises to ("the
@@ -861,9 +923,11 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
                 let next_word = words.partition_point(|w| w.0 < object_end);
                 let gap = &words[p + plen..gap_end];
                 // "no longer only" / "not only" ends nothing.
-                if gap.iter().any(|w| w.2 == "only")
-                    || (p > 0 && words[p - 1].2 == "only")
-                    || words.get(next_word).is_some_and(|w| w.2 == "only")
+                if gap.iter().any(|w| scope_word(w.2, no_longer))
+                    || (p > 0 && scope_word(words[p - 1].2, no_longer))
+                    || words
+                        .get(next_word)
+                        .is_some_and(|w| scope_word(w.2, no_longer))
                 {
                     continue;
                 }
@@ -900,13 +964,7 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
                     } else {
                         gap
                     };
-                    if !vwords.is_empty() && !vwords.iter().all(|w| PREPOSITIONS.contains(&w.2)) {
-                        let vstr = vwords.iter().map(|w| w.2).collect::<Vec<_>>().join(" ");
-                        let vnorm = text::norm_predicate(&vstr);
-                        if !vnorm.is_empty() {
-                            verb = Some(vnorm);
-                        }
-                    }
+                    verb = verb_phrase(vwords);
                 }
             }
             let min_start = words.get(p.saturating_sub(10)).map(|w| w.0).unwrap_or(0);
@@ -1190,7 +1248,8 @@ fn end_text_retractions(
 
 /// Check if the verb in a generic text retraction matches the relation's predicate:
 /// same predicate canonical, same predicate group in the database ontology,
-/// or same verb lemma (with compatible prepositions).
+/// the same verb lemma (with compatible prepositions), or a retraction
+/// synonym pair ("heads"/"leads").
 fn verb_matches_relation(
     db: &Db,
     retract_verb: &str,
@@ -1221,7 +1280,7 @@ fn verb_matches_relation(
     if rv_words.is_empty() || pv_words.is_empty() {
         return Ok(false);
     }
-    if text::lemma_verb(&rv_words[0]) != text::lemma_verb(&pv_words[0]) {
+    if !same_verb(&rv_words[0], &pv_words[0]) {
         return Ok(false);
     }
     if rv_words.len() > 1 && pv_words.len() > 1 {
