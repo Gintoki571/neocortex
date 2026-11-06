@@ -184,7 +184,7 @@ Answer strings are a looser test than ids: a wrong memory that happens to name t
 satisfies it. Read acc@10 with recall/MRR, not instead of them.
 
 Two guard columns keep acc@10 honest: `context tokens/query` (rendered recall output, chars / 4) must not grow more than 10% for a change, and `expect_absent leaked` counts queries that still show an `expect_absent` memory in the top k or as a prose fact line (`[m<id>]`), even when it does not outrank the expected one.
-Prose fact lines (`Config.prose_margin`, `--set prose_margin=0`) are opt-in and off by default: measured +1 mh2 query, no gain on a blind set, +1.5% to +4.5% context tokens.
+Prose fact lines (`Config.prose_margin`, `--set prose_margin=0`) are opt-in and off by default: measured +1 mh2 query, no gain on a blind set, +1.5% to +4.5% context tokens. `prose_wide` (`--set prose_wide=on`) renders the prose steps of the top three chains as their own lines (memory ranking unchanged): mh2 +4 queries, fixtures/holdout/world-300 memory numbers unchanged, +2.6% to +7.9% context tokens; both knobs stay off (`docs/research/prose.md`).
 Typed bridge pulls (`--set bridge_pull=off`) are opt-out and on by default. They reserve up to two fact slots for live relations from returned, non-anchor bridge entities when the other endpoint matches the question's answer type; `NEOCORTEX_DEBUG_FACTS=1` prints pulled, kept, and already-present counters.
 
 ### 6. Channel Ablation Protocol
