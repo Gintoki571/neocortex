@@ -234,6 +234,202 @@ fn h3_13_negated_retraction_is_not_resurrected_as_live() {
     assert!(!out.facts.iter().any(|fact| fact.id == 1 && !fact.ended));
 }
 
+// ------------------------------------------------------------- H3-13b
+
+fn setup_lead_handover_with_competitors(e: &Engine) {
+    e.remember(RememberInput {
+        content: "Mira Sol led the Birch launch.".into(),
+        valid_from: Some("2026-01-10".into()),
+        entities: vec![person("Mira Sol"), project("Birch launch")],
+        relations: vec![rel("Mira Sol", "leads", "Birch launch", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        content: "Noah Imani took over as lead of the Birch launch.".into(),
+        valid_from: Some("2026-02-10".into()),
+        entities: vec![person("Noah Imani"), project("Birch launch")],
+        relations: vec![rel("Noah Imani", "leads", "Birch launch", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    for i in 0..30 {
+        let colleague = format!("Colleague {i:02}");
+        e.remember(RememberInput {
+            content: format!(
+                "{colleague} reviewed Birch launch planning notes during meeting {i:02}."
+            ),
+            valid_from: Some(format!("2026-01-0{}", (i % 9) + 1)),
+            entities: vec![person(&colleague), project("Birch launch")],
+            relations: vec![rel(&colleague, "reviewed notes for", "Birch launch", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+}
+
+fn setup_tool_handover_with_competitors(e: &Engine) {
+    e.remember(RememberInput {
+        content: "Cobalt uses pnpm for package management.".into(),
+        valid_from: Some("2026-01-10".into()),
+        entities: vec![project("Cobalt"), tool("pnpm")],
+        relations: vec![rel("Cobalt", "uses", "pnpm", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        content: "Cobalt switched from pnpm to yarn.".into(),
+        valid_from: Some("2026-02-10".into()),
+        entities: vec![project("Cobalt"), tool("pnpm"), tool("yarn")],
+        relations: vec![rel("Cobalt", "uses", "yarn", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    for i in 0..30 {
+        let colleague = format!("Colleague {i:02}");
+        e.remember(RememberInput {
+            content: format!("{colleague} reviewed pnpm planning notes during meeting {i:02}."),
+            valid_from: Some(format!("2026-01-0{}", (i % 9) + 1)),
+            entities: vec![person(&colleague), tool("pnpm")],
+            relations: vec![rel(&colleague, "reviewed notes for", "pnpm", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+}
+
+fn setup_owner_handover_with_competitors(e: &Engine) {
+    e.remember(RememberInput {
+        content: "Lena Ortiz owns the Orchid archive.".into(),
+        valid_from: Some("2026-01-10".into()),
+        entities: vec![person("Lena Ortiz"), project("Orchid archive")],
+        relations: vec![rel("Lena Ortiz", "owns", "Orchid archive", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        content: "Pavel Duran took over ownership of the Orchid archive.".into(),
+        valid_from: Some("2026-02-10".into()),
+        entities: vec![person("Pavel Duran"), project("Orchid archive")],
+        relations: vec![rel("Pavel Duran", "owns", "Orchid archive", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    for i in 0..30 {
+        let colleague = format!("Colleague {i:02}");
+        e.remember(RememberInput {
+            content: format!(
+                "{colleague} reviewed Orchid archive planning notes during meeting {i:02}."
+            ),
+            valid_from: Some(format!("2026-01-0{}", (i % 9) + 1)),
+            entities: vec![person(&colleague), project("Orchid archive")],
+            relations: vec![rel(
+                &colleague,
+                "reviewed notes for",
+                "Orchid archive",
+                false,
+            )],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn h3_13b_relative_clause_and_before_successor_lead_ranks_ended_memory_in_top_3() {
+    let e = engine();
+    setup_lead_handover_with_competitors(&e);
+    for query in [
+        "the Birch launch that Mira Sol led",
+        "the Birch launch that Mira Sol lead",
+        "who led Birch launch before Noah Imani",
+        "who lead Birch launch before Noah Imani",
+    ] {
+        let out = recall(&e, query);
+        let rank = out.memories.iter().position(|m| m.id == 1).map(|i| i + 1);
+        assert!(
+            rank.is_some_and(|r| r <= 3),
+            "{query}: ended memory rank is {rank:?}, expected <= 3; top memories: {:?}",
+            out.memories
+                .iter()
+                .take(5)
+                .map(|m| (m.id, &m.content, m.score))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Controls:
+    // "who leads Birch launch" -> live memory (m2) is #1, m1 is not #1
+    let cur = recall(&e, "who leads Birch launch");
+    assert_eq!(cur.memories.first().map(|m| m.id), Some(2));
+    // "what did Mira Sol do before lunch" -> m1 is not boosted
+    let lunch = recall(&e, "what did Mira Sol do before lunch");
+    let m1_lunch = lunch.memories.iter().find(|m| m.id == 1);
+    assert!(m1_lunch.is_none() || m1_lunch.unwrap().score < 2.0);
+    // passive "led by" -> live memory is #1
+    let passive = recall(&e, "the Birch launch led by Noah Imani");
+    assert_eq!(passive.memories.first().map(|m| m.id), Some(2));
+}
+
+#[test]
+fn h3_13b_relative_clause_and_before_successor_tool_ranks_ended_memory_in_top_3() {
+    let e = engine();
+    setup_tool_handover_with_competitors(&e);
+    for query in [
+        "the pnpm that Cobalt used",
+        "the pnpm that Cobalt use",
+        "who used pnpm before yarn",
+        "who use pnpm before yarn",
+    ] {
+        let out = recall(&e, query);
+        let rank = out.memories.iter().position(|m| m.id == 1).map(|i| i + 1);
+        assert!(
+            rank.is_some_and(|r| r <= 3),
+            "{query}: ended memory rank is {rank:?}, expected <= 3; top memories: {:?}",
+            out.memories
+                .iter()
+                .take(5)
+                .map(|m| (m.id, &m.content, m.score))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Controls:
+    let cur = recall(&e, "which package manager does Cobalt use");
+    assert_eq!(cur.memories.first().map(|m| m.id), Some(2));
+    let lunch = recall(&e, "what did Cobalt do before lunch");
+    let m1_lunch = lunch.memories.iter().find(|m| m.id == 1);
+    assert!(m1_lunch.is_none() || m1_lunch.unwrap().score < 2.0);
+}
+
+#[test]
+fn h3_13b_relative_clause_and_before_successor_ownership_ranks_ended_memory_in_top_3() {
+    let e = engine();
+    setup_owner_handover_with_competitors(&e);
+    for query in [
+        "the Orchid archive that Lena Ortiz owned",
+        "the Orchid archive that Lena Ortiz own",
+        "who owned Orchid archive before Pavel Duran",
+        "who own Orchid archive before Pavel Duran",
+    ] {
+        let out = recall(&e, query);
+        let rank = out.memories.iter().position(|m| m.id == 1).map(|i| i + 1);
+        assert!(
+            rank.is_some_and(|r| r <= 3),
+            "{query}: ended memory rank is {rank:?}, expected <= 3; top memories: {:?}",
+            out.memories
+                .iter()
+                .take(5)
+                .map(|m| (m.id, &m.content, m.score))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Controls:
+    let cur = recall(&e, "who owns Orchid archive");
+    assert_eq!(cur.memories.first().map(|m| m.id), Some(2));
+    let lunch = recall(&e, "what did Lena Ortiz do before lunch");
+    let m1_lunch = lunch.memories.iter().find(|m| m.id == 1);
+    assert!(m1_lunch.is_none() || m1_lunch.unwrap().score < 2.0);
+}
+
 // ------------------------------------------------------------- H3-11
 
 /// Atlas used npm, then switched to pnpm: the npm fact is ended. Eight other
