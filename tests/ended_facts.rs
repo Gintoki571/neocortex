@@ -666,6 +666,161 @@ fn h3_12_oversees_does_not_end_reviews() {
     assert_eq!(relation_end(&e, rid), None);
 }
 
+/// S02/S05 (round-2 defect 2): "stopped <verb>ing" is a retraction cue too.
+#[test]
+fn h3_12_stopped_working_at_ends_works_at() {
+    let e = engine();
+    let rid = tomasz_works_at_acme(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak stopped working at Acme.",
+        vec![person("Tomasz Nowak"), org("Acme")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "stopped working at did not end works at: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+#[test]
+fn h3_12_has_stopped_reviewing_ends_reviews() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak has stopped reviewing payment-adjacent code.",
+        vec![person("Tomasz Nowak")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "has stopped reviewing did not end reviews: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// The generic "stopped" cue still respects the verb: another verb ends nothing.
+#[test]
+fn h3_12_stopped_approving_does_not_end_reviews() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak stopped approving payment-adjacent code.",
+        vec![person("Tomasz Nowak")],
+    );
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "stopped approving ended reviews: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+/// Y01-Y09, P5: a trailing `, only ...` / `, just ...` clause states the new
+/// state, so the retraction still ends the fact (main behaviour; round 1
+/// regressed here). The scope check applies between the cue and the object and
+/// immediately before the cue, never after the object.
+fn tomasz_works_at_acme(e: &Engine) -> i64 {
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak works at Acme.".into(),
+            valid_from: Some("2026-01-04".into()),
+            entities: vec![person("Tomasz Nowak"), org("Acme"), org("Brightline")],
+            relations: vec![rel("Tomasz Nowak", "works at", "Acme", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    out.relations[0].id
+}
+
+fn retract_with(
+    e: &Engine,
+    content: &str,
+    entities: Vec<EntityIn>,
+) -> neocortex::engine::RememberOutput {
+    e.remember(RememberInput {
+        content: content.into(),
+        entities,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+#[test]
+fn h3_12_trailing_scope_clause_still_ends_works_at() {
+    for text in [
+        "Tomasz Nowak no longer works at Acme, only at Brightline.",
+        "Tomasz Nowak no longer works at Acme, just at Brightline.",
+        "Tomasz Nowak no longer works at Acme; only Brightline remains.",
+        "Tomasz Nowak no longer works at Acme, only there.",
+        "Tomasz Nowak no longer works at Acme, just not there.",
+    ] {
+        let e = engine();
+        let rid = tomasz_works_at_acme(&e);
+        let out = retract_with(
+            &e,
+            text,
+            vec![person("Tomasz Nowak"), org("Acme"), org("Brightline")],
+        );
+        assert!(
+            out.invalidated_relations.contains(&rid),
+            "{text}: trailing clause kept the fact live: {out:?}"
+        );
+        assert_eq!(relation_end(&e, rid), Some(NOW), "{text}");
+    }
+}
+
+/// Y05: synonym verb plus a trailing scope clause.
+#[test]
+fn h3_12_trailing_scope_clause_still_ends_synonym_verb() {
+    let e = engine();
+    let rid = tomasz_leads_team(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak no longer heads the team, only advises it.",
+        vec![person("Tomasz Nowak"), group("team")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "trailing clause kept the synonym retraction live: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// Y07: trailing clause naming a different object ("the docs").
+#[test]
+fn h3_12_trailing_scope_clause_still_ends_reviews() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak no longer reviews payment-adjacent code, only the docs.",
+        vec![person("Tomasz Nowak")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "trailing clause kept reviews live: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// Y12 control: a scope word between the cue and the object still ends nothing.
+#[test]
+fn h3_12_no_longer_only_with_trailing_contrast_ends_nothing() {
+    let e = engine();
+    let rid = tomasz_works_at_acme(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak no longer only works at Acme, but also at Brightline.",
+        vec![person("Tomasz Nowak"), org("Acme"), org("Brightline")],
+    );
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "no longer only ended the fact: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
 #[test]
 fn h3_12_coordinated_pair_retraction_unchanged() {
     let e = engine();

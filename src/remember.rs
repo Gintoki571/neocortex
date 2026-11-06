@@ -67,6 +67,8 @@ const RETRACTIONS: &[(&[&str], &str)] = &[
     (&["separated", "from"], "married to"),
     (&["divorced"], "married to"),
     (&["sold"], "own"),
+    (&["stopped", "working"], "work at"),
+    (&["stopped"], ""),
     (&["stopped", "using"], "use"),
     (&["gave", "up"], "use"),
     (&["is", "no", "longer"], ""),
@@ -74,6 +76,11 @@ const RETRACTIONS: &[(&[&str], &str)] = &[
     (&["no", "longer"], ""),
     (&["ya", "no"], ""),
 ];
+
+/// Cues that retract only when the gap names a verb: "stopped reviewing X" is
+/// a retraction, "stopped by Acme" is a visit, so a bare "stopped" needs the
+/// gerund to say which predicate ended.
+const VERB_REQUIRED_CUES: &[&[&str]] = &[&["stopped"]];
 
 /// Verb lemmas that state the same predicate for retraction matching but are
 /// not aliased in the predicate ontology ("head" is also a role noun, so
@@ -499,6 +506,13 @@ fn infer_negated(text: &str, predicate: &str, group: &str, target: &str, source:
                 .map(String::as_str)
                 .eq(phrase.iter().copied())
             {
+                // "never stopped liking" is a double negative: still positive.
+                if phrase[0] == "stopped"
+                    && start > 0
+                    && matches!(words[start - 1].as_str(), "never" | "not")
+                {
+                    continue;
+                }
                 let no_longer = phrase.last().is_some_and(|w| *w == "longer");
                 let gap = &words[start + phrase.len()..target_pos];
                 if gap.len() <= 3
@@ -863,6 +877,10 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
             {
                 continue;
             }
+            // "never stopped liking" is a double negative: still positive.
+            if phrase[0] == "stopped" && p > 0 && matches!(words[p - 1].2, "never" | "not") {
+                continue;
+            }
             let phrase_start = words[p].0;
             let phrase_end = words[p + plen - 1].1;
             // The object may start up to three words after the cue; an -ly
@@ -922,12 +940,13 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
                 let gap_end = words.partition_point(|w| w.0 < object_start);
                 let next_word = words.partition_point(|w| w.0 < object_end);
                 let gap = &words[p + plen..gap_end];
-                // "no longer only" / "not only" ends nothing.
+                // "no longer only" / "not only" ends nothing. The scope word
+                // must sit between the cue and the object, or immediately
+                // before the cue; one after the object is a trailing clause
+                // stating the new state ("no longer works at Acme, only at
+                // Brightline"), not a scope on the retracted assertion.
                 if gap.iter().any(|w| scope_word(w.2, no_longer))
                     || (p > 0 && scope_word(words[p - 1].2, no_longer))
-                    || words
-                        .get(next_word)
-                        .is_some_and(|w| scope_word(w.2, no_longer))
                 {
                     continue;
                 }
@@ -965,6 +984,9 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
                         gap
                     };
                     verb = verb_phrase(vwords);
+                    if verb.is_none() && VERB_REQUIRED_CUES.contains(phrase) {
+                        continue;
+                    }
                 }
             }
             let min_start = words.get(p.saturating_sub(10)).map(|w| w.0).unwrap_or(0);
