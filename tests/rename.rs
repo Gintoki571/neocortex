@@ -511,3 +511,582 @@ fn forget_rename_memory_keeps_merge_and_retracts_formerly_fact() {
         "forget should retract the formerly-called fact"
     );
 }
+
+/// Verifier F02: "the branch" -> "main" is a common-noun phrase, never a rename.
+#[test]
+fn f02_generic_branch_to_main_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Branch tracks Origin.",
+        vec![typed("Branch", "branch"), typed("Origin", "branch")],
+        vec![rel("Branch", "tracks", "Origin", false)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "main tracks Release.",
+        vec![typed("main", "branch"), typed("Release", "branch")],
+        vec![rel("main", "tracks", "Release", false)],
+        "2026-01-06",
+    );
+    remember_at(
+        &engine,
+        "I renamed the branch to main.",
+        vec![typed("Branch", "branch"), typed("main", "branch")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Branch"),
+        card_id(&engine, "main"),
+        "generic branch->main rename must not merge"
+    );
+}
+
+/// Verifier F03: "The meeting" is a common noun; it must not merge into the
+/// existing project Sync.
+#[test]
+fn f03_meeting_to_project_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Sync runs on nginx.",
+        vec![project("Sync"), typed("nginx", "project")],
+        vec![rel("Sync", "runs on", "nginx", false)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "The meeting was renamed to Sync.",
+        vec![
+            EntityIn {
+                name: "Meeting".into(),
+                ..Default::default()
+            },
+            project("Sync"),
+        ],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Meeting"),
+        card_id(&engine, "Sync"),
+        "meeting->Sync must not merge"
+    );
+}
+
+/// Verifier F04a/F04b: passive "is now called by the team" is not a rename
+/// of Harbor. The two verifier variants differ only in Team's seeded type
+/// (typed "team" vs untyped ""); the fix must block both deterministically.
+#[test]
+fn f04_passive_called_by_merges_nothing_in_both_type_variants() {
+    for typed_team in [true, false] {
+        let engine = new_engine();
+        remember_at(
+            &engine,
+            "Harbor runs on Python 3.11.",
+            vec![project("Harbor"), typed("Python 3.11", "language")],
+            vec![rel("Harbor", "runs on", "Python 3.11", false)],
+            "2026-01-05",
+        );
+        if typed_team {
+            remember_at(
+                &engine,
+                "Team owns Backlog.",
+                vec![typed("Team", "team"), typed("Backlog", "list")],
+                vec![rel("Team", "owns", "Backlog", false)],
+                "2026-01-06",
+            );
+        } else {
+            remember_at(
+                &engine,
+                "Team owns Backlog.",
+                vec![
+                    EntityIn {
+                        name: "Team".into(),
+                        ..Default::default()
+                    },
+                    typed("Backlog", "list"),
+                ],
+                vec![rel("Team", "owns", "Backlog", false)],
+                "2026-01-06",
+            );
+        }
+        let out = remember_at(
+            &engine,
+            "Harbor is now called by the team every morning.",
+            {
+                let mut v = vec![project("Harbor")];
+                if typed_team {
+                    v.push(typed("Team", "team"));
+                } else {
+                    v.push(EntityIn {
+                        name: "Team".into(),
+                        ..Default::default()
+                    });
+                }
+                v
+            },
+            vec![],
+            "2026-06-01",
+        );
+        assert_ne!(
+            card_id(&engine, "Harbor"),
+            card_id(&engine, "Team"),
+            "passive 'called by' (typed_team={typed_team}) must not merge"
+        );
+        assert!(
+            !out.hints.iter().any(|h| h.starts_with("renamed:")),
+            "no rename hint expected, got {:?}",
+            out.hints
+        );
+    }
+}
+
+/// Verifier F08: both names already carry their own live facts and the
+/// rename sentence is undated, so it returns a candidate, never a merge.
+#[test]
+fn f08_both_live_facts_undated_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Harbor runs on Python 3.11.",
+        vec![project("Harbor"), typed("Python 3.11", "language")],
+        vec![rel("Harbor", "runs on", "Python 3.11", true)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Lantern runs on Python 3.13.",
+        vec![project("Lantern"), typed("Python 3.13", "language")],
+        vec![rel("Lantern", "runs on", "Python 3.13", true)],
+        "2026-02-05",
+    );
+    let out = remember_at(
+        &engine,
+        "The Harbor pipeline was renamed to Lantern.",
+        vec![project("Harbor"), project("Lantern")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Harbor"),
+        card_id(&engine, "Lantern"),
+        "undated both-facts rename must not merge"
+    );
+    let reported = out.entities.iter().any(|e| !e.candidates.is_empty())
+        || out.hints.iter().any(|h| h.contains("Lantern"));
+    assert!(
+        reported,
+        "both-facts rename should report a candidate, got {:?} / {:?}",
+        out.entities, out.hints
+    );
+}
+
+/// Verifier F09: a bare shared first name ("Maya" for Maya Chen and Maya
+/// Patel) never renames.
+#[test]
+fn f09_shared_first_name_old_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Maya Chen works at Acme.",
+        vec![person("Maya Chen"), typed("Acme", "org")],
+        vec![rel("Maya Chen", "works at", "Acme", false)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Maya Patel works at Brightline.",
+        vec![person("Maya Patel"), typed("Brightline", "org")],
+        vec![rel("Maya Patel", "works at", "Brightline", false)],
+        "2026-01-06",
+    );
+    let out = remember_at(
+        &engine,
+        "Maya changed her name to Rio.",
+        vec![person("Maya"), person("Rio")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Maya Chen"),
+        card_id(&engine, "Maya Patel"),
+        "seeds must stay separate"
+    );
+    let reported = out.entities.iter().any(|e| !e.candidates.is_empty())
+        || out.hints.iter().any(|h| h.contains("Maya"));
+    assert!(
+        reported,
+        "shared-first-name rename should report a candidate, got {:?} / {:?}",
+        out.entities, out.hints
+    );
+    assert_ne!(
+        card_id(&engine, "Maya Chen"),
+        card_id(&engine, "Rio"),
+        "bare shared first name must not have merged into Rio"
+    );
+    assert_ne!(
+        card_id(&engine, "Maya Patel"),
+        card_id(&engine, "Rio"),
+        "bare shared first name must not have merged into Rio"
+    );
+}
+
+/// Verifier F09b: the NEW name is the shared first name ("Maya").
+#[test]
+fn f09b_shared_first_name_new_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Kim Lee works at Acme.",
+        vec![person("Kim Lee"), typed("Acme", "org")],
+        vec![rel("Kim Lee", "works at", "Acme", false)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Maya Chen works at Brightline.",
+        vec![person("Maya Chen"), typed("Brightline", "org")],
+        vec![rel("Maya Chen", "works at", "Brightline", false)],
+        "2026-01-06",
+    );
+    remember_at(
+        &engine,
+        "Maya Patel works at Initech.",
+        vec![person("Maya Patel"), typed("Initech", "org")],
+        vec![rel("Maya Patel", "works at", "Initech", false)],
+        "2026-01-07",
+    );
+    let out = remember_at(
+        &engine,
+        "Kim Lee changed her name to Maya.",
+        vec![person("Kim Lee"), person("Maya")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Kim Lee"),
+        card_id(&engine, "Maya Chen"),
+        "Kim Lee must not have merged into Maya Chen"
+    );
+    let reported = out.entities.iter().any(|e| !e.candidates.is_empty())
+        || out.hints.iter().any(|h| h.contains("Maya"));
+    assert!(
+        reported,
+        "shared-first-name new name should report a candidate, got {:?} / {:?}",
+        out.entities, out.hints
+    );
+}
+
+/// Verifier F11: a question is not a rename statement.
+#[test]
+fn f11_question_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Harbor runs on Python 3.11.",
+        vec![project("Harbor")],
+        vec![],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Was Harbor renamed to Lantern?",
+        vec![project("Harbor"), project("Lantern")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Harbor"),
+        card_id(&engine, "Lantern"),
+        "a question must not merge"
+    );
+}
+
+/// Verifier F12: a rename immediately reverted ("then back to Harbor") merges nothing.
+#[test]
+fn f12_reverted_rename_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Harbor runs on Python 3.11.",
+        vec![project("Harbor")],
+        vec![],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Harbor was renamed to Lantern, then back to Harbor.",
+        vec![project("Harbor"), project("Lantern")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Harbor"),
+        card_id(&engine, "Lantern"),
+        "a reverted rename must not merge"
+    );
+}
+
+/// Verifier F13: a plan stated after the cue ("planned for Q3") merges nothing.
+#[test]
+fn f13_planned_after_cue_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Harbor runs on Python 3.11.",
+        vec![project("Harbor")],
+        vec![],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "The rename of Harbor to Lantern is planned for Q3.",
+        vec![project("Harbor"), project("Lantern")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Harbor"),
+        card_id(&engine, "Lantern"),
+        "a planned rename must not merge"
+    );
+}
+
+/// Verifier F16: directory names are generic, never rename endpoints.
+#[test]
+fn f16_tests_directory_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Tests holds Fixtures.",
+        vec![typed("Tests", "directory"), typed("Fixtures", "directory")],
+        vec![rel("Tests", "holds", "Fixtures", false)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Specs holds Docs.",
+        vec![typed("Specs", "directory"), typed("Docs", "directory")],
+        vec![rel("Specs", "holds", "Docs", false)],
+        "2026-01-06",
+    );
+    remember_at(
+        &engine,
+        "We renamed the tests directory to specs.",
+        vec![typed("Tests", "directory"), typed("Specs", "directory")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Tests"),
+        card_id(&engine, "Specs"),
+        "tests->specs directory rename must not merge"
+    );
+}
+
+/// Verifier F17: "the main branch" is a generic phrase.
+#[test]
+fn f17_main_branch_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Main tracks Origin.",
+        vec![typed("Main", "branch"), typed("Origin", "branch")],
+        vec![rel("Main", "tracks", "Origin", false)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Release tracks Stable.",
+        vec![typed("Release", "branch"), typed("Stable", "branch")],
+        vec![rel("Release", "tracks", "Stable", false)],
+        "2026-01-06",
+    );
+    remember_at(
+        &engine,
+        "The main branch was renamed to release.",
+        vec![typed("Main", "branch"), typed("Release", "branch")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Main"),
+        card_id(&engine, "Release"),
+        "main branch -> release must not merge"
+    );
+}
+
+/// Verifier F20: the same branch->main generic rename in agent voice.
+#[test]
+fn f20_team_bare_verb_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Branch tracks Origin.",
+        vec![typed("Branch", "branch"), typed("Origin", "branch")],
+        vec![rel("Branch", "tracks", "Origin", false)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "main tracks Release.",
+        vec![typed("main", "branch"), typed("Release", "branch")],
+        vec![rel("main", "tracks", "Release", false)],
+        "2026-01-06",
+    );
+    remember_at(
+        &engine,
+        "The team renamed the branch to main.",
+        vec![
+            typed("Team", "team"),
+            typed("Branch", "branch"),
+            typed("main", "branch"),
+        ],
+        vec![],
+        "2026-06-01",
+    );
+    assert_ne!(
+        card_id(&engine, "Branch"),
+        card_id(&engine, "main"),
+        "team-renamed branch->main must not merge"
+    );
+}
+
+/// Verifier T01: "Harbor is now Lantern." is a rename.
+#[test]
+fn t01_is_now_name_merges() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Harbor runs on Python 3.11.",
+        vec![project("Harbor"), typed("Python 3.11", "language")],
+        vec![rel("Harbor", "runs on", "Python 3.11", true)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Harbor is now Lantern.",
+        vec![project("Harbor"), project("Lantern")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_eq!(
+        card_id(&engine, "Harbor"),
+        card_id(&engine, "Lantern"),
+        "T01 'is now <name>' must merge"
+    );
+}
+
+/// Verifier T02: parenthetical "(now Beacon)" is a rename.
+#[test]
+fn t02_parenthetical_now_merges() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Atlas uses npm.",
+        vec![project("Atlas"), typed("npm", "tool")],
+        vec![rel("Atlas", "uses", "npm", true)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Atlas (now Beacon) uses Swift.",
+        vec![
+            project("Atlas"),
+            project("Beacon"),
+            typed("Swift", "language"),
+        ],
+        vec![],
+        "2026-06-01",
+    );
+    assert_eq!(
+        card_id(&engine, "Atlas"),
+        card_id(&engine, "Beacon"),
+        "T02 '(now X)' must merge"
+    );
+}
+
+/// Verifier T09: "Lantern (renamed from Harbor)" without "to" is a rename.
+#[test]
+fn t09_renamed_from_without_to_merges() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Harbor runs on Python 3.11.",
+        vec![project("Harbor"), typed("Python 3.11", "language")],
+        vec![rel("Harbor", "runs on", "Python 3.11", true)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Lantern (renamed from Harbor) runs ingest.",
+        vec![project("Lantern"), project("Harbor")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_eq!(
+        card_id(&engine, "Harbor"),
+        card_id(&engine, "Lantern"),
+        "T09 'renamed from' must merge"
+    );
+}
+
+/// The CLI merge core now moves `relations.subj`: after `merge_entities`,
+/// a later exclusive fact on the survivor ends the moved stale fact (the
+/// merge command is unchanged-or-better).
+#[test]
+fn merge_command_moves_subj_and_ends_stale_exclusive_fact() {
+    let engine = new_engine();
+    let first = remember_at(
+        &engine,
+        "Atlas runs on Python 3.11.",
+        vec![project("Atlas"), typed("Python 3.11", "language")],
+        vec![rel("Atlas", "runs on", "Python 3.11", true)],
+        "2026-01-09",
+    );
+    remember_at(
+        &engine,
+        "Beacon runs on Python 3.13.",
+        vec![project("Beacon"), typed("Python 3.13", "language")],
+        vec![],
+        "2026-02-01",
+    );
+    // Merge via the command path (shares merge_entities_in with renames).
+    engine.merge_entities("Beacon", "Atlas", false).unwrap();
+    let survivor = card_id(&engine, "Beacon");
+    // The moved 3.11 fact now keys on subj=survivor, so the stranded 3.13
+    // value must end when a later exclusive fact lands.
+    let third = remember_at(
+        &engine,
+        "Beacon runs on Python 3.14.",
+        vec![project("Beacon"), typed("Python 3.14", "language")],
+        vec![rel("Beacon", "runs on", "Python 3.14", true)],
+        "2026-08-20",
+    );
+    assert!(
+        !third.invalidated_relations.is_empty(),
+        "merge must have moved subj so the exclusive slot ends stale facts"
+    );
+    let card = engine.entity("Beacon", 20).unwrap();
+    assert_eq!(card.card.id, survivor);
+    assert!(
+        card.current_facts
+            .iter()
+            .any(|f| f.fact.contains("Python 3.14")),
+        "current facts should hold Python 3.14, got {:?}",
+        card.current_facts
+    );
+    assert!(
+        !card
+            .current_facts
+            .iter()
+            .any(|f| f.fact.contains("Python 3.11")),
+        "Python 3.11 should not be current, got {:?}",
+        card.current_facts
+    );
+    // first stays referenced for id readability.
+    assert!(first.id > 0);
+}

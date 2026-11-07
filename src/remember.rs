@@ -496,12 +496,118 @@ const RENAME_NEW_FIRST: &[&str] = &[
 ];
 
 /// True when the sentence words just before the rename cue hedge or negate
-/// it ("might rename", "was not renamed"): such statements merge nothing.
+/// it ("might rename", "was not renamed"), or the words after the cue plan
+/// it ("planned for Q3"): such statements merge nothing.
 fn rename_blocked(words: &[String], cue_pos: usize) -> bool {
     let from = cue_pos.saturating_sub(5);
-    words[from..cue_pos].iter().any(|w| {
+    let hedge = |w: &String| {
         HEDGES.contains(&w.as_str()) || RENAME_HEDGES.contains(&w.as_str()) || negating_word(w)
-    })
+    };
+    if words[from..cue_pos].iter().any(hedge) {
+        return true;
+    }
+    // A plan stated after the cue ("... to Lantern is planned for Q3") is
+    // still a plan: scan the rest of the sentence after the cue.
+    words[cue_pos..].iter().any(hedge)
+}
+
+/// Common-noun name pieces: a rename never joins two names when either
+/// side is one of these ("the branch", "the meeting", "the tests
+/// directory", "the main branch", "the document"). A multi-word name merges
+/// only when every token is generic, so a proper name with a descriptive
+/// head ("Harbor directory") is not blocked by its head alone.
+const RENAME_GENERIC_NOUNS: &[&str] = &[
+    "branch",
+    "main",
+    "meeting",
+    "file",
+    "document",
+    "test",
+    "spec",
+    "directory",
+    "folder",
+    "dir",
+    "team",
+    "release",
+    "origin",
+    "stable",
+    "pipeline",
+    "project",
+    "system",
+    "service",
+    "database",
+    "config",
+];
+
+/// True when a rename endpoint is a common-noun phrase or a file name,
+/// never a proper name: "Branch", "main", "Meeting", "tests directory",
+/// "main branch", "Document", or any dotted/file-like name ("config.yaml",
+/// "README.md").
+fn rename_is_generic(display: &str, norm: &str) -> bool {
+    if display.contains('.') || display.contains('/') {
+        return true;
+    }
+    if norm.is_empty() {
+        return false;
+    }
+    norm.split_whitespace()
+        .all(|t| RENAME_GENERIC_NOUNS.contains(&t))
+}
+
+/// True when the rename sentence states a date that can order a rename
+/// against two competing live facts (a four-digit year, "in July 2026").
+fn rename_sentence_has_date(content: &str) -> bool {
+    text::fold(content)
+        .split_whitespace()
+        .any(|w| w.len() == 4 && w.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Does this entity have a live fact from a different memory (so a rename
+/// written in the current memory does not count as its own prior fact)?
+fn entity_has_live_facts(db: &Db, entity: i64, memory_id: i64) -> Result<bool> {
+    Ok(db.sql().query_row(
+        "SELECT EXISTS(SELECT 1 FROM relations r
+         WHERE (r.src=?1 OR r.dst=?1 OR r.subj=?1)
+           AND r.expired_at IS NULL AND r.valid_to IS NULL AND r.polarity=1
+           AND NOT EXISTS (SELECT 1 FROM relation_evidence e
+                           WHERE e.relation_id=r.id AND e.memory_id=?2))",
+        rusqlite::params![entity, memory_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Stored people whose first name (first norm token) is `token`, excluding
+/// the two ids already being renamed (so a person's own rename to another
+/// full name sharing the first name is not blocked by its own old name).
+fn shared_first_name_people(
+    db: &Db,
+    token: &str,
+    exclude_a: i64,
+    exclude_b: i64,
+) -> Result<Vec<(i64, String, String)>> {
+    if token.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut st = db.sql().prepare(
+        "SELECT id,name,type FROM entities
+         WHERE type='person' COLLATE NOCASE
+           AND (norm=?1 OR norm LIKE ?1 || ' %')",
+    )?;
+    let rows = st.query_map([token], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, name, kind) = row?;
+        if id != exclude_a && id != exclude_b {
+            out.push((id, name, kind));
+        }
+    }
+    Ok(out)
 }
 
 /// One rename candidate `(old name, new name)` as stated in a write.
@@ -541,16 +647,44 @@ fn rename_pairs(
             .collect()
     };
     let word_of: Vec<Vec<String>> = names.iter().map(|n| tokens(n)).collect();
-    for sentence in content.split(['.', ';', '!', '?', '\n']) {
-        let words = tokens(sentence);
+    // Sentence chunks with their terminator: a question ("Was Harbor
+    // renamed to Lantern?") is never a rename statement.
+    let mut sentences: Vec<(String, char)> = Vec::new();
+    let mut current = String::new();
+    for ch in content.chars() {
+        if matches!(ch, '.' | ';' | '!' | '?' | '\n') {
+            sentences.push((std::mem::take(&mut current), ch));
+        } else {
+            current.push(ch);
+        }
+    }
+    sentences.push((current, ' '));
+    for (sentence, terminator) in sentences {
+        if terminator == '?' {
+            continue;
+        }
+        let words = tokens(&sentence);
         if words.len() < 3 {
+            continue;
+        }
+        // "then back to <old>" reverts the rename in the same sentence.
+        if words.windows(2).any(|w| w == ["back", "to"])
+            || words.iter().any(|w| w.starts_with("revert"))
+        {
             continue;
         }
         // Fast path: most memories say nothing about a rename.
         if !words.iter().any(|w| {
             matches!(
                 w.as_str(),
-                "renamed" | "rename" | "called" | "formerly" | "previously" | "changed" | "known"
+                "renamed"
+                    | "rename"
+                    | "called"
+                    | "formerly"
+                    | "previously"
+                    | "changed"
+                    | "known"
+                    | "now"
             )
         }) {
             continue;
@@ -576,7 +710,9 @@ fn rename_pairs(
                 .position(|w| w.iter().map(String::as_str).eq(cue.iter().copied()))
         };
         // Old-first gaps ("Harbor was renamed to Lantern"): the cue sits
-        // between the old occurrence and the new one.
+        // between the old occurrence and the new one, and must end
+        // immediately before the new name so "now called by the team"
+        // (agent after the cue) does not count as the rename target.
         for &(oi, os, ol) in &occ {
             for &(ni, ns, _) in &occ {
                 if ni == oi || ns <= os + ol {
@@ -594,7 +730,9 @@ fn rename_pairs(
                     &["now", "known", "as"][..],
                 ] {
                     if let Some(p) = contains(gap, cue) {
-                        cue_at = Some(os + ol + p);
+                        if p + cue.len() == gap.len() {
+                            cue_at = Some(os + ol + p);
+                        }
                         break;
                     }
                 }
@@ -608,9 +746,18 @@ fn rename_pairs(
                                 .iter()
                                 .position(|w| w == "name")
                                 .is_some_and(|p| p + 1 < rest.len() && rest[p + 1] == "to")
+                            && rest.last().is_some_and(|w| w == "to")
                         {
                             cue_at = Some(os + ol + g);
                         }
+                    }
+                }
+                if cue_at.is_none() && gap.last().is_some_and(|w| w == "now") {
+                    // "Harbor is now Lantern" / "Atlas (now Beacon)": a bare
+                    // "now" immediately before the new name (with "is" for
+                    // the non-parenthetical form).
+                    if gap.len() == 1 || gap.iter().any(|w| w == "is") {
+                        cue_at = Some(os + ol + gap.len() - 1);
                     }
                 }
                 if let Some(cue) = cue_at {
@@ -645,6 +792,23 @@ fn rename_pairs(
                         && *s <= os + ol + 4
                         && words[os + ol..*s].last().is_some_and(|w| w == "to")
                 }) {
+                    pairs.push((oi, ni, c));
+                }
+            }
+        }
+        // "<new> (renamed from <old>)" without "to": the new name precedes
+        // the cue, the old name trails "from".
+        for c in 0..words.len().saturating_sub(1) {
+            if !matches!(words[c].as_str(), "renamed" | "rename") || words[c + 1] != "from" {
+                continue;
+            }
+            let new = occ
+                .iter()
+                .filter(|(_, s, _)| *s < c)
+                .max_by_key(|(_, s, _)| *s);
+            let old = occ.iter().find(|(_, s, _)| *s >= c + 2 && *s < c + 5);
+            if let (Some(&(ni, _, _)), Some(&(oi, _, _))) = (new, old) {
+                if ni != oi {
                     pairs.push((oi, ni, c));
                 }
             }
@@ -696,6 +860,12 @@ fn rename_pairs(
         if r.negated == Some(true) {
             continue;
         }
+        // A question or a reversion is not a rename, whatever the predicate.
+        if content.trim_end().ends_with('?')
+            || content_words.windows(2).any(|w| w == ["back", "to"])
+        {
+            continue;
+        }
         let folded = text::fold(&r.predicate);
         let folded = folded.trim();
         let pair = if RENAME_OLD_FIRST.contains(&folded) {
@@ -742,6 +912,7 @@ fn apply_rename(
     resolutions: &mut [EntityResolution],
     old_name: &str,
     new_name: &str,
+    content: &str,
     old_vector: &[f32],
     content_vector: &[f32],
     memory_id: i64,
@@ -790,6 +961,19 @@ fn apply_rename(
         ));
         return Ok(());
     }
+    // A common-noun phrase or file name never joins two proper names
+    // ("the branch", "the meeting", "README.md" merge nothing).
+    if rename_is_generic(&old_display, &norm_old) || rename_is_generic(&new_display, &norm_new) {
+        let which = if rename_is_generic(&old_display, &norm_old) {
+            &old_display
+        } else {
+            &new_display
+        };
+        hints.push(format!(
+            "rename skipped: \"{which}\" is a generic noun or file name, not a proper name"
+        ));
+        return Ok(());
+    }
     // Several entities under the old name: merge nothing, offer candidates.
     let named: Vec<i64> = {
         let mut st = db.sql().prepare(
@@ -829,6 +1013,148 @@ fn apply_rename(
         hints.push(format!(
             "rename not applied: \"{old_display}\" names {} entities; merge it explicitly with neocortex merge",
             named.len()
+        ));
+        return Ok(());
+    }
+    // Several entities under the NEW name: the same guard, symmetrically.
+    let named_new: Vec<i64> = {
+        let mut st = db.sql().prepare(
+            "SELECT DISTINCT x FROM (
+                 SELECT entity_id AS x FROM entity_aliases WHERE alias_norm=?1
+                 UNION SELECT id FROM entities WHERE norm=?1)",
+        )?;
+        let rows = st.query_map([&norm_new], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if named_new.len() > 1 {
+        let positions: Vec<usize> = resolutions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| text::norm_name(&r.name) == norm_new)
+            .map(|(i, _)| i)
+            .collect();
+        for pos in positions {
+            let mut candidates = Vec::new();
+            for id in &named_new {
+                let (name, kind): (String, String) = db.sql().query_row(
+                    "SELECT name,type FROM entities WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                candidates.push(crate::engine::EntityCandidate {
+                    id: *id,
+                    name,
+                    kind,
+                    description: String::new(),
+                    score: None,
+                });
+            }
+            resolutions[pos].candidates = candidates;
+            resolutions[pos].status = "ambiguous".into();
+        }
+        hints.push(format!(
+            "rename not applied: \"{new_display}\" names {} entities; merge it explicitly with neocortex merge",
+            named_new.len()
+        ));
+        return Ok(());
+    }
+    // A bare first name never renames: "Maya changed her name to Rio" stays
+    // a conflict when Maya Chen and Maya Patel share the first name (and a
+    // lone bare first name is still not a full-name rename). Full names
+    // sharing a first name ("Kim Lee" -> "Kim Stone") are unaffected.
+    for (norm, typ, display) in [
+        (&norm_old, &old_type, &old_display),
+        (&norm_new, &new_type, &new_display),
+    ] {
+        let mut tokens = norm.split_whitespace();
+        let (Some(first), second) = (tokens.next(), tokens.next()) else {
+            continue;
+        };
+        if second.is_some() {
+            continue;
+        }
+        let shared = shared_first_name_people(db, first, old_id, new_id)?;
+        let is_first_name = typ.eq_ignore_ascii_case("person") || !shared.is_empty();
+        if !is_first_name {
+            continue;
+        }
+        let positions: Vec<usize> = resolutions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| text::norm_name(&r.name) == *norm)
+            .map(|(i, _)| i)
+            .collect();
+        let mut candidates = Vec::new();
+        for (id, name, kind) in &shared {
+            candidates.push(crate::engine::EntityCandidate {
+                id: *id,
+                name: name.clone(),
+                kind: kind.clone(),
+                description: String::new(),
+                score: None,
+            });
+        }
+        if candidates.is_empty() {
+            let id = if norm == &norm_old { old_id } else { new_id };
+            let (name, kind): (String, String) =
+                db.sql()
+                    .query_row("SELECT name,type FROM entities WHERE id=?1", [id], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
+            candidates.push(crate::engine::EntityCandidate {
+                id,
+                name,
+                kind,
+                description: String::new(),
+                score: None,
+            });
+        }
+        for pos in positions {
+            resolutions[pos].candidates = candidates.clone();
+            resolutions[pos].status = "ambiguous".into();
+        }
+        hints.push(format!(
+            "rename not applied: \"{display}\" is a first name naming {} people; use a full name or merge it explicitly with neocortex merge",
+            shared.len()
+        ));
+        return Ok(());
+    }
+    // Two established things with their own live facts: without a date in
+    // the sentence there is no evidence which fact is stale, so the rename
+    // is a candidate, never a silent merge.
+    if entity_has_live_facts(db, old_id, memory_id)?
+        && entity_has_live_facts(db, new_id, memory_id)?
+        && !rename_sentence_has_date(content)
+    {
+        for (norm, other_id, other_display) in [
+            (&norm_old, new_id, &new_display),
+            (&norm_new, old_id, &old_display),
+        ] {
+            let (name, kind): (String, String) = db.sql().query_row(
+                "SELECT name,type FROM entities WHERE id=?1",
+                [other_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let _ = other_display;
+            let positions: Vec<usize> = resolutions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| text::norm_name(&r.name) == *norm)
+                .map(|(i, _)| i)
+                .collect();
+            for pos in positions {
+                resolutions[pos].candidates = vec![crate::engine::EntityCandidate {
+                    id: other_id,
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    description: String::new(),
+                    score: None,
+                }];
+                resolutions[pos].status = "ambiguous".into();
+            }
+        }
+        hints.push(format!(
+            "rename not applied: \"{old_display}\" and \"{new_display}\" each have live facts and the sentence states no date; merge it explicitly with neocortex merge"
         ));
         return Ok(());
     }
@@ -2910,6 +3236,7 @@ fn write_prepared(
                 &mut resolutions,
                 &old_name,
                 &new_name,
+                &content,
                 &old_vector,
                 &content_vector,
                 id,

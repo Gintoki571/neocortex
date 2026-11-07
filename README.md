@@ -356,8 +356,10 @@ also render the interval with a computed duration ("3 years 2 months",
   or as a relation with predicate "renamed to" / "now called" / "formerly
   called") makes one entity — the old name becomes an alias of the surviving
   (new) name, old facts move to it, and a "Lantern formerly called Harbor"
-  fact keeps the old name answerable. Hedged ("might rename"), negated
-  ("did not rename") or ambiguous (several entities named Harbor) renames
+  fact keeps the old name answerable. Hedged ("might rename", "planned for
+  Q3"), negated ("did not rename"), questioned, reverted ("then back to
+  Harbor"), passive ("called by the team"), generic ("the branch", "the
+  meeting", a file name), bare-first-name, or undated both-facts renames
   merge nothing.
 - Inverse and symmetric phrases: "X reports to Y" is stored once as "Y manages
   X" (or, for "married to", with both ends in storage order) and every side

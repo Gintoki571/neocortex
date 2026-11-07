@@ -108,9 +108,12 @@ Store something when it will still matter next week:
   called" / "formerly called") merges the two names into one entity — the old
   name stays as an alias of the surviving (new) name, old facts move to it,
   and a "Lantern formerly called Harbor" fact keeps the old name answerable.
-  A hedged ("might rename", "plan to rename"), negated ("did not rename") or
-  ambiguous (several entities named Harbor) rename merges nothing, so write it
-  as a plan instead and merge by hand when it happens.
+  A hedged ("might rename", "plan to rename", "planned for Q3"), negated
+  ("did not rename"), questioned ("Was X renamed?"), reverted ("then back
+  to Harbor"), passive ("called by the team"), generic ("the branch", "the
+  meeting", a file name), bare-first-name, or undated both-facts rename
+  merges nothing, so write it as a plan instead and merge by hand when it
+  happens. "X is now Y", "Y (now Z)" and "Y (renamed from X)" also merge.
 - **Text-only retraction**: a sentence with no relation ("Ivan left Acme; he no
   longer works there") ends the one live fact it names, at `valid_from`, and
   reports it as `invalidated`. It also runs on a write that supplies its own
