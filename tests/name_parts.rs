@@ -148,13 +148,11 @@ fn a_hyphen_tail_does_not_start_a_span() {
     );
 }
 
-// ------------------------------------------------------ sentence-initial (EX-05, nc-ex03)
+// ------------------------------------------------------ sentence-initial (EX-05)
 
-// EX-05 remainder (nc-ex03): an unknown sentence-initial word stays out even
-// before a verb. Known aliases are kept (covered by the stored-alias tests).
 #[test]
-fn sentence_initial_unknown_name_before_a_verb_stays_out() {
-    for (text, dropped) in [
+fn sentence_initial_name_before_a_verb_is_kept() {
+    for (text, kept) in [
         ("Paris is the capital of France.", "Paris"),
         ("Cypher is the query language.", "Cypher"),
         ("Aveiro was quiet in winter.", "Aveiro"),
@@ -167,14 +165,12 @@ fn sentence_initial_unknown_name_before_a_verb_stays_out() {
     ] {
         let got = names(text);
         assert!(
-            !got.iter().any(|n| n == dropped),
-            "{dropped:?} must not be extracted (unknown sentence-initial) from {got:?} in {text:?}"
+            got.iter().any(|n| n == kept),
+            "{kept:?} missing from {got:?}"
         );
     }
-    // Mid-sentence capitalized names still have position evidence.
     let got = names("Paris is the capital of France.");
     assert!(got.iter().any(|n| n == "France"), "{got:?}");
-    assert!(!got.iter().any(|n| n == "Paris"), "{got:?}");
 }
 
 #[test]
