@@ -132,9 +132,7 @@ fn read_row(r: &rusqlite::Row) -> rusqlite::Result<MemoryRow> {
 fn fetch_rows(db: &Db, ids: &[i64]) -> Result<HashMap<i64, MemoryRow>> {
     let mut out = HashMap::new();
     for chunk in ids.chunks(400) {
-        let marks = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; chunk.len()].join(",");
         let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id IN ({marks})");
         let mut st = db.sql().prepare(&sql)?;
         let mut rows = st.query(params_from_iter(chunk.iter()))?;
@@ -146,13 +144,28 @@ fn fetch_rows(db: &Db, ids: &[i64]) -> Result<HashMap<i64, MemoryRow>> {
     Ok(out)
 }
 
+/// Read the rows `ids` adds to `rows`, then drop the ids `keep` rejects.
+fn fetch_kept(
+    db: &Db,
+    rows: &mut HashMap<i64, MemoryRow>,
+    ids: &mut Vec<i64>,
+    keep: &dyn Fn(&MemoryRow) -> bool,
+) -> Result<()> {
+    let missing: Vec<i64> = ids
+        .iter()
+        .copied()
+        .filter(|id| !rows.contains_key(id))
+        .collect();
+    rows.extend(fetch_rows(db, &missing)?);
+    ids.retain(|id| rows.get(id).is_some_and(keep));
+    Ok(())
+}
+
 /// Memories that mention any of the entities, deduplicated and in id order.
 fn memories_mentioning(db: &Db, entities: &[i64]) -> Result<Vec<i64>> {
     let mut out = Vec::new();
     for chunk in entities.chunks(400) {
-        let marks = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; chunk.len()].join(",");
         let sql = format!("SELECT DISTINCT memory_id FROM mentions WHERE entity_id IN ({marks})");
         let mut st = db.sql().prepare(&sql)?;
         for id in st.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, i64>(0))? {
@@ -177,9 +190,7 @@ fn temporal_link_ids(db: &Db, seeds: &[(i64, f64)], keep: usize, depth: usize) -
     let cosine: HashMap<i64, f64> = seeds.iter().copied().collect();
     let mut scores: HashMap<i64, f64> = HashMap::new();
     for chunk in ids.chunks(400) {
-        let marks = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; chunk.len()].join(",");
         let sql =
             format!("SELECT a,b,weight FROM memory_links WHERE a IN ({marks}) OR b IN ({marks})");
         let mut st = db.sql().prepare(&sql)?;
@@ -565,9 +576,7 @@ fn structured_filters(
 fn alias_entities(db: &Db, names: &[String]) -> Result<Vec<i64>> {
     let mut out = HashSet::new();
     for chunk in names.chunks(400) {
-        let marks = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; chunk.len()].join(",");
         let sql =
             format!("SELECT DISTINCT entity_id FROM entity_aliases WHERE alias_norm IN ({marks})");
         let mut st = db.sql().prepare(&sql)?;
@@ -579,27 +588,6 @@ fn alias_entities(db: &Db, names: &[String]) -> Result<Vec<i64>> {
     let mut ids: Vec<i64> = out.into_iter().collect();
     ids.sort_unstable();
     Ok(ids)
-}
-
-fn relation_visible(
-    valid_from: i64,
-    valid_to: Option<i64>,
-    expired: Option<i64>,
-    now: i64,
-    history: bool,
-    as_of: Option<i64>,
-) -> bool {
-    let t = as_of.unwrap_or(now);
-    if valid_from > t {
-        return false;
-    }
-    if as_of.is_some() {
-        return valid_to.is_none_or(|v| t < v);
-    }
-    if history {
-        return true;
-    }
-    valid_to.is_none_or(|v| now < v) && expired.is_none()
 }
 
 /// Relation-fact seeds: `relations_fts` hits and `relations_vec` KNN, both
@@ -632,6 +620,11 @@ fn relation_seeds_with_config(
     prefix_min: usize,
     options: RelationSeedOptions<'_>,
 ) -> Result<(SeedPairs, SeedPairs)> {
+    let vis = paths::Visibility {
+        now,
+        as_of,
+        history,
+    };
     let mut entities = Vec::new();
     let mut memories = Vec::new();
     let mut add = |relation_id: i64, src: i64, dst: i64, score: f64| -> Result<()> {
@@ -681,9 +674,7 @@ fn relation_seeds_with_config(
         let mut seeds: Vec<i64> = options.query_entities.iter().copied().collect();
         seeds.sort_unstable();
         seeds.truncate(REL_PREFILTER_SEEDS);
-        let marks = std::iter::repeat_n("?", seeds.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; seeds.len()].join(",");
         let sql = format!(
             "SELECT id,src,dst,valid_from,valid_to,expired_at FROM relations
              WHERE (src IN ({marks}) OR dst IN ({marks}))
@@ -702,7 +693,7 @@ fn relation_seeds_with_config(
             let vf: i64 = r.get(3)?;
             let vt: Option<i64> = r.get(4)?;
             let expired: Option<i64> = r.get(5)?;
-            if !relation_visible(vf, vt, expired, now, history, as_of) {
+            if !vis.shows(vf, vt, expired) {
                 continue;
             }
             let Some(v) = vector_st
@@ -737,9 +728,7 @@ fn relation_seeds_with_config(
             .map(|(id, _)| *id)
             .collect();
         if !ids.is_empty() {
-            let marks = std::iter::repeat_n("?", ids.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let marks = vec!["?"; ids.len()].join(",");
             let sql = format!(
                 "SELECT id,src,dst,valid_from,valid_to,expired_at FROM relations WHERE id IN ({marks})"
             );
@@ -753,7 +742,7 @@ fn relation_seeds_with_config(
                 let vf: i64 = r.get(3)?;
                 let vt: Option<i64> = r.get(4)?;
                 let expired: Option<i64> = r.get(5)?;
-                if relation_visible(vf, vt, expired, now, history, as_of) {
+                if vis.shows(vf, vt, expired) {
                     visible.insert(id, (src, dst));
                 }
             }
@@ -801,9 +790,7 @@ fn bridge_words(engine: &Engine, ids: &[i64]) -> Result<HashSet<String>> {
         if chunk.is_empty() {
             continue;
         }
-        let marks = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; chunk.len()].join(",");
         let sql = format!("SELECT name FROM entities WHERE id IN ({marks})");
         let mut st = engine.db.sql().prepare(&sql)?;
         for name in st.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, String>(0))? {
@@ -1442,6 +1429,8 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         depth
     };
     let mut rows: HashMap<i64, MemoryRow> = HashMap::new();
+    let keep =
+        |row: &MemoryRow| eligible(row, as_of, history, input, since, until, now, planned_ok);
 
     // ------------------------------------------------------------ bm25
     let mut bm25_scored: Vec<(i64, f64)> = Vec::new();
@@ -1464,11 +1453,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     rows.extend(fetch_rows(&engine.db, &missing)?);
     let bm25_scored: Vec<(i64, f64)> = bm25_scored
         .into_iter()
-        .filter(|(id, _)| {
-            rows.get(id).is_some_and(|row| {
-                eligible(row, as_of, history, input, since, until, now, planned_ok)
-            })
-        })
+        .filter(|(id, _)| rows.get(id).is_some_and(keep))
         .collect();
     let best_bm25 = bm25_scored
         .iter()
@@ -1499,11 +1484,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     rows.extend(fetch_rows(&engine.db, &missing)?);
     let mut vec_ranked: Vec<(i64, f64)> = knn
         .into_iter()
-        .filter(|(id, _)| {
-            rows.get(id).is_some_and(|row| {
-                eligible(row, as_of, history, input, since, until, now, planned_ok)
-            })
-        })
+        .filter(|(id, _)| rows.get(id).is_some_and(keep))
         .map(|(id, cosine)| (id, f64::from(cosine)))
         .collect();
     vec_ranked.truncate(depth);
@@ -1541,20 +1522,8 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                     .get(id)
                     .is_some_and(|row| row.9 >= w.start && row.9 < w.end)
         }));
-        let missing: Vec<i64> = candidates
-            .iter()
-            .copied()
-            .filter(|id| !rows.contains_key(id))
-            .collect();
-        rows.extend(fetch_rows(&engine.db, &missing)?);
-        let in_window: Vec<i64> = candidates
-            .into_iter()
-            .filter(|id| {
-                rows.get(id).is_some_and(|row| {
-                    eligible(row, as_of, history, input, since, until, now, planned_ok)
-                })
-            })
-            .collect();
+        fetch_kept(&engine.db, &mut rows, &mut candidates, &keep)?;
+        let in_window = candidates;
         let vectors = fetch_vectors(&engine.db, &in_window)?;
         let mut scored: Vec<(i64, f64)> = in_window
             .into_iter()
@@ -1641,9 +1610,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let seed_ids: Vec<i64> = ent_seeds.keys().copied().collect();
     let mut specificity: HashMap<i64, i64> = HashMap::new();
     for chunk in seed_ids.chunks(400) {
-        let marks = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; chunk.len()].join(",");
         let sql =
             format!("SELECT entity_id,COUNT(*) FROM mentions WHERE entity_id IN ({marks}) GROUP BY entity_id");
         let mut st = engine.db.sql().prepare(&sql)?;
@@ -1703,21 +1670,8 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         }
     }
     graph_ids.truncate(fetch_depth);
-    let missing: Vec<i64> = graph_ids
-        .iter()
-        .copied()
-        .filter(|id| !rows.contains_key(id))
-        .collect();
-    rows.extend(fetch_rows(&engine.db, &missing)?);
-    let graph_ids: Vec<i64> = graph_ids
-        .into_iter()
-        .filter(|id| {
-            rows.get(id).is_some_and(|row| {
-                eligible(row, as_of, history, input, since, until, now, planned_ok)
-            })
-        })
-        .take(depth)
-        .collect();
+    fetch_kept(&engine.db, &mut rows, &mut graph_ids, &keep)?;
+    graph_ids.truncate(depth);
 
     // ---------------------------------------------------------- anchor
     // The memories of the exact anchors (the entities the question names),
@@ -1745,12 +1699,8 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         let strong: Vec<i64> = anchors.strong.clone();
         let mut cand: Vec<i64> = Vec::new();
         if !graph_ids.is_empty() {
-            let marks = std::iter::repeat_n("?", graph_ids.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let emarks = std::iter::repeat_n("?", strong.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let marks = vec!["?"; graph_ids.len()].join(",");
+            let emarks = vec!["?"; strong.len()].join(",");
             let sql = format!(
                 "SELECT DISTINCT memory_id FROM mentions
                  WHERE memory_id IN ({marks}) AND entity_id IN ({emarks})"
@@ -1774,11 +1724,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         // dense rank is drowned by the world cluster, but among the anchor's
         // own top-PPR memories the on-topic hit is near the head.
         anchor_ids = top_by_cosine(&engine.db, &cand, &query_vec, depth)?;
-        anchor_ids.retain(|id| {
-            rows.get(id).is_some_and(|row| {
-                eligible(row, as_of, history, input, since, until, now, planned_ok)
-            })
-        });
+        anchor_ids.retain(|id| rows.get(id).is_some_and(keep));
         anchor_ids.truncate(depth);
     }
 
@@ -1844,20 +1790,8 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     };
     let mut path_ids = paths::evidence(&engine.db, &lexical_hits)?;
     let mut sem_ids = paths::evidence(&engine.db, &sem_hits)?;
-    let missing: Vec<i64> = path_ids
-        .iter()
-        .chain(&sem_ids)
-        .copied()
-        .filter(|id| !rows.contains_key(id))
-        .collect();
-    rows.extend(fetch_rows(&engine.db, &missing)?);
-    for ids in [&mut path_ids, &mut sem_ids] {
-        ids.retain(|id| {
-            rows.get(id).is_some_and(|row| {
-                eligible(row, as_of, history, input, since, until, now, planned_ok)
-            })
-        });
-    }
+    fetch_kept(&engine.db, &mut rows, &mut path_ids, &keep)?;
+    fetch_kept(&engine.db, &mut rows, &mut sem_ids, &keep)?;
     sem_ids.truncate(depth);
     let top_chains = paths::top_chains(&lexical_hits, &sem_hits);
     path_ids.truncate(depth);
@@ -1870,16 +1804,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     } else {
         Vec::new()
     };
-    let missing: Vec<i64> = causal_ids
-        .iter()
-        .copied()
-        .filter(|id| !rows.contains_key(id))
-        .collect();
-    rows.extend(fetch_rows(&engine.db, &missing)?);
-    causal_ids.retain(|id| {
-        rows.get(id)
-            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
-    });
+    fetch_kept(&engine.db, &mut rows, &mut causal_ids, &keep)?;
     causal_ids.truncate(depth);
 
     // ----------------------------------------------------------- tlink
@@ -1890,16 +1815,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     } else {
         Vec::new()
     };
-    let missing: Vec<i64> = tlink_ids
-        .iter()
-        .copied()
-        .filter(|id| !rows.contains_key(id))
-        .collect();
-    rows.extend(fetch_rows(&engine.db, &missing)?);
-    tlink_ids.retain(|id| {
-        rows.get(id)
-            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
-    });
+    fetch_kept(&engine.db, &mut rows, &mut tlink_ids, &keep)?;
     tlink_ids.truncate(depth);
 
     // ------------------------------------------------------- exclusion
@@ -1923,16 +1839,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             .filter(|id| !lacking.contains(id))
             .collect();
     }
-    let missing: Vec<i64> = excl_ids
-        .iter()
-        .copied()
-        .filter(|id| !rows.contains_key(id))
-        .collect();
-    rows.extend(fetch_rows(&engine.db, &missing)?);
-    excl_ids.retain(|id| {
-        rows.get(id)
-            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
-    });
+    fetch_kept(&engine.db, &mut rows, &mut excl_ids, &keep)?;
     excl_ids.truncate(depth);
 
     // ---------------------------------------------------------- status
@@ -1951,10 +1858,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     } else {
         (Vec::new(), HashSet::new())
     };
-    status_ids.retain(|id| {
-        rows.get(id)
-            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
-    });
+    status_ids.retain(|id| rows.get(id).is_some_and(keep));
 
     let mut channels = vec![
         rank::Channel {
@@ -2025,16 +1929,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     } else {
         (Vec::new(), Vec::new())
     };
-    let missing: Vec<i64> = cause_ids
-        .iter()
-        .copied()
-        .filter(|id| !rows.contains_key(id))
-        .collect();
-    rows.extend(fetch_rows(&engine.db, &missing)?);
-    cause_ids.retain(|id| {
-        rows.get(id)
-            .is_some_and(|row| eligible(row, as_of, history, input, since, until, now, planned_ok))
-    });
+    fetch_kept(&engine.db, &mut rows, &mut cause_ids, &keep)?;
     if !cause_ids.is_empty() {
         channels.push(rank::Channel {
             name: "cause",
@@ -2049,9 +1944,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         let ids: Vec<i64> = fused.iter().map(|f| f.id).collect();
         let mut times: HashMap<i64, Vec<i64>> = HashMap::new();
         for chunk in ids.chunks(400) {
-            let marks = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let marks = vec!["?"; chunk.len()].join(",");
             let sql =
                 format!("SELECT memory_id,at FROM memory_access WHERE memory_id IN ({marks})");
             let mut st = engine.db.sql().prepare(&sql)?;
@@ -2319,9 +2212,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         let _ = engine
             .db
             .write_within(crate::db::OPEN_BUSY, |db| {
-            let marks = std::iter::repeat_n("?", returned_memory_ids.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let marks = vec!["?"; returned_memory_ids.len()].join(",");
             let sql = format!(
                 "UPDATE memories SET access_count=access_count+1,last_access=?1 WHERE id IN ({marks})"
             );
@@ -2362,24 +2253,20 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         if chunk.is_empty() {
             continue;
         }
-        let marks = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; chunk.len()].join(",");
         let sql = format!("SELECT DISTINCT entity_id FROM mentions WHERE memory_id IN ({marks})");
         let mut st = engine.db.sql().prepare(&sql)?;
         for entity_id in st.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, i64>(0))? {
             relevant_entities.insert(entity_id?);
         }
     }
-    let top_entities: Vec<i64> = ppr_score
+    let mut top_entities: Vec<(i64, f64)> = ppr_score
         .iter()
         .filter(|(id, _)| relevant_entities.contains(id) && snap.ent_node.contains_key(id))
         .map(|(id, s)| (*id, *s))
-        .sorted_by_score()
-        .into_iter()
-        .take(10)
-        .map(|x| x.0)
         .collect();
+    top_entities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let top_entities: Vec<i64> = top_entities.into_iter().take(10).map(|x| x.0).collect();
     // A time window asks about past states too, so ended facts stay in view.
     let facts = facts_for_view(
         engine,
@@ -2422,7 +2309,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             let Some(row) = rows_to_add.get(&id) else {
                 continue;
             };
-            if !eligible(row, as_of, history, input, since, until, now, planned_ok) {
+            if !keep(row) {
                 continue;
             }
             memories.push(MemoryHit {
@@ -2451,11 +2338,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         if !top_chains.is_empty() {
             let prose = paths::prose_facts(&engine.db, &sem_hits, engine.cfg.prose_margin, cutoff)?
                 .into_iter()
-                .filter(|fact| {
-                    rows.get(&fact.id).is_some_and(|row| {
-                        eligible(row, as_of, history, input, since, until, now, planned_ok)
-                    })
-                });
+                .filter(|fact| rows.get(&fact.id).is_some_and(keep));
             merged.extend(prose);
             for fact in paths::facts(&engine.db, &top_chains, cutoff, 8)? {
                 if !merged.iter().any(|existing| existing.id == fact.id) {
@@ -2582,7 +2465,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             let Some(row) = rows_to_add.get(&id) else {
                 continue;
             };
-            if !eligible(row, as_of, history, input, since, until, now, planned_ok) {
+            if !keep(row) {
                 continue;
             }
             memories.push(MemoryHit {
@@ -2612,9 +2495,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             if chunk.is_empty() {
                 continue;
             }
-            let marks = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
+            let marks = vec!["?"; chunk.len()].join(",");
             let sql = format!("SELECT name FROM entities WHERE id IN ({marks})");
             let mut st = engine.db.sql().prepare(&sql)?;
             for n in st.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, String>(0))? {
@@ -2724,17 +2605,6 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         omitted: selected.len().saturating_sub(kept.len()),
         over_budget,
     })
-}
-
-trait ScoreOrder {
-    fn sorted_by_score(self) -> Vec<(i64, f64)>;
-}
-impl<I: Iterator<Item = (i64, f64)>> ScoreOrder for I {
-    fn sorted_by_score(self) -> Vec<(i64, f64)> {
-        let mut v: Vec<_> = self.collect();
-        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        v
-    }
 }
 
 fn card(engine: &Engine, id: i64) -> Result<EntityCard> {
@@ -2868,9 +2738,7 @@ fn facts_for_view(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let marks = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; ids.len()].join(",");
     let mut st = engine.db.sql().prepare(&format!(
         "SELECT r.id,r.src,r.dst,
             COALESCE(NULLIF(r.predicate_text,''),NULLIF(p.display,''),p.canonical),
@@ -3168,9 +3036,7 @@ fn asked_relation(engine: &Engine, query: &str) -> Result<Option<AskedRelation>>
     let mut norms: Vec<&str> = windows.iter().map(|(_, norm)| norm.as_str()).collect();
     norms.sort_unstable();
     norms.dedup();
-    let marks = std::iter::repeat_n("?", norms.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; norms.len()].join(",");
     let sql = format!(
         "SELECT a.alias_norm, COALESCE(NULLIF(p.group_id,0),p.id),
                 COALESCE(g.canonical,p.canonical), p.inverse_of, p.id
@@ -3226,9 +3092,7 @@ fn anchor_mentions(
         return Ok(Vec::new());
     }
     let ids: Vec<i64> = anchors.iter().copied().take(64).collect();
-    let marks = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; ids.len()].join(",");
     let mut st = engine.db.sql().prepare(&format!(
         "SELECT alias_norm,entity_id FROM entity_aliases WHERE entity_id IN ({marks})"
     ))?;
@@ -3417,9 +3281,7 @@ fn ended_pair_facts(
     if ids.len() < 2 {
         return Ok(Vec::new());
     }
-    let marks = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; ids.len()].join(",");
     let sql = format!(
         "SELECT r.id FROM relations r
          WHERE r.polarity=1 AND r.src IN ({marks}) AND r.dst IN ({marks})
@@ -3533,9 +3395,7 @@ fn negated_value_facts(
         let mut ids: Vec<i64> = anchors.iter().copied().collect();
         ids.sort_unstable();
         ids.truncate(20);
-        let marks = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; ids.len()].join(",");
         let sql = format!(
             "SELECT id FROM relations
              WHERE valid_from<=? AND (src IN ({marks}) OR dst IN ({marks}))
@@ -3592,9 +3452,7 @@ fn negated_value_facts(
         let mut ids: Vec<i64> = anchors.iter().copied().collect();
         ids.sort_unstable();
         ids.truncate(20);
-        let marks = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; ids.len()].join(",");
         let sql = format!(
             "SELECT r.id FROM relations r JOIN predicates p ON p.id=r.predicate_id
              WHERE COALESCE(NULLIF(p.group_id,0),p.id)=? AND r.polarity=1
@@ -3702,9 +3560,7 @@ fn asked_family_facts(
     let mut ids: Vec<i64> = mentions.iter().map(|(id, _, _)| *id).collect();
     ids.sort_unstable();
     ids.dedup();
-    let marks = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; ids.len()].join(",");
     let sql = format!(
         "SELECT r.id,r.src,r.dst,
             COALESCE(NULLIF(r.predicate_text,''),NULLIF(p.display,''),p.canonical),
@@ -4221,9 +4077,7 @@ fn representative(engine: &Engine, ids: &[i64]) -> Result<Option<MemoryHit>> {
     if ids.is_empty() {
         return Ok(None);
     }
-    let marks = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; ids.len()].join(",");
     let sql = format!(
         "SELECT m.id,m.kind,m.content,m.valid_from,m.valid_to,m.expired_at,m.superseded_by,m.tags
          FROM memories m JOIN mentions mn ON mn.memory_id=m.id
@@ -4275,9 +4129,7 @@ pub fn overview(engine: &Engine, query: Option<&str>, k: usize) -> Result<Overvi
         if chunk.is_empty() {
             continue;
         }
-        let marks = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; chunk.len()].join(",");
         let sql =
             format!("SELECT id,type,description,mention_count FROM entities WHERE id IN ({marks})");
         let mut st = engine.db.sql().prepare(&sql)?;

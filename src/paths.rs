@@ -1804,9 +1804,7 @@ fn specific_entities(db: &Db, ids: &HashSet<i64>) -> Result<HashSet<i64>> {
     let total: i64 = db
         .sql()
         .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
-    let marks = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; ids.len()].join(",");
     let mut st = db.sql().prepare(&format!(
         "SELECT entity_id,COUNT(DISTINCT memory_id) FROM mentions
          WHERE entity_id IN ({marks}) GROUP BY entity_id"
@@ -1830,7 +1828,7 @@ fn related_memories(db: &Db, seeds: &[i64], specific: &HashSet<i64>) -> Result<H
     if specific.is_empty() {
         return Ok(HashSet::new());
     }
-    let marks = |n: usize| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
+    let marks = |n: usize| vec!["?"; n].join(",");
     let mut st = db.sql().prepare(&format!(
         "SELECT DISTINCT a.memory_id FROM mentions a
          JOIN mentions b ON b.entity_id=a.entity_id
@@ -1863,7 +1861,7 @@ fn cause_relation_query(
     candidates: &[i64],
     anchors: &[i64],
 ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
-    let marks = |n: usize| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
+    let marks = |n: usize| vec!["?"; n].join(",");
     let mut branches = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(group)];
     if !candidates.is_empty() {
@@ -1935,9 +1933,7 @@ pub(crate) fn cause_follow(
     let Some(group) = group else {
         return Ok((Vec::new(), Vec::new()));
     };
-    let marks = std::iter::repeat_n("?", seeds.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; seeds.len()].join(",");
     let mut seed_entities: HashSet<i64> = HashSet::new();
     let mut st = db.sql().prepare(&format!(
         "SELECT entity_id FROM mentions WHERE memory_id IN ({marks})"

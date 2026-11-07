@@ -85,9 +85,7 @@ pub fn query_anchors(
     // alias -> (entity, entity norm)
     let mut hits: HashMap<String, Vec<(i64, String)>> = HashMap::new();
     for chunk in names.chunks(400) {
-        let marks = std::iter::repeat_n("?", chunk.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = vec!["?"; chunk.len()].join(",");
         let sql = format!(
             "SELECT DISTINCT a.alias_norm, a.entity_id, e.norm FROM entity_aliases a
              JOIN entities e ON e.id = a.entity_id WHERE a.alias_norm IN ({marks})"
