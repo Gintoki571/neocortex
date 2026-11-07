@@ -103,6 +103,14 @@ Store something when it will still matter next week:
   of the same entity (prefer `entities[].aliases`). Any relation whose two ends
   resolve to the same entity is dropped, and the reply names it in `hints`
   (`dropped self-relation: Robert Okafor nickname Bob (kept "Bob" as an alias)`).
+- **Renames join the old and new name**: a statement like "Harbor was renamed
+  to Lantern" (as text, or as a relation with predicate "renamed to" / "now
+  called" / "formerly called") merges the two names into one entity — the old
+  name stays as an alias of the surviving (new) name, old facts move to it,
+  and a "Lantern formerly called Harbor" fact keeps the old name answerable.
+  A hedged ("might rename", "plan to rename"), negated ("did not rename") or
+  ambiguous (several entities named Harbor) rename merges nothing, so write it
+  as a plan instead and merge by hand when it happens.
 - **Text-only retraction**: a sentence with no relation ("Ivan left Acme; he no
   longer works there") ends the one live fact it names, at `valid_from`, and
   reports it as `invalidated`. It also runs on a write that supplies its own

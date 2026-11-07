@@ -352,6 +352,13 @@ also render the interval with a computed duration ("3 years 2 months",
   keep the memory on a placeholder entity so nothing is lost. `distinct_from`
   (entity tool, CLI `alias`-family) forces a homonym split; `merge <a> <b>`
   converges them again.
+- Renames join the old and new name: "Harbor was renamed to Lantern" (as text,
+  or as a relation with predicate "renamed to" / "now called" / "formerly
+  called") makes one entity — the old name becomes an alias of the surviving
+  (new) name, old facts move to it, and a "Lantern formerly called Harbor"
+  fact keeps the old name answerable. Hedged ("might rename"), negated
+  ("did not rename") or ambiguous (several entities named Harbor) renames
+  merge nothing.
 - Inverse and symmetric phrases: "X reports to Y" is stored once as "Y manages
   X" (or, for "married to", with both ends in storage order) and every side
   renders its own view: `entity` shows the phrase that starts with the profile,

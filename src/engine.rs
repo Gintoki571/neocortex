@@ -890,123 +890,9 @@ impl Engine {
             ));
         }
         let now = self.clock().now;
-        self.db.write(|db| {
-            // Move similar edges to `keep`, dropping self pairs and keeping the
-            // highest score per pair.
-            let moved: Vec<(i64, i64, f32)> = {
-                let mut st = db
-                    .sql()
-                    .prepare("SELECT a,b,score FROM similar WHERE a=?1 OR b=?1")?;
-                let rows = st.query_map([m], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-                rows.collect::<rusqlite::Result<_>>()?
-            };
-            db.sql()
-                .execute("DELETE FROM similar WHERE a=?1 OR b=?1", [m])?;
-            for (a, b, score) in moved {
-                let other = if a == m { b } else { a };
-                if other == k || other == m {
-                    continue;
-                }
-                let (lo, hi) = if other < k { (other, k) } else { (k, other) };
-                db.sql().execute(
-                    "INSERT INTO similar(a,b,score) VALUES (?1,?2,?3)
-                     ON CONFLICT(a,b) DO UPDATE SET score=MAX(score, excluded.score)",
-                    rusqlite::params![lo, hi, score],
-                )?;
-            }
-            // B5 containment links move the same way, and the survivor answers
-            // to the merged name's tokens.
-            let moved_parts: Vec<(i64, i64, f32)> = {
-                let mut st = db
-                    .sql()
-                    .prepare("SELECT a,b,weight FROM name_part WHERE a=?1 OR b=?1")?;
-                let rows = st.query_map([m], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-                rows.collect::<rusqlite::Result<_>>()?
-            };
-            db.sql()
-                .execute("DELETE FROM name_part WHERE a=?1 OR b=?1", [m])?;
-            for (a, b, weight) in moved_parts {
-                let other = if a == m { b } else { a };
-                if other == k || other == m {
-                    continue;
-                }
-                let (lo, hi) = if other < k { (other, k) } else { (k, other) };
-                db.sql().execute(
-                    "INSERT INTO name_part(a,b,weight) VALUES (?1,?2,?3)
-                     ON CONFLICT(a,b) DO UPDATE SET weight=MAX(weight, excluded.weight)",
-                    rusqlite::params![lo, hi, weight],
-                )?;
-            }
-            db.sql().execute(
-                "INSERT OR IGNORE INTO name_tokens(token,entity_id)
-                 SELECT token,?1 FROM name_tokens WHERE entity_id=?2",
-                [k, m],
-            )?;
-            db.sql().execute(
-                "UPDATE OR IGNORE mentions SET entity_id=?1 WHERE entity_id=?2",
-                [k, m],
-            )?;
-            db.sql()
-                .execute("DELETE FROM mentions WHERE entity_id=?1", [m])?;
-            db.sql().execute(
-                "UPDATE OR IGNORE entity_aliases SET entity_id=?1, origin='manual' WHERE entity_id=?2",
-                [k, m],
-            )?;
-            db.sql()
-                .execute("DELETE FROM entity_aliases WHERE entity_id=?1", [m])?;
-            db.sql()
-                .execute("UPDATE relations SET src=?1 WHERE src=?2", [k, m])?;
-            db.sql()
-                .execute("UPDATE relations SET dst=?1 WHERE dst=?2", [k, m])?;
-            // Relations that become self-loops are kept as expired rows and
-            // reported: never a silent delete. Their PPR snapshot skips them
-            // automatically once expired.
-            let loops: Vec<i64> = {
-                let mut st = db
-                    .sql()
-                    .prepare("SELECT id FROM relations WHERE src=dst AND src=?1")?;
-                let rows = st.query_map([k], |r| r.get::<_, i64>(0))?;
-                rows.collect::<rusqlite::Result<_>>()?
-            };
-            let mut self_loop_report = Vec::new();
-            for rid in &loops {
-                crate::remember::retract_relations(db, &[*rid], now)?;
-                self_loop_report.push(format!("r{rid} expired (self-loop of e{k})"));
-            }
-            // Two entities that described the same fact become one relation,
-            // and an exclusive predicate keeps at most one live object.
-            merge_duplicate_relations(db)?;
-            let invalidated = reapply_exclusivity(db, now)?;
-            crate::remember::end_memories_of_ended_facts(db, &invalidated)?;            let merged_count: i64 = db.sql().query_row(
-                "SELECT mention_count FROM entities WHERE id=?1",
-                [m],
-                |r| r.get(0),
-            )?;
-            db.sql().execute(
-                "UPDATE entities SET mention_count=mention_count+?1, updated_at=?2 WHERE id=?3",
-                rusqlite::params![merged_count, now, k],
-            )?;
-            db.sql()
-                .execute("DELETE FROM entities_fts WHERE rowid=?1", [m])?;
-            db.sql()
-                .execute("DELETE FROM entities_vec WHERE rowid=?1", [m])?;
-            db.sql().execute("DELETE FROM entities WHERE id=?1", [m])?;
-            crate::resolve::refresh_entity_fts(db, k)?;
-            // Incremental projection: drop the merged node (with its edges) and
-            // re-project only what the surviving entity owns.
-            crate::kg::remove_entity(db, m)?;
-            crate::kg::reproject_entity(db, k)?;
-            crate::kg::bump_gen(db)?;
-            let mut changed = vec![format!("e{m} merged into e{k}")];
-            changed.extend(self_loop_report);
-            for rid in &invalidated {
-                let fact: String = db
-                    .sql()
-                    .query_row("SELECT fact FROM relations WHERE id=?1", [rid], |r| r.get(0))
-                    .unwrap_or_else(|_| format!("r{rid}"));
-                changed.push(format!("r{rid} ended: {fact}"));
-            }
-            Ok(ChangeOutput { changed })
+        let done = self.db.write(|db| merge_entities_in(db, k, m, now))?;
+        Ok(ChangeOutput {
+            changed: done.changed,
         })
     }
 
@@ -1277,6 +1163,143 @@ impl Engine {
         crate::remember::check_embedder(&self.db, self.emb.as_ref())
     }
 }
+/// What an entity merge did, for the write path to report the same facts.
+/// The rename path (H3-10) runs a merge inside the caller's transaction, so
+/// this core takes `&Db` instead of opening one.
+pub(crate) struct MergeDone {
+    pub invalidated: Vec<i64>,
+    pub changed: Vec<String>,
+}
+
+pub(crate) fn merge_entities_in(db: &Db, k: i64, m: i64, now: i64) -> Result<MergeDone> {
+    // Move similar edges to `keep`, dropping self pairs and keeping the
+    // highest score per pair.
+    let moved: Vec<(i64, i64, f32)> = {
+        let mut st = db
+            .sql()
+            .prepare("SELECT a,b,score FROM similar WHERE a=?1 OR b=?1")?;
+        let rows = st.query_map([m], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    db.sql()
+        .execute("DELETE FROM similar WHERE a=?1 OR b=?1", [m])?;
+    for (a, b, score) in moved {
+        let other = if a == m { b } else { a };
+        if other == k || other == m {
+            continue;
+        }
+        let (lo, hi) = if other < k { (other, k) } else { (k, other) };
+        db.sql().execute(
+            "INSERT INTO similar(a,b,score) VALUES (?1,?2,?3)
+             ON CONFLICT(a,b) DO UPDATE SET score=MAX(score, excluded.score)",
+            rusqlite::params![lo, hi, score],
+        )?;
+    }
+    // B5 containment links move the same way, and the survivor answers
+    // to the merged name's tokens.
+    let moved_parts: Vec<(i64, i64, f32)> = {
+        let mut st = db
+            .sql()
+            .prepare("SELECT a,b,weight FROM name_part WHERE a=?1 OR b=?1")?;
+        let rows = st.query_map([m], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    db.sql()
+        .execute("DELETE FROM name_part WHERE a=?1 OR b=?1", [m])?;
+    for (a, b, weight) in moved_parts {
+        let other = if a == m { b } else { a };
+        if other == k || other == m {
+            continue;
+        }
+        let (lo, hi) = if other < k { (other, k) } else { (k, other) };
+        db.sql().execute(
+            "INSERT INTO name_part(a,b,weight) VALUES (?1,?2,?3)
+             ON CONFLICT(a,b) DO UPDATE SET weight=MAX(weight, excluded.weight)",
+            rusqlite::params![lo, hi, weight],
+        )?;
+    }
+    db.sql().execute(
+        "INSERT OR IGNORE INTO name_tokens(token,entity_id)
+         SELECT token,?1 FROM name_tokens WHERE entity_id=?2",
+        [k, m],
+    )?;
+    db.sql().execute(
+        "UPDATE OR IGNORE mentions SET entity_id=?1 WHERE entity_id=?2",
+        [k, m],
+    )?;
+    db.sql()
+        .execute("DELETE FROM mentions WHERE entity_id=?1", [m])?;
+    db.sql().execute(
+        "UPDATE OR IGNORE entity_aliases SET entity_id=?1, origin='manual' WHERE entity_id=?2",
+        [k, m],
+    )?;
+    db.sql()
+        .execute("DELETE FROM entity_aliases WHERE entity_id=?1", [m])?;
+    db.sql()
+        .execute("UPDATE relations SET src=?1 WHERE src=?2", [k, m])?;
+    db.sql()
+        .execute("UPDATE relations SET dst=?1 WHERE dst=?2", [k, m])?;
+    // The semantic subject follows too, so the write path's exclusive-slot
+    // lookups (which key on `subj`) find the moved facts.
+    db.sql()
+        .execute("UPDATE relations SET subj=?1 WHERE subj=?2", [k, m])?;
+    // Relations that become self-loops are kept as expired rows and
+    // reported: never a silent delete. Their PPR snapshot skips them
+    // automatically once expired.
+    let loops: Vec<i64> = {
+        let mut st = db
+            .sql()
+            .prepare("SELECT id FROM relations WHERE src=dst AND src=?1")?;
+        let rows = st.query_map([k], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut self_loop_report = Vec::new();
+    for rid in &loops {
+        crate::remember::retract_relations(db, &[*rid], now)?;
+        self_loop_report.push(format!("r{rid} expired (self-loop of e{k})"));
+    }
+    // Two entities that described the same fact become one relation,
+    // and an exclusive predicate keeps at most one live object.
+    merge_duplicate_relations(db)?;
+    let invalidated = reapply_exclusivity(db, now)?;
+    crate::remember::end_memories_of_ended_facts(db, &invalidated)?;
+    let merged_count: i64 =
+        db.sql()
+            .query_row("SELECT mention_count FROM entities WHERE id=?1", [m], |r| {
+                r.get(0)
+            })?;
+    db.sql().execute(
+        "UPDATE entities SET mention_count=mention_count+?1, updated_at=?2 WHERE id=?3",
+        rusqlite::params![merged_count, now, k],
+    )?;
+    db.sql()
+        .execute("DELETE FROM entities_fts WHERE rowid=?1", [m])?;
+    db.sql()
+        .execute("DELETE FROM entities_vec WHERE rowid=?1", [m])?;
+    db.sql().execute("DELETE FROM entities WHERE id=?1", [m])?;
+    crate::resolve::refresh_entity_fts(db, k)?;
+    // Incremental projection: drop the merged node (with its edges) and
+    // re-project only what the surviving entity owns.
+    crate::kg::remove_entity(db, m)?;
+    crate::kg::reproject_entity(db, k)?;
+    crate::kg::bump_gen(db)?;
+    let mut changed = vec![format!("e{m} merged into e{k}")];
+    changed.extend(self_loop_report);
+    for rid in &invalidated {
+        let fact: String = db
+            .sql()
+            .query_row("SELECT fact FROM relations WHERE id=?1", [rid], |r| {
+                r.get(0)
+            })
+            .unwrap_or_else(|_| format!("r{rid}"));
+        changed.push(format!("r{rid} ended: {fact}"));
+    }
+    Ok(MergeDone {
+        invalidated,
+        changed,
+    })
+}
+
 /// Collapse live relations that became the same `(src, predicate, dst)` after
 /// an entity merge: keep the earliest start, sum the evidence, move the
 /// evidence rows and the projections of the rows that go away.
