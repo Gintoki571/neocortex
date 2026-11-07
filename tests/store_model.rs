@@ -23,20 +23,19 @@
 //!      clock moved to a probe date.
 //!   3. exclusive slots, in two halves: (a) the ending the engine reports
 //!      (`invalidated_relations`) equals the model's expectation — same subject,
-//!      same predicate group, never another subject's; asserted on main.
-//!      (b) at most one live (positive) value per (subject, exclusive predicate
-//!      group) at now; does not hold on main (FINDING-1: merge does not remap
-//!      `relations.subj`), so it lives in the `#[ignore]`d intent test.
+//!      same predicate group, never another subject's; (b) at most one live
+//!      (positive) value per (subject, exclusive predicate group) at now.
+//!      Holds on merged main 4a14f81 (FINDING-1 fixed: `merge_entities`
+//!      remaps `relations.subj`, the write path's slot key, to the survivor).
 //!   4. merge (`merge_entities`): no fact lost (every pre-merge fact incident
 //!      to the merged entity is reachable from the survivor or an allowed
 //!      survivor-alias, or was a live duplicate the merge consolidated, or
 //!      became a self-loop); no live relation with src == dst; the old name
 //!      resolves to the survivor.
-//!   5. `validate()` reports no unexpected problems. On main it reports one
-//!      known contradiction: "relation rN is current but every memory that
-//!      states it has ended" (FINDING-2); that exact signature is tolerated,
-//!      everything else fails. The strict variant (no tolerance) is covered by
-//!      the `#[ignore]`d intent test.
+//!   5. `validate()` reports no unexpected problems. On merged main it still
+//!      reports one known contradiction: "relation rN is current but every
+//!      memory that states it has ended" (FINDING-2, still open); that exact
+//!      signature is tolerated, everything else fails.
 //!
 //! Names are chosen two+ tokens apart so the near-name layer (JW/blockers)
 //! returns Below for value pairs; with the hash embedder the name layer
@@ -116,9 +115,10 @@ impl Rng {
     }
 }
 
-/// A stored fact row. `slot` is the slot key captured AT WRITE TIME (`relations.subj`):
-/// the engine binds it at insert and `merge_entities` does not remap it on entity merge,
-/// so it may point at a merged-away entity (see FINDING-1 in the lane report).
+/// A stored fact row. `slot` is the slot key captured AT WRITE TIME
+/// (`relations.subj`): the engine binds it at insert and, since merged main
+/// 4a14f81, `merge_entities` remaps it to the survivor together with
+/// `src`/`dst`, so the model remaps it the same way on merge.
 #[derive(Clone)]
 struct Fact {
     id: i64,
@@ -303,7 +303,7 @@ fn sql_slot_violations(e: &Engine, ctx: &Ctx) -> Vec<String> {
         let mut st =
             e.db.sql()
                 .prepare(
-                    "SELECT r.src, COALESCE(NULLIF(p.group_id, 0), p.id), COUNT(*) AS n
+                    "SELECT r.subj, COALESCE(NULLIF(p.group_id, 0), p.id), COUNT(*) AS n
                  FROM relations r JOIN predicates p ON p.id = r.predicate_id
                  WHERE r.polarity = 1 AND r.expired_at IS NULL
                    AND (r.valid_to IS NULL OR r.valid_to > ?1)
@@ -318,11 +318,11 @@ fn sql_slot_violations(e: &Engine, ctx: &Ctx) -> Vec<String> {
     })()
     .unwrap_or_else(|err| ctx.fail(format!("rule 3 probe query failed: {err}")));
     let mut details = Vec::new();
-    for (src, group, n) in slots {
-        match slot_detail(e, src, group, n) {
+    for (subj, group, n) in slots {
+        match slot_detail(e, subj, group, n) {
             Ok(mut rows) => details.append(&mut rows),
             Err(err) => details.push(format!(
-                "slot (subject e{src}, group {group}): detail query failed: {err}"
+                "slot (subject e{subj}, group {group}): detail query failed: {err}"
             )),
         }
     }
@@ -330,20 +330,20 @@ fn sql_slot_violations(e: &Engine, ctx: &Ctx) -> Vec<String> {
 }
 
 /// One fact per line for the violating slot.
-fn slot_detail(e: &Engine, src: i64, group: i64, n: i64) -> Result<Vec<String>, String> {
+fn slot_detail(e: &Engine, subj: i64, group: i64, n: i64) -> Result<Vec<String>, String> {
     let mut st =
         e.db.sql()
             .prepare(
                 "SELECT r.id, es.name, ed.name, p.canonical, r.valid_from, r.valid_to
              FROM relations r JOIN predicates p ON p.id = r.predicate_id
-             JOIN entities es ON es.id = r.src
+             JOIN entities es ON es.id = r.subj
              JOIN entities ed ON ed.id = r.dst
-             WHERE r.src = ?1 AND COALESCE(NULLIF(p.group_id, 0), p.id) = ?2
+             WHERE r.subj = ?1 AND COALESCE(NULLIF(p.group_id, 0), p.id) = ?2
                AND r.polarity = 1 AND r.expired_at IS NULL
                AND (r.valid_to IS NULL OR r.valid_to > ?3)",
             )
             .map_err(|e| e.to_string())?;
-    let rows = st.query_map(rusqlite::params![src, group, NOW], |r| {
+    let rows = st.query_map(rusqlite::params![subj, group, NOW], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
@@ -357,7 +357,7 @@ fn slot_detail(e: &Engine, src: i64, group: i64, n: i64) -> Result<Vec<String>, 
     for row in rows.map_err(|e| e.to_string())? {
         let (id, s, d, c, vf, vt) = row.map_err(|e| e.to_string())?;
         out.push(format!(
-            "slot (subject e{src}, group {group}, live={n}): r{id} {s} {c} {d} vf={vf} vt={vt:?}"
+            "slot (subject e{subj}, group {group}, live={n}): r{id} {s} {c} {d} vf={vf} vt={vt:?}"
         ));
     }
     Ok(out)
@@ -376,18 +376,10 @@ fn sql_live_self_loops(e: &Engine) -> i64 {
 }
 
 /// The per-op gate. `is_merge` relaxes rule 1 (merge consolidates exact live
-/// duplicates by design; rules 2/4/5 still apply). `strict` asserts rule 3's
-/// "at most one live value per (subject, exclusive predicate) at now" and disables
-/// the FINDING-2 tolerance in rule 5; it is `#[ignore]`d on main (FINDING-1/2).
-fn check_all(
-    e: &mut Engine,
-    m: &Model,
-    ctx: &Ctx,
-    rel_before: i64,
-    is_merge: bool,
-    op_no: u64,
-    strict: bool,
-) {
+/// duplicates by design; rules 2/3/4/5 still apply). Rule 3's "at most one
+/// live value per (subject, exclusive predicate) at now" is asserted on merged
+/// main (FINDING-1 fixed); rule 5 keeps the FINDING-2 tolerance (still open).
+fn check_all(e: &mut Engine, m: &Model, ctx: &Ctx, rel_before: i64, is_merge: bool, op_no: u64) {
     if !is_merge {
         let after = relation_count(e);
         ctx.expect(
@@ -512,16 +504,14 @@ fn check_all(
             )),
         }
     }
-    if strict {
-        let slots = sql_slot_violations(e, ctx);
-        ctx.expect(
-            slots.is_empty(),
-            format!(
-                "rule 3: exclusive slots with >1 live value:\n{}",
-                slots.join("\n")
-            ),
-        );
-    }
+    let slots = sql_slot_violations(e, ctx);
+    ctx.expect(
+        slots.is_empty(),
+        format!(
+            "rule 3: exclusive slots with >1 live value:\n{}",
+            slots.join("\n")
+        ),
+    );
     let loops = sql_live_self_loops(e);
     ctx.expect(
         loops == 0,
@@ -530,22 +520,19 @@ fn check_all(
     let problems = e
         .validate()
         .unwrap_or_else(|err| vec![format!("validate failed: {err}")]);
-    // FINDING-2 (main f51b27e): a relation whose every evidence memory has
-    // `valid_to` set (e.g. written by two memories that were both invalidated
-    // with `invalidate m`) is reported here even though it is a legal store
-    // state — the ending rule counts only expired memories as lost evidence.
-    // Anything else that `validate()` reports is a real failure.
-    let unexpected: Vec<String> = if strict {
-        problems
-    } else {
-        problems
-            .into_iter()
-            .filter(|p| {
-                !(p.starts_with("relation r")
-                    && p.ends_with("is current but every memory that states it has ended"))
-            })
-            .collect()
-    };
+    // FINDING-2 (still open on merged main 4a14f81): a relation whose every
+    // evidence memory has `valid_to` set (e.g. written by two memories that
+    // were both invalidated with `invalidate m`) is reported here even though
+    // it is a legal store state — the ending rule counts only expired memories
+    // as lost evidence. This exact signature is tolerated; anything else that
+    // `validate()` reports is a real failure.
+    let unexpected: Vec<String> = problems
+        .into_iter()
+        .filter(|p| {
+            !(p.starts_with("relation r")
+                && p.ends_with("is current but every memory that states it has ended"))
+        })
+        .collect();
     ctx.expect(
         unexpected.is_empty(),
         format!("rule 5: validate reports: {unexpected:?}"),
@@ -699,7 +686,7 @@ fn mirror_remember(
                 id: rid,
                 src,
                 dst,
-                slot: src, // slot key captured at write time (never remapped on merge)
+                slot: src, // slot key captured at write time (remapped on merge, like relations.subj)
                 group,
                 polarity,
                 valid_from: rf,
@@ -740,9 +727,9 @@ fn mirror_remember(
         eng == mdl,
         format!("exclusive/flip endings mismatch: engine {eng:?} != model {mdl:?}"),
     );
-    // Never another subject's fact. A slot ending must come from a written slot;
-    // a polarity-flip ending may come from the triple of the write even when a
-    // merge moved that row's stale slot key away.
+    // Never another subject's fact. A slot ending must come from a written slot
+    // (the slot key follows merges since merged main 4a14f81, like the engine's
+    // `subj`); a polarity-flip ending may come from the triple of the write.
     for rid in &eng {
         let f = m
             .find_fact(*rid)
@@ -816,7 +803,6 @@ fn op_remember(
     rel_before: i64,
     op_no: u64,
     supersede: bool,
-    strict: bool,
 ) {
     let n_rel = 1 + rng.below(2) as usize;
     let mut inputs: Vec<RelInput> = Vec::new();
@@ -956,7 +942,7 @@ fn op_remember(
                 m.created[rd] = true;
             }
             mirror_remember(m, ctx, &inputs, &out, mem_vf, mem_vt, supersede_target);
-            check_all(e, m, ctx, rel_before, false, op_no, strict);
+            check_all(e, m, ctx, rel_before, false, op_no);
         }
         Err(err) => ctx.fail(format!("remember failed: {err}")),
     }
@@ -969,7 +955,6 @@ fn op_invalidate_memory(
     ctx: &mut Ctx,
     rel_before: i64,
     op_no: u64,
-    strict: bool,
 ) {
     let candidates: Vec<&Memory> = m.memories.iter().filter(|mm| !mm.expired).collect();
     if candidates.is_empty() {
@@ -996,7 +981,7 @@ fn op_invalidate_memory(
                 // Relations whose only live evidence is this memory end at `at`.
                 end_last_evidence(m, &[id], at);
             }
-            check_all(e, m, ctx, rel_before, false, op_no, strict);
+            check_all(e, m, ctx, rel_before, false, op_no);
         }
         Err(err) => ctx.fail(format!("invalidate m{id} failed: {err}")),
     }
@@ -1009,7 +994,6 @@ fn op_invalidate_relation(
     ctx: &mut Ctx,
     rel_before: i64,
     op_no: u64,
-    strict: bool,
 ) {
     let live: Vec<(i64, i64)> = m
         .facts
@@ -1037,7 +1021,7 @@ fn op_invalidate_relation(
                     f.valid_to = Some(at);
                 }
             }
-            check_all(e, m, ctx, rel_before, false, op_no, strict);
+            check_all(e, m, ctx, rel_before, false, op_no);
         }
         Err(err) => ctx.fail(format!("invalidate r{rid} failed: {err}")),
     }
@@ -1050,7 +1034,6 @@ fn op_forget(
     ctx: &mut Ctx,
     rel_before: i64,
     op_no: u64,
-    strict: bool,
 ) {
     let live: Vec<i64> = m.live_memory_ids();
     if live.is_empty() {
@@ -1066,7 +1049,7 @@ fn op_forget(
             }
             // Relations whose only live evidence is the just-forgotten memory retract.
             retract_last_evidence(m, id);
-            check_all(e, m, ctx, rel_before, false, op_no, strict);
+            check_all(e, m, ctx, rel_before, false, op_no);
         }
         Err(err) => ctx.fail(format!("forget m{id} failed: {err}")),
     }
@@ -1102,7 +1085,6 @@ fn op_merge(
     ctx: &mut Ctx,
     rel_before: i64,
     op_no: u64,
-    strict: bool,
 ) {
     // Pick two distinct logical roots.
     let (a, b) = (rng.below(6) as usize, rng.below(6) as usize);
@@ -1141,8 +1123,9 @@ fn op_merge(
                     m.map[i] = keep;
                 }
             }
-            // Move facts. The slot key (`relations.subj`) is NOT remapped by the engine's
-            // merge path; keep it at its write-time root (FINDING-1).
+            // Move facts. The slot key (`relations.subj`) follows the merged
+            // entity to the survivor, as merged main 4a14f81 does
+            // (`UPDATE relations SET subj=?1 WHERE subj=?2`).
             for f in m.facts.iter_mut() {
                 if f.src == gone {
                     f.src = keep;
@@ -1150,7 +1133,9 @@ fn op_merge(
                 if f.dst == gone {
                     f.dst = keep;
                 }
-                // f.slot unchanged, as with relations.subj
+                if f.slot == gone {
+                    f.slot = keep;
+                }
             }
             for f in m.facts.iter_mut() {
                 if f.src == f.dst && !f.expired {
@@ -1274,7 +1259,7 @@ fn op_merge(
                     ctx.fail(format!("rule 4: fact r{id} lost in merge {gone_name} -> {keep_name} (no card carries it, not a consolidated duplicate, not a self-loop)"));
                 }
             }
-            check_all(e, m, ctx, rel_before, true, op_no, strict);
+            check_all(e, m, ctx, rel_before, true, op_no);
         }
         Err(err) => ctx.fail(format!(
             "merge_entities {keep_name} <- {gone_name} failed: {err}"
@@ -1286,7 +1271,7 @@ fn parse_seed_list() -> Vec<u64> {
     (1..=200).collect()
 }
 
-fn run_all(strict: bool) {
+fn run_all() {
     for seed in parse_seed_list() {
         let mut engine = open_engine();
         let mut model = Model::new();
@@ -1308,7 +1293,6 @@ fn run_all(strict: bool) {
                     rel_before,
                     op,
                     false,
-                    strict,
                 ),
                 50..=57 => op_remember(
                     &mut engine,
@@ -1318,7 +1302,6 @@ fn run_all(strict: bool) {
                     rel_before,
                     op,
                     true,
-                    strict,
                 ),
                 58..=69 => op_invalidate_memory(
                     &mut engine,
@@ -1327,7 +1310,6 @@ fn run_all(strict: bool) {
                     &mut ctx,
                     rel_before,
                     op,
-                    strict,
                 ),
                 70..=79 => op_invalidate_relation(
                     &mut engine,
@@ -1336,26 +1318,9 @@ fn run_all(strict: bool) {
                     &mut ctx,
                     rel_before,
                     op,
-                    strict,
                 ),
-                80..=89 => op_forget(
-                    &mut engine,
-                    &mut model,
-                    &mut rng,
-                    &mut ctx,
-                    rel_before,
-                    op,
-                    strict,
-                ),
-                _ => op_merge(
-                    &mut engine,
-                    &mut model,
-                    &mut rng,
-                    &mut ctx,
-                    rel_before,
-                    op,
-                    strict,
-                ),
+                80..=89 => op_forget(&mut engine, &mut model, &mut rng, &mut ctx, rel_before, op),
+                _ => op_merge(&mut engine, &mut model, &mut rng, &mut ctx, rel_before, op),
             }
         }
     }
@@ -1363,30 +1328,5 @@ fn run_all(strict: bool) {
 
 #[test]
 fn store_model_random_op_sequences_hold_the_store_rules() {
-    run_all(false);
-}
-
-/// FINDING-1/2 (main f51b27e): see the lane report. FINDING-1: `merge_entities`
-/// does not remap `relations.subj` (the slot key of the exclusive-ending path),
-/// so after any merge the write-time slot query misses the merged subject's
-/// facts: a new exclusive value neither ends nor backfills the competing live
-/// one, leaving two live values per (subject, exclusive predicate). Reproducer:
-/// seed 0x1, ops after the two merges ("merge Bruno Kestler into Elena Marsh",
-/// "merge Elena Marsh into Astrid Vollent"), remember #17 — relations r8 and
-/// r22 both live at now in slot (e1, work at).
-///
-/// FINDING-2: a relation whose every evidence memory has `valid_to` set but is
-/// not expired is reported by `validate()` as "current but every memory that
-/// states it has ended" — the ending rule counts only expired memories as lost
-/// evidence. Reproducer: seed 0x7, op after #19 — `validate()` reports relation
-/// r15 contradictory. A minimal deterministic probe (two memories evidencing
-/// one fact, both invalidated with `invalidate m`) reproduces the same report.
-///
-/// This test encodes the intent: rules 3 and 5 hold after ANY op sequence,
-/// merges and invalidations included. It fails on main and belongs to the fix,
-/// not to this lane.
-#[test]
-#[ignore = "FINDING-1/2: the exclusive slot does not hold across merges on main, and validate() reports vt-evidenced relations; reproducer seeds 0x1 and 0x7; see the nc-model lane report"]
-fn store_model_rules_hold_across_merges_and_invalidations() {
-    run_all(true);
+    run_all();
 }
