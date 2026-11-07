@@ -846,3 +846,76 @@ fn h3_12_coordinated_pair_retraction_unchanged() {
     );
     assert_eq!(relation_end(&e, rid), Some(NOW));
 }
+
+/// B10/B12 (round-3 defect 1): a negating word before the cue keeps the fact
+/// live, including contracted auxiliaries ("hasn't", straight or curly
+/// apostrophe) and the spaced "has not" / "did not" forms.
+#[test]
+fn h3_12_negated_auxiliary_before_stopped_keeps_works_at_live() {
+    for text in [
+        "Tomasz Nowak hasn't stopped working at Acme.",
+        "Tomasz Nowak hasn\u{2019}t stopped working at Acme.",
+        "Tomasz Nowak has not stopped working at Acme.",
+        "Tomasz Nowak never stopped working at Acme.",
+        "Tomasz Nowak did not stop working at Acme.",
+        "Tomasz Nowak didn't stop working at Acme.",
+    ] {
+        let e = engine();
+        let rid = tomasz_works_at_acme(&e);
+        let out = retract_with(
+            &e,
+            text,
+            vec![person("Tomasz Nowak"), org("Acme"), org("Brightline")],
+        );
+        assert!(
+            !out.invalidated_relations.contains(&rid),
+            "{text}: double negative ended works at: {out:?}"
+        );
+        assert_eq!(relation_end(&e, rid), None, "{text}");
+    }
+}
+
+#[test]
+fn h3_12_negated_auxiliary_before_stopped_keeps_reviews_live() {
+    for text in [
+        "Tomasz Nowak hasn't stopped reviewing payment-adjacent code.",
+        "Tomasz Nowak hasn\u{2019}t stopped reviewing payment-adjacent code.",
+        "Tomasz Nowak hasn't stopped approving payment-adjacent code.",
+        "Tomasz Nowak has not stopped reviewing payment-adjacent code.",
+    ] {
+        let e = engine();
+        let rid = tomasz_reviews_payment(&e);
+        let out = retract_with(&e, text, vec![person("Tomasz Nowak")]);
+        assert!(
+            !out.invalidated_relations.contains(&rid),
+            "{text}: double negative ended reviews: {out:?}"
+        );
+        assert_eq!(relation_end(&e, rid), None, "{text}");
+    }
+}
+
+/// B13: the same guard on the "stopped using" cue.
+#[test]
+fn h3_12_hasnt_stopped_using_keeps_uses_live() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Atlas uses npm for building packages.".into(),
+            entities: vec![project("Atlas"), tool("npm")],
+            relations: vec![rel("Atlas", "uses", "npm", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    for text in [
+        "Atlas hasn't stopped using npm.",
+        "Atlas hasn't stopped using npm for builds.",
+    ] {
+        let out2 = retract_with(&e, text, vec![project("Atlas"), tool("npm")]);
+        assert!(
+            !out2.invalidated_relations.contains(&rid),
+            "{text}: double negative ended uses: {out2:?}"
+        );
+        assert_eq!(relation_end(&e, rid), None, "{text}");
+    }
+}

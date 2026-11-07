@@ -303,6 +303,25 @@ fn hedged(words: &[(usize, usize, &str)], from: usize, cue: usize) -> bool {
     words[from..cue].iter().any(|w| HEDGES.contains(&w.2))
 }
 
+/// A negating word directly before a retraction cue ("never stopped", "hasn't
+/// stopped"): the cue is a double negative and the fact stays live. Contracted
+/// negated auxiliaries count in every spelling the tokenisers keep ("hasn't",
+/// "hasn\u{2019}t", and "hasnt" once a tokeniser strips the curly apostrophe).
+fn negating_word(w: &str) -> bool {
+    /// Negating words, with the contracted auxiliaries written without their
+    /// apostrophe so "hasn't", "hasn\u{2019}t" and "hasnt" all match.
+    const NEGATIONS: &[&str] = &[
+        "not", "never", "aint", "arent", "cant", "couldnt", "didnt", "doesnt", "dont", "hadnt",
+        "hasnt", "havent", "isnt", "mightnt", "mustnt", "neednt", "shant", "shouldnt", "wasnt",
+        "werent", "wont", "wouldnt",
+    ];
+    let bare: String = w
+        .chars()
+        .filter(|c| *c != '\'' && *c != '\u{2019}')
+        .collect();
+    NEGATIONS.contains(&bare.as_str())
+}
+
 fn words_of(text: &str) -> Vec<String> {
     text.split_whitespace()
         .map(|w| {
@@ -507,10 +526,7 @@ fn infer_negated(text: &str, predicate: &str, group: &str, target: &str, source:
                 .eq(phrase.iter().copied())
             {
                 // "never stopped liking" is a double negative: still positive.
-                if phrase[0] == "stopped"
-                    && start > 0
-                    && matches!(words[start - 1].as_str(), "never" | "not")
-                {
+                if phrase[0] == "stopped" && start > 0 && negating_word(&words[start - 1]) {
                     continue;
                 }
                 let no_longer = phrase.last().is_some_and(|w| *w == "longer");
@@ -582,7 +598,7 @@ fn cue_before(words: &[String], verb_pos: usize) -> Option<usize> {
             // "never stopped liking" is a double negative: still positive.
             if matches!(words[start].as_str(), "stopped" | "ceased")
                 && start > 0
-                && matches!(words[start - 1].as_str(), "never" | "not")
+                && negating_word(&words[start - 1])
             {
                 continue;
             }
@@ -878,7 +894,7 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
                 continue;
             }
             // "never stopped liking" is a double negative: still positive.
-            if phrase[0] == "stopped" && p > 0 && matches!(words[p - 1].2, "never" | "not") {
+            if phrase[0] == "stopped" && p > 0 && negating_word(words[p - 1].2) {
                 continue;
             }
             let phrase_start = words[p].0;
