@@ -221,7 +221,8 @@ and `next:` when present.
   memory does not exist.
 - `next:` means recall stopped one hop short, e.g.
   `next: follow e151 Mira Lindqvist for where live — chain ends at a person`.
-  Call `follow` with that `entity` and `want`, then answer from what it returns.
+  Call `follow` with that `entity` and `want` (or `recall` with the hint
+  once), then answer from what it returns.
   Do not guess the missing name.
 - `remember` prints `saved m<id>` (or `duplicate of`), its `entities:` and
   `relations:` with statuses, `invalidated:`, `superseded:`, `conflict:`,

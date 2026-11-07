@@ -120,3 +120,75 @@ fn next_hints_serialize_the_follow_call() {
         }])
     );
 }
+
+#[test]
+fn a_two_hop_hub_is_never_a_hint_target() {
+    // Noah -> Mira -> Lyon(hub, 33 residents) -> France. The chain would
+    // otherwise end at Lyon; the degree cap keeps the hub out.
+    let e = Engine::open_in_memory(Arc::new(HashEmbedder)).unwrap();
+    remember(&e, "Noah Tansen's manager is Mira Shah.", |i| {
+        i.entities = vec![entity("Noah Tansen"), entity("Mira Shah")];
+        i.relations = vec![relation(
+            "Noah Tansen",
+            "manager",
+            "Mira Shah",
+            "Noah Tansen's manager is Mira Shah.",
+        )];
+    });
+    remember(&e, "Mira Shah lives in Lyon.", |i| {
+        i.entities = vec![entity("Mira Shah"), entity("Lyon")];
+        i.relations = vec![relation(
+            "Mira Shah",
+            "lives in",
+            "Lyon",
+            "Mira Shah lives in Lyon.",
+        )];
+    });
+    remember(&e, "Lyon is situated in France.", |i| {
+        i.entities = vec![entity("Lyon"), entity("France")];
+        i.relations = vec![relation(
+            "Lyon",
+            "situated in",
+            "France",
+            "Lyon is situated in France.",
+        )];
+    });
+    for k in 0..33 {
+        let name = format!("Resident{k} Vale");
+        let content = format!("{name} lives in Lyon.");
+        remember(&e, &content.clone(), |i| {
+            i.entities = vec![entity(&name), entity("Lyon")];
+            i.relations = vec![relation(&name, "lives in", "Lyon", &content)];
+        });
+    }
+    let out = e
+        .recall(&RecallInput {
+            query: "Which country is the city where Noah Tansen's manager lives located in?".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.next.iter().all(|h| h.name != "Lyon"),
+        "a 35-degree city must never be a hint target: {:?}",
+        out.next
+    );
+}
+
+#[test]
+fn a_forgotten_terminal_is_never_a_hint_target() {
+    let e = two_hop_engine();
+    // m2 is Mira's Oslo memory; soft-forgetting it retracts the lives-in fact.
+    e.forget("m2", false).unwrap();
+    let out = e
+        .recall(&RecallInput {
+            query: "Where does the manager of Noah Tansen live?".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        !out.memories.iter().any(|m| m.content.contains("Oslo")),
+        "the forgotten memory must be out of context: {:?}",
+        out.memories
+    );
+    assert!(out.next.is_empty(), "{:?}", out.next);
+}
