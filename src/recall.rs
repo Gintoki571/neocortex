@@ -52,6 +52,12 @@ const STATUS_FTS_SQL: &str = "SELECT rowid FROM memories_fts WHERE memories_fts 
 const ABSTAIN_COSINE: f64 = 0.18;
 /// Most `next` hints one recall may carry.
 const HINT_MAX: usize = 2;
+/// Most live incident relations a `next` hint target may have. Beyond this
+/// `follow` from the bridge spends its budget on hub fan-out (a world city
+/// with 50+ live `lives in` edges drowns the hop the question wants), so a
+/// hint that names a hub costs a call for nothing. 32 matches the semantic
+/// beam's small-bridge admission (`SEM_WIDEN_CAP`).
+const HINT_MAX_DEGREE: usize = 32;
 /// Words whose frame names what the question asks for.
 const WH_WORDS: [&str; 9] = [
     "how", "what", "when", "where", "which", "who", "whom", "whose", "why",
@@ -1080,10 +1086,17 @@ fn step_end(step: &paths::Step) -> i64 {
     }
 }
 
-/// True when the entity has a live relation `follow` would accept for the
-/// question's relation words: a hint that names a hop no relation can walk
-/// only costs the caller a call.
-fn relation_matches_frame(
+/// True when `id` is a followable next-hop bridge: it has at most
+/// `HINT_MAX_DEGREE` live incident relations (never a hub) and at least one
+/// live relation, beyond the chain step the hint asks to go past, matching
+/// the question's wh-frame words. A hint that names a hop no relation can
+/// walk only costs the caller a call. Visibility is `follow`'s: a future
+/// (`valid_from`) or ended (`valid_to`/`expired_at`) relation does not
+/// count, which is also why an entity whose only facts were ended or
+/// forgotten (retracted on `forget`/`invalidate`) is never named.
+/// History/past questions never reach here: the caller suppresses hints
+/// for them entirely.
+fn hint_bridge_followable(
     engine: &Engine,
     id: i64,
     frame_forms: &HashSet<String>,
@@ -1094,6 +1107,7 @@ fn relation_matches_frame(
         "SELECT r.id,p.canonical,r.fact FROM relations r
            JOIN predicates p ON p.id=r.predicate_id
           WHERE (r.src=?1 OR r.dst=?2) AND r.expired_at IS NULL
+            AND r.valid_from<=?3
             AND (r.valid_to IS NULL OR r.valid_to>?3)",
     )?;
     let rows = st.query_map(params![id, id, now], |r| {
@@ -1103,20 +1117,42 @@ fn relation_matches_frame(
             r.get::<_, String>(2)?,
         ))
     })?;
+    let mut live = 0usize;
+    let mut frame_hit = false;
     for row in rows {
         let (relation_id, predicate, fact) = row?;
+        // Degree is the total live fan-out `follow` would walk, including
+        // the chain step the hint asks to go beyond.
+        live += 1;
         if Some(relation_id) == exclude {
             continue;
         }
         let forms = format!("{predicate} {fact}");
-        if text::tokens(&forms)
-            .iter()
-            .any(|token| !word_forms(token).is_disjoint(frame_forms))
+        let tokens = text::tokens(&forms);
+        if !frame_hit
+            && tokens
+                .iter()
+                .any(|token| !word_forms(token).is_disjoint(frame_forms))
         {
-            return Ok(true);
+            frame_hit = true;
+        }
+        if frame_hit && live > HINT_MAX_DEGREE {
+            return Ok(false);
         }
     }
-    Ok(false)
+    Ok(live <= HINT_MAX_DEGREE && frame_hit)
+}
+
+/// The wh-frame check alone (degree cap is in `hint_bridge_followable`).
+#[allow(dead_code)]
+fn relation_matches_frame(
+    engine: &Engine,
+    id: i64,
+    frame_forms: &HashSet<String>,
+    exclude: Option<i64>,
+    now: i64,
+) -> Result<bool> {
+    hint_bridge_followable(engine, id, frame_forms, exclude, now)
 }
 
 /// `follow`-ready hints for the hop retrieval could not finish: name the bridge
@@ -1192,7 +1228,7 @@ fn next_hops(
         } else {
             Some(step.relation_id)
         };
-        if !relation_matches_frame(engine, end, &frame_forms, exclude, now)? {
+        if !hint_bridge_followable(engine, end, &frame_forms, exclude, now)? {
             continue;
         }
         bridge_ids.push(end);
@@ -1203,7 +1239,7 @@ fn next_hops(
     if bridge_ids.is_empty() {
         for (id, _) in seeds {
             if bridge_ids.contains(id)
-                || !relation_matches_frame(engine, *id, &frame_forms, None, now)?
+                || !hint_bridge_followable(engine, *id, &frame_forms, None, now)?
             {
                 continue;
             }
@@ -4148,6 +4184,106 @@ mod hint_tests {
         let f = fixture();
         let chain = chain(f.step_to_mira.clone());
         assert!(hint(&f, &[&chain], &[(f.mira, 0.9)], &[], &[], 0.0).is_empty());
+    }
+
+    #[test]
+    fn a_hub_bridge_gets_no_hint() {
+        let f = fixture();
+        // Give Mira 31 more live edges (33 total with her two): a `follow`
+        // from her would spend its budget on fan-out, so she is never named.
+        for i in 0..31 {
+            let peer = format!("Peer{i:02} Hub");
+            f.engine
+                .remember(RememberInput {
+                    content: format!("Mira Shah knows {peer}."),
+                    entities: vec![entity("Mira Shah", "person"), entity(&peer, "person")],
+                    relations: vec![rel("Mira Shah", "knows", &peer)],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let chain = chain(f.step_to_mira.clone());
+        assert!(hint(&f, &[&chain], &[], &[], &[], 0.40).is_empty());
+        // A seed bridge to the same hub is skipped too.
+        assert!(hint(&f, &[], &[(f.mira, 0.9)], &[], &[], 0.40).is_empty());
+    }
+
+    #[test]
+    fn a_forgotten_terminal_gets_no_hint() {
+        let f = fixture();
+        let live_memory: i64 = f
+            .engine
+            .db
+            .sql()
+            .query_row(
+                "SELECT id FROM memories WHERE content LIKE '%Mira Shah lives in Oslo%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        f.engine.forget(&format!("m{live_memory}"), false).unwrap();
+        let chain = chain(f.step_to_mira.clone());
+        assert!(
+            hint(&f, &[&chain], &[], &[], &[], 0.40).is_empty(),
+            "the retracted lives-in edge must not name Mira"
+        );
+        assert!(hint(&f, &[], &[(f.mira, 0.9)], &[], &[], 0.40).is_empty());
+    }
+
+    #[test]
+    fn a_future_terminal_gets_no_hint() {
+        // `follow` cannot walk a future-dated relation, so a bridge whose only
+        // frame-matching edge starts after the question's `now` is dead.
+        let engine = Engine::open_in_memory(Arc::new(HashEmbedder)).unwrap();
+        engine
+            .remember(RememberInput {
+                content: "Priya manages Mira Shah.".into(),
+                entities: vec![entity("Priya", "person"), entity("Mira Shah", "person")],
+                relations: vec![rel("Priya", "manages", "Mira Shah")],
+                ..Default::default()
+            })
+            .unwrap();
+        let lives = engine
+            .remember(RememberInput {
+                content: "Mira Shah lives in Oslo.".into(),
+                valid_from: Some("2030-01-01".into()),
+                entities: vec![entity("Mira Shah", "person"), entity("Oslo", "place")],
+                relations: vec![rel("Mira Shah", "lives in", "Oslo")],
+                ..Default::default()
+            })
+            .unwrap();
+        let priya = resolve_entity(&engine, "Priya").unwrap();
+        let mira = resolve_entity(&engine, "Mira Shah").unwrap();
+        let manages_id = engine
+            .db
+            .sql()
+            .query_row(
+                "SELECT id FROM relations WHERE fact='Priya manages Mira Shah.'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let step = paths::Step {
+            relation_id: manages_id,
+            src: priya,
+            dst: mira,
+            predicate: "manages".into(),
+            fact: "Priya manages Mira Shah.".into(),
+            reverse: false,
+            matched: 1,
+            memory: None,
+        };
+        let chain = chain(step);
+        let f = Fixture {
+            engine,
+            priya,
+            mira,
+            step_to_mira: chain.steps[0].clone(),
+            step_to_anika: chain.steps[0].clone(),
+            lives_mira: lives.relations[0].id,
+            lives_fact: lives.relations[0].fact.clone(),
+        };
+        assert!(hint(&f, &[&chain], &[], &[], &[], 0.40).is_empty());
     }
 }
 
