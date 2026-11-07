@@ -2183,14 +2183,18 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     // H2-03: when a verb-phrase negation asks for the excluded or ended value
     // and such a fact exists, the ended/current memories are the answer even
-    // though they carry no negation cue. The check reuses the ended-fact
-    // paths below; when it finds nothing the filter is unchanged.
-    let negated_value_early = if negated_value {
+    // though they carry no negation cue. Computed once (scoped to the entities
+    // the question names) and reused for injection below. An unresolved pronoun
+    // subject ("what does she no longer use") with no named entity is ambiguous
+    // and must not inject any subject's ended value.
+    let negated_value_facts_result = if negated_value
+        && !(query_alias_entities.is_empty() && unresolved_pronoun_subject(&input.query))
+    {
         negated_value_facts(engine, &query_vec, &query_alias_entities, cutoff)?
     } else {
         Vec::new()
     };
-    let has_negated_value = !negated_value_early.is_empty();
+    let has_negated_value = !negated_value_facts_result.is_empty();
     // A question about what is *not* the case must not be answered with the
     // positive facts: keep only memories that state a negative themselves,
     // in their wording or as evidence of a negative relation.
@@ -2550,65 +2554,82 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // current value for contrast, reusing the ended-fact path. This runs for
     // both the negated branch (whose filter drops live positives) and the
     // exclusion-without-a-known-property branch (whose history filter drops
-    // ended positives). Non-frame questions are unchanged.
-    if negated_value {
-        let mut anchors = query_alias_entities.clone();
-        for id in &top_entities {
-            anchors.insert(*id);
-        }
-        let extra = negated_value_facts(engine, &query_vec, &anchors, cutoff)?;
-        let fresh: Vec<FactHit> = extra
-            .into_iter()
-            .filter(|f| !facts.iter().any(|x| x.id == f.id && !x.memory))
-            .collect();
-        if !fresh.is_empty() {
-            // Ensure the evidence memories of the answer are visible even when
-            // the negated filter would have dropped them.
-            let mut evidence_ids: Vec<i64> = Vec::new();
-            {
-                let mut st = engine.db.sql().prepare_cached(
-                    "SELECT memory_id FROM relation_evidence WHERE relation_id=?1",
-                )?;
-                for fact in &fresh {
-                    for row in st.query_map([fact.id], |r| r.get::<_, i64>(0))? {
-                        let mid = row?;
-                        if !evidence_ids.contains(&mid) {
-                            evidence_ids.push(mid);
-                        }
+    // ended positives). The result is computed once above, scoped only to the
+    // entities the question names (never top_entities), so a different subject's
+    // ended value is never injected. The scoped facts are the complete answer
+    // for this frame; keeping unrelated facts would leak other subjects (A12).
+    // Non-frame questions are unchanged.
+    let h203_empty = negated_value_facts_result.is_empty();
+    if negated_value && !h203_empty {
+        let full = negated_value_facts_result;
+        // Ensure the evidence memories of the answer are visible even when
+        // the negated filter would have dropped them.
+        let mut evidence_ids: Vec<i64> = Vec::new();
+        {
+            let mut st = engine
+                .db
+                .sql()
+                .prepare_cached("SELECT memory_id FROM relation_evidence WHERE relation_id=?1")?;
+            for fact in &full {
+                for row in st.query_map([fact.id], |r| r.get::<_, i64>(0))? {
+                    let mid = row?;
+                    if !evidence_ids.contains(&mid) {
+                        evidence_ids.push(mid);
                     }
                 }
             }
-            let rows_to_add = fetch_rows(&engine.db, &evidence_ids)?;
-            for id in evidence_ids {
-                if memories.iter().any(|memory| memory.id == id) {
-                    continue;
-                }
-                let Some(row) = rows_to_add.get(&id) else {
-                    continue;
-                };
-                if !eligible(row, as_of, history, input, since, until, now, planned_ok) {
-                    continue;
-                }
-                memories.push(MemoryHit {
-                    id,
-                    kind: row.2.clone(),
-                    content: row.1.clone(),
-                    valid_from: row.9,
-                    valid_to: row.10,
-                    ended: is_ended(row, cutoff),
-                    superseded_by: row.12,
-                    tags: row.3.split_whitespace().map(str::to_string).collect(),
-                    score: 0.0,
-                    reasons: vec!["negated#1".into()],
-                    duration: None,
-                    maybe_superseded_by: None,
-                });
-            }
-            let mut merged = fresh;
-            merged.extend(facts);
-            merged.truncate(8);
-            facts = merged;
         }
+        let rows_to_add = fetch_rows(&engine.db, &evidence_ids)?;
+        for id in evidence_ids {
+            if memories.iter().any(|memory| memory.id == id) {
+                continue;
+            }
+            let Some(row) = rows_to_add.get(&id) else {
+                continue;
+            };
+            if !eligible(row, as_of, history, input, since, until, now, planned_ok) {
+                continue;
+            }
+            memories.push(MemoryHit {
+                id,
+                kind: row.2.clone(),
+                content: row.1.clone(),
+                valid_from: row.9,
+                valid_to: row.10,
+                ended: is_ended(row, cutoff),
+                superseded_by: row.12,
+                tags: row.3.split_whitespace().map(str::to_string).collect(),
+                score: 0.0,
+                reasons: vec!["negated#1".into()],
+                duration: None,
+                maybe_superseded_by: None,
+            });
+        }
+        facts = full;
+        facts.truncate(8);
+    } else if negated_value && !query_alias_entities.is_empty() {
+        // No ended/negated value for the asked subject: keep facts scoped to
+        // the question's entities so a different subject's values never leak.
+        let mut names: Vec<String> = Vec::new();
+        let ids: Vec<i64> = query_alias_entities.iter().copied().collect();
+        for chunk in ids.chunks(400) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let marks = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT name FROM entities WHERE id IN ({marks})");
+            let mut st = engine.db.sql().prepare(&sql)?;
+            for n in st.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, String>(0))? {
+                names.push(text::norm_name(&n?));
+            }
+        }
+        facts.retain(|f| {
+            names
+                .iter()
+                .any(|n| text::norm_name(&f.source) == *n || text::norm_name(&f.target) == *n)
+        });
     }
     // Ordering and duration questions want the intervals themselves, oldest
     // first, with the elapsed time spelled out. Other queries keep relevance
@@ -3442,12 +3463,22 @@ fn ended_pair_facts(
     paths::facts_by_ids(&engine.db, &rel_ids, cutoff, 2)
 }
 
+fn unresolved_pronoun_subject(query: &str) -> bool {
+    text::tokens(query)
+        .iter()
+        .any(|w| matches!(w.as_str(), "she" | "he" | "they" | "her" | "him" | "them"))
+}
+
 /// H2-03: the excluded or ended value of a negated-value question, with the
 /// current value for contrast. Ended positives come first (most query-like),
 /// then a negated row if one exists, then one live value per ended predicate
-/// group. Anchored when the question names entities; otherwise the global
-/// relation KNN supplies candidates. Returns empty when there is nothing to
-/// surface, so non-frame behavior stays byte-identical.
+/// group. `anchors` are the entities the question names (never top_entities):
+/// when present, only relations touching them are considered, so a different
+/// subject's ended value is never injected. When the question names no entity,
+/// the global KNN path runs and keeps only rows whose subject (semantic `subj`,
+/// else `src`) is the most query-similar subject among the candidates. Returns
+/// empty when there is nothing to surface, so non-frame behavior stays
+/// byte-identical.
 fn negated_value_facts(
     engine: &Engine,
     query_vec: &[f32],
@@ -3470,8 +3501,23 @@ fn negated_value_facts(
             .map(|v| rank::cosine(query_vec, &v))
             .unwrap_or(0.0)
     }
+    let subject_of = |id: i64| -> Option<i64> {
+        engine
+            .db
+            .sql()
+            .query_row(
+                "SELECT CASE WHEN subj = 0 THEN src ELSE subj END FROM relations WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    };
     // Candidate (ended/negated) relation ids, most query-like first.
     let mut candidates: Vec<(f32, i64)> = Vec::new();
+    // When the global path runs (no named entity), restrict to one subject.
+    let mut global_subject: Option<i64> = None;
     if anchors.is_empty() {
         let mut st = engine.db.sql().prepare(&format!(
             "SELECT rowid,1-distance FROM relations_vec
@@ -3483,16 +3529,30 @@ fn negated_value_facts(
                 Ok((r.get(0)?, r.get(1)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
+        // Collect ended/negated hits with their semantic subjects.
+        let mut scored: Vec<(f32, i64, Option<i64>)> = Vec::new();
         for (id, cosine) in hits {
             let ok: bool = engine.db.sql().query_row(
                 "SELECT EXISTS(SELECT 1 FROM relations r WHERE r.id=?1 AND r.valid_from<=?2
-                 AND (r.polarity=0
-                      OR (r.polarity=1 AND (r.expired_at IS NOT NULL OR (r.valid_to IS NOT NULL AND r.valid_to<=?2)))))",
+                 AND (polarity=0
+                      OR (polarity=1 AND (r.expired_at IS NOT NULL OR (r.valid_to IS NOT NULL AND r.valid_to<=?2)))))",
                 params![id, cutoff],
                 |r| r.get(0),
             )?;
             if ok {
-                candidates.push((cosine, id));
+                scored.push((cosine, id, subject_of(id)));
+            }
+        }
+        // The most query-similar subject owns the answer; a question with no
+        // named entity must not mix subjects.
+        if let Some((_, _, subj)) = scored.first() {
+            global_subject = *subj;
+        }
+        if let Some(owner) = global_subject {
+            for (cosine, id, subj) in scored {
+                if subj == Some(owner) {
+                    candidates.push((cosine, id));
+                }
             }
         }
     } else {
@@ -3555,19 +3615,24 @@ fn negated_value_facts(
     let mut live: Vec<i64> = Vec::new();
     for group in groups {
         let id: Option<i64> = if anchors.is_empty() {
-            engine
-                .db
-                .sql()
-                .query_row(
-                    "SELECT r.id FROM relations r JOIN predicates p ON p.id=r.predicate_id
-                     WHERE COALESCE(NULLIF(p.group_id,0),p.id)=?1 AND r.polarity=1
-                       AND r.valid_from<=?2 AND r.expired_at IS NULL
-                       AND (r.valid_to IS NULL OR r.valid_to>?2)
-                     ORDER BY r.id DESC LIMIT 1",
-                    params![group, cutoff],
-                    |r| r.get(0),
-                )
-                .optional()?
+            if let Some(owner) = global_subject {
+                engine
+                    .db
+                    .sql()
+                    .query_row(
+                        "SELECT r.id FROM relations r JOIN predicates p ON p.id=r.predicate_id
+                         WHERE COALESCE(NULLIF(p.group_id,0),p.id)=?1 AND r.polarity=1
+                           AND r.valid_from<=?2 AND r.expired_at IS NULL
+                           AND (r.valid_to IS NULL OR r.valid_to>?2)
+                           AND CASE WHEN r.subj = 0 THEN r.src ELSE r.subj END = ?3
+                         ORDER BY r.id DESC LIMIT 1",
+                        params![group, cutoff, owner],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+            } else {
+                None
+            }
         } else {
             let mut ids: Vec<i64> = anchors.iter().copied().collect();
             ids.sort_unstable();
@@ -3612,15 +3677,6 @@ fn negated_value_facts(
     // unrelated live value would leak a positive into a negative answer.
     let mut ended: Vec<i64> = Vec::new();
     let mut negated_rows: Vec<i64> = Vec::new();
-    let subject_of = |id: i64, engine: &Engine| -> Option<i64> {
-        engine
-            .db
-            .sql()
-            .query_row("SELECT src FROM relations WHERE id=?1", [id], |r| r.get(0))
-            .optional()
-            .ok()
-            .flatten()
-    };
     for &id in &ordered {
         let row: Option<(i64, Option<i64>, Option<i64>)> = engine
             .db
@@ -3643,16 +3699,12 @@ fn negated_value_facts(
     if !ended.is_empty() {
         ordered.extend(live);
     } else if !negated_rows.is_empty() {
-        let neg_subjects: Vec<Option<i64>> = negated_rows
-            .iter()
-            .map(|&id| subject_of(id, engine))
-            .collect();
+        let neg_subjects: Vec<Option<i64>> =
+            negated_rows.iter().map(|&id| subject_of(id)).collect();
         let contrast: Vec<i64> = live
             .iter()
             .copied()
-            .filter(|&id| {
-                subject_of(id, engine).is_some_and(|src| neg_subjects.contains(&Some(src)))
-            })
+            .filter(|&id| subject_of(id).is_some_and(|src| neg_subjects.contains(&Some(src))))
             .collect();
         if contrast.is_empty() {
             return Ok(Vec::new());

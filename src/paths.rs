@@ -194,7 +194,9 @@ pub fn negated_value_frame(query: &str) -> bool {
             return true;
         }
     }
-    // AUX + negation + content ("does Lumen not use", "is not on").
+    // AUX + negation + content ("does Lumen not use", "is not on"). The content
+    // word must read as a predicate (verb/phrase), not a state adjective: "which
+    // tests are not flaky" asks about a property, not an excluded/ended value.
     for (i, word) in words.iter().enumerate() {
         if AUXILIARIES.contains(&word.as_str()) {
             let window_end = (i + 4).min(words.len());
@@ -204,7 +206,7 @@ pub fn negated_value_frame(query: &str) -> bool {
                     && j + 1 < words.len()
                 {
                     if let Some(follow) = words.get(j + 1) {
-                        if follow == "sure" || is_pronoun(follow) {
+                        if follow == "sure" || is_pronoun(follow) || state_property_word(follow) {
                             continue;
                         }
                         return true;
@@ -217,13 +219,81 @@ pub fn negated_value_frame(query: &str) -> bool {
     for (i, word) in words.iter().enumerate() {
         if CONTRACTIONS.contains(&word.as_str()) {
             if let Some(follow) = words.get(i + 1) {
-                if follow != "sure" && !is_pronoun(follow) {
+                if follow != "sure" && !is_pronoun(follow) && !state_property_word(follow) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+/// State/property adjectives: "not flaky", "not ready" describe a property, not
+/// an excluded or ended value (H2-03). Kept narrow so verb predicates still fire.
+fn state_property_word(word: &str) -> bool {
+    matches!(
+        word,
+        "flaky"
+            | "buggy"
+            | "stale"
+            | "ready"
+            | "safe"
+            | "unsafe"
+            | "risky"
+            | "slow"
+            | "fast"
+            | "stable"
+            | "unstable"
+            | "valid"
+            | "invalid"
+            | "empty"
+            | "null"
+            | "nil"
+            | "true"
+            | "false"
+            | "local"
+            | "remote"
+            | "public"
+            | "private"
+            | "internal"
+            | "external"
+            | "active"
+            | "inactive"
+            | "online"
+            | "offline"
+            | "available"
+            | "unavailable"
+            | "possible"
+            | "impossible"
+            | "visible"
+            | "hidden"
+            | "enabled"
+            | "disabled"
+            | "optional"
+            | "required"
+            | "correct"
+            | "incorrect"
+            | "wrong"
+            | "right"
+            | "equal"
+            | "same"
+            | "different"
+            | "new"
+            | "old"
+            | "good"
+            | "bad"
+            | "fine"
+            | "okay"
+            | "ok"
+            | "healthy"
+            | "unhealthy"
+            | "clean"
+            | "dirty"
+            | "open"
+            | "closed"
+            | "free"
+            | "busy"
+    )
 }
 
 fn bare_words(value: &str) -> Vec<String> {
