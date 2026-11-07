@@ -1845,16 +1845,9 @@ fn related_memories(db: &Db, seeds: &[i64], specific: &HashSet<i64>) -> Result<H
         marks(seeds.len()),
         marks(specific.len())
     ))?;
-    let p: Vec<Box<dyn rusqlite::ToSql>> = seeds
-        .iter()
-        .chain(seeds.iter())
-        .chain(specific.iter())
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
-        .collect();
     let mut out = HashSet::new();
-    for id in st.query_map(params_from_iter(p.iter().map(|x| x.as_ref())), |r| {
-        r.get::<_, i64>(0)
-    })? {
+    let p = seeds.iter().chain(seeds).chain(specific);
+    for id in st.query_map(params_from_iter(p), |r| r.get::<_, i64>(0))? {
         out.insert(id?);
     }
     Ok(out)
@@ -1864,40 +1857,24 @@ fn related_memories(db: &Db, seeds: &[i64], specific: &HashSet<i64>) -> Result<H
 /// one of `candidates`, plus those that end at a question anchor. The endpoint
 /// lists are literal placeholders so the plan is driven by `idx_relev_memory`
 /// and `idx_rel_src`/`idx_rel_dst` instead of a scan of every stored relation.
-fn cause_relation_query(
-    group: i64,
-    candidates: &[i64],
-    anchors: &[i64],
-) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+fn cause_relation_query(group: i64, candidates: &[i64], anchors: &[i64]) -> (String, Vec<i64>) {
     let marks = |n: usize| vec!["?"; n].join(",");
     let mut branches = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(group)];
+    let mut params = vec![group];
     if !candidates.is_empty() {
         branches.push(format!(
             "SELECT relation_id FROM relation_evidence WHERE memory_id IN ({})",
             marks(candidates.len())
         ));
-        params.extend(
-            candidates
-                .iter()
-                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-        );
+        params.extend(candidates);
     }
     if !anchors.is_empty() {
         branches.push(format!(
             "SELECT id FROM relations WHERE src IN ({0}) OR dst IN ({0})",
             marks(anchors.len())
         ));
-        params.extend(
-            anchors
-                .iter()
-                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-        );
-        params.extend(
-            anchors
-                .iter()
-                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-        );
+        params.extend(anchors);
+        params.extend(anchors);
     }
     let sql = format!(
         "SELECT r.id,r.valid_from,r.valid_to,r.expired_at,e.memory_id,r.src,r.dst
@@ -1968,7 +1945,7 @@ pub(crate) fn cause_follow(
     let mut st = db.sql().prepare(&sql)?;
     let mut pairs: Vec<(i64, i64)> = Vec::new();
     let mut anchored: HashSet<i64> = HashSet::new();
-    for row in st.query_map(params_from_iter(params.iter().map(|x| x.as_ref())), |r| {
+    for row in st.query_map(params_from_iter(&params), |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
@@ -2774,9 +2751,7 @@ mod tests {
             .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .unwrap();
         let plan: Vec<String> = st
-            .query_map(params_from_iter(params.iter().map(|x| x.as_ref())), |r| {
-                r.get::<_, String>(3)
-            })
+            .query_map(params_from_iter(&params), |r| r.get::<_, String>(3))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();

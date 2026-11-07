@@ -194,25 +194,13 @@ fn temporal_link_ids(db: &Db, seeds: &[(i64, f64)], keep: usize, depth: usize) -
         let sql =
             format!("SELECT a,b,weight FROM memory_links WHERE a IN ({marks}) OR b IN ({marks})");
         let mut st = db.sql().prepare(&sql)?;
-        let mut p: Vec<Box<dyn rusqlite::ToSql>> = chunk
-            .iter()
-            .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
-            .collect();
-        p.extend(
-            chunk
-                .iter()
-                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-        );
-        for row in st.query_map(
-            rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, f64>(2)?,
-                ))
-            },
-        )? {
+        for row in st.query_map(params_from_iter(chunk.iter().chain(chunk)), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, f64>(2)?,
+            ))
+        })? {
             let (a, b, weight) = row?;
             let (anchor, other) = if rank.contains_key(&a) {
                 (a, b)
@@ -1707,17 +1695,9 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                  WHERE memory_id IN ({marks}) AND entity_id IN ({emarks})"
             );
             let mut st = engine.db.sql().prepare(&sql)?;
-            let mut p: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-            for id in &graph_ids {
-                p.push(Box::new(*id) as Box<dyn rusqlite::ToSql>);
-            }
-            for id in &strong {
-                p.push(Box::new(*id) as Box<dyn rusqlite::ToSql>);
-            }
-            for id in st.query_map(
-                rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
-                |r| r.get::<_, i64>(0),
-            )? {
+            for id in st.query_map(params_from_iter(graph_ids.iter().chain(&strong)), |r| {
+                r.get::<_, i64>(0)
+            })? {
                 cand.push(id?);
             }
         }
@@ -2218,15 +2198,9 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             let sql = format!(
                 "UPDATE memories SET access_count=access_count+1,last_access=?1 WHERE id IN ({marks})"
             );
-            let mut p: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now)];
-            p.extend(
-                returned_memory_ids
-                    .iter()
-                    .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-            );
             db.sql().execute(
                 &sql,
-                rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
+                params_from_iter(std::iter::once(&now).chain(&returned_memory_ids)),
             )?;
             let mut insert = db
                 .sql()
@@ -3388,17 +3362,13 @@ fn negated_value_facts(
                     OR (polarity=1 AND (expired_at IS NOT NULL OR (valid_to IS NOT NULL AND valid_to<=?))))
              ORDER BY valid_from DESC, id DESC LIMIT 800"
         );
-        let mut bind: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cutoff)];
-        for id in ids.iter().chain(ids.iter()) {
-            bind.push(Box::new(*id));
-        }
-        bind.push(Box::new(cutoff));
+        let bind = std::iter::once(&cutoff)
+            .chain(&ids)
+            .chain(&ids)
+            .chain([&cutoff]);
         let mut st = engine.db.sql().prepare(&sql)?;
         let rows: Vec<i64> = st
-            .query_map(
-                rusqlite::params_from_iter(bind.iter().map(|x| x.as_ref())),
-                |r| r.get(0),
-            )?
+            .query_map(params_from_iter(bind), |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for id in rows {
             candidates.push((cosine_of(engine, id, query_vec), id));
@@ -3446,17 +3416,13 @@ fn negated_value_facts(
                AND (r.src IN ({marks}) OR r.dst IN ({marks}))
              ORDER BY r.id DESC LIMIT 20"
         );
-        let mut bind: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(group), Box::new(cutoff), Box::new(cutoff)];
-        for id in ids.iter().chain(ids.iter()) {
-            bind.push(Box::new(*id));
-        }
+        let bind = [&group, &cutoff, &cutoff]
+            .into_iter()
+            .chain(&ids)
+            .chain(&ids);
         let mut st = engine.db.sql().prepare(&sql)?;
         let pool: Vec<i64> = st
-            .query_map(
-                rusqlite::params_from_iter(bind.iter().map(|x| x.as_ref())),
-                |r| r.get(0),
-            )?
+            .query_map(params_from_iter(bind), |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let id: Option<i64> = pool.into_iter().max_by(|a, b| {
             cosine_of(engine, *a, query_vec).total_cmp(&cosine_of(engine, *b, query_vec))
@@ -3560,13 +3526,9 @@ fn asked_family_facts(
            AND (r.src IN ({marks}) OR r.dst IN ({marks}))"
     );
     let mut st = engine.db.sql().prepare(&sql)?;
-    let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(asked.group)];
-    for id in ids.iter().chain(ids.iter()) {
-        sql_params.push(Box::new(*id));
-    }
     let mut candidates = Vec::new();
     for row in st.query_map(
-        rusqlite::params_from_iter(sql_params.iter().map(|x| x.as_ref())),
+        params_from_iter(std::iter::once(&asked.group).chain(&ids).chain(&ids)),
         |r| {
             Ok((
                 r.get::<_, i64>(0)?,
