@@ -2616,3 +2616,128 @@ fn a_why_question_without_causes_is_unchanged() {
     assert_eq!(ids(&on), ids(&base));
     assert!(on.facts.iter().all(|f| f.source != "retry storm"));
 }
+
+/// A store above the anchor channel's scale gate (50k memories): the same
+/// tests run unlocked at 108k. Bulk-inserted (the crowd) through plain SQL
+/// so the test does not ingest 50k memories through `remember`.
+fn at_scale(e: &Engine) {
+    let sql = e.db.sql();
+    sql.execute_batch("BEGIN").unwrap();
+    let mut st = sql
+        .prepare(
+            "INSERT INTO memories(content,kind,tags,importance,created_at,valid_from,content_hash) VALUES (?1,'note','',0.5,0,0,?1)",
+        )
+        .unwrap();
+    for n in 0..50_000 {
+        st.execute([format!("fill {n}")]).unwrap();
+    }
+    sql.execute_batch("COMMIT").unwrap();
+    drop(st);
+}
+
+// A gold memory that only the graph channel can see (an exact anchor, no
+// shared query words and no BM25 term) must still answer a question whose
+// top dense/BM25 hits belong to other memories (nc-hay1: at 108k distractors
+// a graph#1 hit loses the fused ranking to 2-channel modest hits).
+#[test]
+fn anchored_gold_reaches_top_k_despite_dense_crowding() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    // Access recording must not let comparisons drift between calls.
+    e.cfg.w_retention = 0.0;
+    at_scale(&e);
+    let gold = remember(
+        &e,
+        "The Titan Krios G4 is the lab's main high-resolution cryo-EM scope.",
+        |i| {
+            i.entities = vec![EntityIn {
+                name: "Titan Krios G4".into(),
+                aliases: vec!["microscope".into()],
+                ..Default::default()
+            }];
+        },
+    );
+    // Distractors that merely repeat the question's words ("book a session"):
+    // they take the top BM25 + vector ranks but say nothing about the anchor.
+    for n in 0..6 {
+        remember(
+            &e,
+            &format!("Book a session slot for the polishing machine, visit {n}."),
+            |i| {
+                i.entities = vec![entity("Polishing Machine")];
+            },
+        );
+    }
+    let query = RecallInput {
+        query: "book a session on the microscope".into(),
+        k: Some(5),
+        ..Default::default()
+    };
+    e.cfg.w_anchor = 0.0;
+    let off = e.recall(&query).unwrap();
+    assert!(
+        !ids(&off).contains(&gold),
+        "precondition: without the anchor channel the gold is buried by crowded distractors"
+    );
+    e.cfg.w_anchor = 2.5;
+    let on = e.recall(&query).unwrap();
+    assert!(
+        ids(&on).contains(&gold),
+        "anchored gold must reach top-k despite dense distractors"
+    );
+    // And it should carry the anchor reason while doing so.
+    assert!(
+        has_reason(&on, gold, "anchor#"),
+        "gold should get an anchor-channel reason: {:?}",
+        on.memories
+            .iter()
+            .find(|m| m.id == gold)
+            .map(|m| &m.reasons)
+    );
+}
+
+#[test]
+fn anchor_knob_parses_and_defaults_on() {
+    let mut cfg = Config::default();
+    assert_eq!(cfg.w_anchor, 2.5);
+    neocortex::eval::set_config(&mut cfg, "w_anchor", "0").unwrap();
+    assert_eq!(cfg.w_anchor, 0.0);
+    neocortex::eval::set_config(&mut cfg, "w_anchor", "2.5").unwrap();
+    assert_eq!(cfg.w_anchor, 2.5);
+    assert!(neocortex::eval::set_config(&mut cfg, "w_anchor", "many").is_err());
+}
+
+#[test]
+fn anchor_knob_zero_is_byte_identical() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    e.cfg.w_retention = 0.0;
+    at_scale(&e);
+    remember(&e, "The Titan Krios G4 is the lab's main scope.", |i| {
+        i.entities = vec![EntityIn {
+            name: "Titan Krios G4".into(),
+            aliases: vec!["microscope".into()],
+            ..Default::default()
+        }];
+    });
+    remember(&e, "Book a session for the polisher.", |i| {
+        i.entities = vec![entity("Polisher")];
+    });
+    let query = RecallInput {
+        query: "book a session on the microscope".into(),
+        ..Default::default()
+    };
+    // With the knob at 0 the channel is silent: on/off/on must round-trip.
+    e.cfg.w_anchor = 0.0;
+    let off = serde_json::to_string(&e.recall(&query).unwrap()).unwrap();
+    e.cfg.w_anchor = 2.5;
+    let on = serde_json::to_string(&e.recall(&query).unwrap()).unwrap();
+    assert_ne!(
+        on, off,
+        "with the knob on the output must change (anchor channel active)"
+    );
+    e.cfg.w_anchor = 0.0;
+    let off2 = serde_json::to_string(&e.recall(&query).unwrap()).unwrap();
+    assert_eq!(
+        off2, off,
+        "knob off must give a deterministic, state-free output"
+    );
+}

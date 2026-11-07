@@ -1019,6 +1019,19 @@ pub(crate) fn search(db: &Db, query: &str, seeds: &[i64], vis: Visibility) -> Re
 pub(crate) const SEM_FACTS: usize = 100;
 /// Edges taken from one entity in the semantic beam.
 const SEM_EDGES: usize = 6;
+/// Most relations an entity may carry before the semantic beam stops
+/// admitting its facts wholesale (outside the relevance KNN): a hop's
+/// relation can rank below the top-100 KNN at 108k distractors, and a
+/// small-degree bridge's own facts must stay reachable.
+const SEM_WIDEN_CAP: usize = 32;
+/// The widening (and the extra beam depth) engage only once the store is
+/// past this size: below it, KNN-100 spans essentially the whole relation
+/// set, so the stranded-hop mechanism cannot occur anyway.
+const SEM_WIDEN_MIN_STORE: i64 = 50_000;
+/// Deepest semantic walk (edges): the chain form the seeded benchmarks ask
+/// for (depth 4 walked to the world hubs and buried the answers, so the
+/// wider walk stays off).
+const SEM_MAX_DEPTH: usize = 3;
 /// Score factor for a hop through a text-only memory.
 const PROSE_HOP: f64 = 0.8;
 /// Score factor for a hop through a name-containment link (B5): the write
@@ -1195,6 +1208,15 @@ pub(crate) fn search_semantic(
     let mut entity_vector_st = db
         .sql()
         .prepare_cached("SELECT embedding FROM entities_vec WHERE rowid=?1")?;
+    // The widened beam depth + bridge admission: only at scale (see
+    // SEM_WIDEN_MIN_STORE). Small stores get the old beam byte for byte.
+    let at_scale = db
+        .sql()
+        .query_row("SELECT count(*) FROM memories", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0)
+        >= SEM_WIDEN_MIN_STORE;
+    let depth = if at_scale { SEM_MAX_DEPTH } else { MAX_DEPTH };
+    let widen_enabled = at_scale;
     let mut vector_st = db
         .sql()
         .prepare_cached("SELECT embedding FROM memories_vec WHERE rowid=?1")?;
@@ -1211,6 +1233,23 @@ pub(crate) fn search_semantic(
             return Ok(hit.clone());
         }
         let mut out = Vec::new();
+        // A chain can always continue through a small-degree bridge's own
+        // facts, whatever their cosine to the question (nc-hay1): at 108k
+        // distractors a hop's relation can fall outside the top-100 KNN that
+        // bounds `relevant` (cos 0.10-0.16 loses to the world's generic
+        // facts), yet the residual walk must still reach it via the bridge
+        // that hop 1 just landed on. Hub entities stay KNN-bounded so the
+        // fan-out (and the vector reads) stay capped.
+        let widen = widen_enabled
+            && db
+                .sql()
+                .query_row(
+                    "SELECT count(*) FROM relations WHERE (src=?1 OR dst=?1) AND polarity=1",
+                    [entity],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(i64::MAX)
+                <= SEM_WIDEN_CAP as i64;
         for row in edges_st.query_map([entity], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -1224,7 +1263,10 @@ pub(crate) fn search_semantic(
             ))
         })? {
             let (relation_id, src, dst, predicate, fact, from, to, expired) = row?;
-            if !relevant.contains(&relation_id) || src == dst || !vis.shows(from, to, expired) {
+            if (!relevant.contains(&relation_id) && !widen)
+                || src == dst
+                || !vis.shows(from, to, expired)
+            {
                 continue;
             }
             let Some(vector) = relation_vector_st
@@ -1328,7 +1370,7 @@ pub(crate) fn search_semantic(
         .map(|id| (*id, vec![*id], 0.0, Vec::new(), query_vec.to_vec()))
         .collect();
     let mut hits: Vec<PathHit> = Vec::new();
-    for _ in 0..MAX_DEPTH {
+    for _ in 0..depth {
         let mut next = Vec::new();
         for (entity, visited, sum, steps, residual) in &frontier {
             // First compute features + base cosine for every candidate.
@@ -2744,6 +2786,136 @@ mod name_part_tests {
         );
         const { assert!(NAME_PART_HOP < super::PROSE_HOP) };
         const { assert!(super::PROSE_HOP < 1.0) };
+    }
+}
+
+/// nc-hay1: at 108k distractors a hop's relation can fall outside the top-100
+/// KNN that bounds the semantic beam's `relevant` set (its cosine to the
+/// question collapses behind the world's generic facts), so a two-hop answer
+/// needs the beam to keep walking through a small-degree bridge's own facts.
+/// The hop that KNN alone would miss is the answer's last hop, incident to
+/// the bridge hop 1 landed on.
+#[cfg(test)]
+mod widen_tests {
+    use super::{search_semantic, Visibility};
+    use crate::db::Db;
+    use rusqlite::params;
+
+    fn vector(axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; 768];
+        v[axis] = 1.0;
+        v
+    }
+
+    fn entity(db: &Db, name: &str, axis: usize) -> i64 {
+        db.sql()
+            .execute(
+                "INSERT INTO entities(name,norm,type,homonym,created_at,updated_at)
+                 VALUES (?1,?1,'person',0,0,0)",
+                params![name],
+            )
+            .unwrap();
+        let id = db.sql().last_insert_rowid();
+        db.sql()
+            .execute(
+                "INSERT INTO entities_vec(rowid,embedding) VALUES (?1,?2)",
+                params![id, db.vec_blob(&vector(axis))],
+            )
+            .unwrap();
+        id
+    }
+
+    fn relation(db: &Db, src: i64, dst: i64, pid: i64, axis: usize, scale: f32) -> i64 {
+        db.sql()
+            .execute(
+                "INSERT INTO relations(src,dst,predicate_id,predicate_text,subj,fact,valid_from,created_at)
+                 VALUES (?1,?2,?3,'likes',?1,'fact text',0,0)",
+                params![src, dst, pid],
+            )
+            .unwrap();
+        let id = db.sql().last_insert_rowid();
+        let mut v = vec![0.0f32; 768];
+        v[axis] = scale;
+        db.sql()
+            .execute(
+                "INSERT INTO relations_vec(rowid,embedding) VALUES (?1,?2)",
+                params![id, db.vec_blob(&v)],
+            )
+            .unwrap();
+        id
+    }
+
+    /// Chain: Noor(at ?2 axis) --hop1(axis 0)-- Delta --hop2(axis 7, weak)--> Aisha.
+    /// 110 same-axis distractor relations sit above hop2's cosine, so it is
+    /// outside the KNN-100 unless the widening admits it via the bridge.
+    fn fixture(db: &Db, pid: i64) -> (i64, i64, i64) {
+        // The widening engages only at scale; build a 50k-memory store so the
+        // crowded dispatch the seam protects against is exercised.
+        let sql = db.sql();
+        sql.execute_batch("BEGIN").unwrap();
+        let mut st = sql
+            .prepare("INSERT INTO memories(content,kind,tags,importance,created_at,valid_from,content_hash) VALUES (?1,'note','',0.5,0,0,?1)")
+            .unwrap();
+        for n in 0..50_000 {
+            st.execute(params![format!("fill {n}")]).unwrap();
+        }
+        sql.execute_batch("COMMIT").unwrap();
+        drop(st);
+        let noor = entity(db, "Noor", 0);
+        let delta = entity(db, "Delta", 0);
+        let aisha = entity(db, "Aisha", 0);
+        // hop 1: matches the question fully
+        relation(db, noor, delta, pid, 0, 1.0);
+        // hop 2: weak cosine (axis 7), beyond the distractor crowd
+        relation(db, delta, aisha, pid, 7, 0.3);
+        // 110 distractor facts, incident to unrelated entities (not on the
+        // chain), fully on axis 0: they exhaust the KNN-100 above hop2's
+        // cosine. Delta's own incident count stays small.
+        let d0 = entity(db, "distractor zero", 0);
+        let d1 = entity(db, "distractor one", 0);
+        for _ in 0..110 {
+            relation(db, d0, d1, pid, 0, 1.0);
+        }
+        (noor, delta, aisha)
+    }
+
+    #[test]
+    fn a_small_bridge_keeps_its_whole_frontier_reachable() {
+        let db = Db::open_in_memory().unwrap();
+        db.sql()
+            .execute(
+                "INSERT INTO predicates(canonical,display,exclusive,group_id,symmetric,seeded)
+                 VALUES ('likes','likes',0,0,0,0)",
+                [],
+            )
+            .unwrap();
+        let pid = db.sql().last_insert_rowid();
+        let (noor, delta, aisha) = fixture(&db, pid);
+        let query = vector(0);
+        let vis = Visibility {
+            now: 0,
+            as_of: None,
+            history: false,
+        };
+        let hits = search_semantic(
+            &db,
+            "Who started the firm",
+            &query,
+            &[noor],
+            &[noor],
+            false,
+            &[],
+            vis,
+            false,
+            super::NAME_PART_HOP,
+        )
+        .unwrap();
+        let chain = hits
+            .iter()
+            .find(|h| h.steps.len() == 2)
+            .unwrap_or_else(|| panic!("no two-hop chain: {hits:?}"));
+        assert_eq!(chain.steps[0].dst, delta, "hop one lands on the bridge");
+        assert_eq!(chain.steps[1].dst, aisha, "hop two reaches the answer");
     }
 }
 

@@ -50,6 +50,11 @@ const STATUS_FTS_SQL: &str = "SELECT rowid FROM memories_fts WHERE memories_fts 
 /// Top dense-retrieval cosine below which a query with no lexical or entity
 /// support is treated as "nothing relevant is stored".
 const ABSTAIN_COSINE: f64 = 0.18;
+/// Store size (memories) at which the anchor channel activates fully. At
+/// 108k anchored golds lose the fusion to two-channel distractors; at a few
+/// hundred memories the same top memories already follow from the PPR seeds
+/// and the sibling boost re-orders them for the worse.
+const ANCHOR_MIN_MEMORIES: i64 = 50_000;
 /// Most `next` hints one recall may carry.
 const HINT_MAX: usize = 2;
 /// Words whose frame names what the question asks for.
@@ -950,7 +955,7 @@ fn bridge_pull_facts(
             }
         }
     }
-    bridges.truncate(3);
+    bridges.truncate(6);
     if bridges.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -1685,6 +1690,69 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         .take(depth)
         .collect();
 
+    // ---------------------------------------------------------- anchor
+    // The memories of the exact anchors (the entities the question names),
+    // ranked by query cosine. At 108k distractors, even a graph#1 hit loses
+    // the fused ranking to memories that sit top-5 in two channels, so an
+    // anchored answer needs a channel that no common word in the question
+    // can crowd out. The candidate universe is the top PPR window (bounded
+    // by fetch_depth, no new scans: a world hub touches at most that many
+    // rows), re-ordered by cosine. Only strong anchors qualify; weak
+    // (anchor_tiers) ones keep their seed/beam roles only.
+    // Inert below ANCHOR_MIN_MEMORIES: in a small store the same top
+    // memories already follow from the PPR seeds, and the sibling boost
+    // re-orders them for the worse (measured: 0.953 -> 0.929 on the small
+    // fixture set at full weight).
+    let mut anchor_ids: Vec<i64> = Vec::new();
+    let anchor_on = engine.cfg.w_anchor > 0.0 && !anchors.strong.is_empty() && {
+        let n: i64 = engine
+            .db
+            .sql()
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+            .unwrap_or(0);
+        n >= ANCHOR_MIN_MEMORIES
+    };
+    if anchor_on {
+        let strong: Vec<i64> = anchors.strong.clone();
+        let mut cand: Vec<i64> = Vec::new();
+        if !graph_ids.is_empty() {
+            let marks = std::iter::repeat_n("?", graph_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let emarks = std::iter::repeat_n("?", strong.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT DISTINCT memory_id FROM mentions
+                 WHERE memory_id IN ({marks}) AND entity_id IN ({emarks})"
+            );
+            let mut st = engine.db.sql().prepare(&sql)?;
+            let mut p: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            for id in &graph_ids {
+                p.push(Box::new(*id) as Box<dyn rusqlite::ToSql>);
+            }
+            for id in &strong {
+                p.push(Box::new(*id) as Box<dyn rusqlite::ToSql>);
+            }
+            for id in st.query_map(
+                rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
+                |r| r.get::<_, i64>(0),
+            )? {
+                cand.push(id?);
+            }
+        }
+        // Cosine rank inside the anchor's neighborhood: at 108k the global
+        // dense rank is drowned by the world cluster, but among the anchor's
+        // own top-PPR memories the on-topic hit is near the head.
+        anchor_ids = top_by_cosine(&engine.db, &cand, &query_vec, depth)?;
+        anchor_ids.retain(|id| {
+            rows.get(id).is_some_and(|row| {
+                eligible(row, as_of, history, input, since, until, now, planned_ok)
+            })
+        });
+        anchor_ids.truncate(depth);
+    }
+
     // ------------------------------------------------------------ path
     // Query-directed beam search over relations. This is what answers "where
     // does the manager of X live": the destination memory shares no words with
@@ -1874,6 +1942,11 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             name: "graph",
             weight: engine.cfg.w_graph,
             ids: &graph_ids,
+        },
+        rank::Channel {
+            name: "anchor",
+            weight: engine.cfg.w_anchor,
+            ids: &anchor_ids,
         },
         rank::Channel {
             name: "time",
