@@ -930,12 +930,12 @@ fn bridge_pull_facts(
             }
         }
     }
+    let mut mentions_st = engine
+        .db
+        .sql()
+        .prepare_cached("SELECT entity_id FROM mentions WHERE memory_id=?1")?;
     for memory in memories.iter().take(5) {
-        let mut st = engine
-            .db
-            .sql()
-            .prepare("SELECT entity_id FROM mentions WHERE memory_id=?1")?;
-        for id in st.query_map([memory.id], |r| r.get::<_, i64>(0))? {
+        for id in mentions_st.query_map([memory.id], |r| r.get::<_, i64>(0))? {
             let id = id?;
             if !anchors.contains(&id) && !bridges.contains(&id) {
                 bridges.push(id);
@@ -969,6 +969,10 @@ fn bridge_pull_facts(
         .unwrap_or(usize::MAX);
 
     let query_words: HashSet<String> = text::tokens(query).into_iter().collect();
+    let mut vector_st = engine
+        .db
+        .sql()
+        .prepare_cached("SELECT embedding FROM relations_vec WHERE rowid=?1")?;
     let mut ranked: Vec<(usize, f64, i64, i64)> = Vec::new();
     let mut already_present = 0;
     for bridge in bridges {
@@ -979,7 +983,7 @@ fn bridge_pull_facts(
         if count > p99 {
             continue;
         }
-        let mut st = engine.db.sql().prepare(
+        let mut st = engine.db.sql().prepare_cached(
             "SELECT r.id,
                     COALESCE(NULLIF(r.predicate_text,''),NULLIF(p.display,''),p.canonical),
                     r.valid_from
@@ -1008,14 +1012,8 @@ fn bridge_pull_facts(
                 .into_iter()
                 .filter(|word| query_words.contains(word))
                 .count();
-            let cosine = engine
-                .db
-                .sql()
-                .query_row(
-                    "SELECT embedding FROM relations_vec WHERE rowid=?1",
-                    [id],
-                    |r| r.get::<_, Vec<u8>>(0),
-                )
+            let cosine = vector_st
+                .query_row([id], |r| r.get::<_, Vec<u8>>(0))
                 .ok()
                 .and_then(|blob| engine.db.blob_to_vec(&blob))
                 .map(|vec| f64::from(rank::cosine(query_vec, &vec)))
@@ -2755,39 +2753,32 @@ fn facts_for_view(
          JOIN entities e ON e.id=r.src JOIN entities d ON d.id=r.dst
          WHERE (r.src IN ({marks}) OR r.dst IN ({marks})) AND r.src != r.dst"
     ))?;
+    let mut vector_st = engine
+        .db
+        .sql()
+        .prepare_cached("SELECT embedding FROM relations_vec WHERE rowid=?1")?;
     let mut out = Vec::new();
-    let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
-        .collect();
-    sql_params.extend(
-        ids.iter()
-            .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-    );
-    for x in st.query_map(
-        rusqlite::params_from_iter(sql_params.iter().map(|x| x.as_ref())),
-        |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, i64>(7)?,
-                r.get::<_, Option<i64>>(8)?,
-                r.get::<_, Option<i64>>(9)?,
-                r.get::<_, String>(10)?,
-                r.get::<_, String>(11)?,
-                r.get::<_, i64>(12)?,
-                r.get::<_, i64>(13)?,
-                r.get::<_, Option<i64>>(14)?,
-                r.get::<_, i64>(15)?,
-                r.get::<_, Option<String>>(16)?,
-            ))
-        },
-    )? {
+    for x in st.query_map(params_from_iter(ids.iter().chain(ids)), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, i64>(7)?,
+            r.get::<_, Option<i64>>(8)?,
+            r.get::<_, Option<i64>>(9)?,
+            r.get::<_, String>(10)?,
+            r.get::<_, String>(11)?,
+            r.get::<_, i64>(12)?,
+            r.get::<_, i64>(13)?,
+            r.get::<_, Option<i64>>(14)?,
+            r.get::<_, i64>(15)?,
+            r.get::<_, Option<String>>(16)?,
+        ))
+    })? {
         let (
             id,
             src,
@@ -2820,23 +2811,13 @@ fn facts_for_view(
         // rendered with the viewer as subject and the inverse phrase.
         let other_side = viewer == Some(dst) && (inverse_pred.is_some() || symmetric != 0);
         let (source, target, predicate) = if other_side {
-            (
-                target.clone(),
-                source.clone(),
-                inverse_pred.clone().unwrap_or(pred.clone()),
-            )
+            (target, source, inverse_pred.unwrap_or(pred))
         } else {
-            (source.clone(), target.clone(), pred.clone())
+            (source, target, pred)
         };
         let cosine = if let Some(query) = query_vec {
-            engine
-                .db
-                .sql()
-                .query_row(
-                    "SELECT embedding FROM relations_vec WHERE rowid=?1",
-                    [id],
-                    |r| r.get::<_, Vec<u8>>(0),
-                )
+            vector_st
+                .query_row([id], |r| r.get::<_, Vec<u8>>(0))
                 .optional()?
                 .and_then(|blob| engine.db.blob_to_vec(&blob))
                 .map(|v| rank::cosine(query, &v))
@@ -2871,6 +2852,14 @@ fn facts_for_view(
     }
     out.sort_by(|a, b| b.0.total_cmp(&a.0));
     out.truncate(limit);
+    let mut count_st = engine.db.sql().prepare_cached(
+        "SELECT count(*),
+                (SELECT COALESCE(MAX(exclusive),0) FROM predicates
+                 WHERE id=?2 OR group_id=?2)
+         FROM relations WHERE subj=?1 AND predicate_id IN
+             (SELECT id FROM predicates WHERE group_id=?2) AND polarity=1
+         AND expired_at IS NULL AND valid_from<=?3 AND (valid_to IS NULL OR valid_to>?3)",
+    )?;
     out.into_iter()
         .map(|(_, mut fact, key)| {
             if let Some((subj, group)) = key {
@@ -2878,16 +2867,8 @@ fn facts_for_view(
                 // predicate is single-valued (seeded exclusive, or a group an
                 // agent flagged): on "depends on" or "uses" two live values
                 // are ordinary and the marker read like a conflict warning.
-                let (n, single): (i64, i64) = engine.db.sql().query_row(
-                    "SELECT count(*),
-                            (SELECT COALESCE(MAX(exclusive),0) FROM predicates
-                             WHERE id=?2 OR group_id=?2)
-                     FROM relations WHERE subj=?1 AND predicate_id IN
-                         (SELECT id FROM predicates WHERE group_id=?2) AND polarity=1
-                     AND expired_at IS NULL AND valid_from<=?3 AND (valid_to IS NULL OR valid_to>?3)",
-                    params![subj, group, cutoff],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
+                let (n, single): (i64, i64) = count_st
+                    .query_row(params![subj, group, cutoff], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 fact.current_values = (n >= 2 && single != 0).then_some(n as usize);
             }
             Ok(fact)
