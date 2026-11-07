@@ -830,6 +830,1445 @@ fn nickname_person_ok(db: &Db, item: &EntityIn) -> Result<bool> {
         chars.next().is_some_and(|c| c.is_uppercase()) && w.chars().any(|c| c.is_lowercase())
     }))
 }
+
+/// Extra hedge words for the rename guard: a rename someone only plans,
+/// decides, or might make does not join two names (H3-10).
+const RENAME_HEDGES: &[&str] = &[
+    "will",
+    "going",
+    "intend",
+    "intends",
+    "intended",
+    "intending",
+    "whether",
+    "about",
+    "maybe",
+];
+
+/// Agent-supplied rename predicates that TRIGGER a merge, by direction.
+/// Narrowed (fix round 4): only unambiguous rename assertions merge. Call-shaped
+/// spellings ("formerly called", "previously called", "now called", "now known as",
+/// "renamed", "rename to", "formerly", "previously") are plain relations —
+/// "Ana previously called Bo" is a phone call, not a rename — and must stay
+/// byte-identical in storage to main. `same_as` still merges (handled separately).
+/// `text::fold` keeps "now" (unlike `norm_predicate`), so surface forms match.
+const RENAME_OLD_FIRST: &[&str] = &["renamed to"];
+const RENAME_NEW_FIRST: &[&str] = &["renamed from"];
+
+/// True when the sentence words just before the rename cue hedge or negate
+/// it ("might rename", "was not renamed"), or the words after the cue plan
+/// it ("planned for Q3"): such statements merge nothing. The caller limits
+/// the post-cue slice to the cue's clause (stopping at ",", ";" or " and "
+/// / " but "), so a hedge in a following clause ("... and we may expand it
+/// later") does not block a true rename in the first clause.
+fn rename_blocked(words: &[String], cue_pos: usize) -> bool {
+    let from = cue_pos.saturating_sub(5);
+    let hedge = |w: &String| {
+        HEDGES.contains(&w.as_str()) || RENAME_HEDGES.contains(&w.as_str()) || negating_word(w)
+    };
+    if words[from..cue_pos].iter().any(hedge) {
+        return true;
+    }
+    // A plan stated after the cue ("... to Lantern is planned for Q3") is
+    // still a plan: scan the rest of the sentence after the cue.
+    words[cue_pos..].iter().any(hedge)
+}
+
+/// Common-noun name pieces: a rename never joins two names when either
+/// side is one of these ("the branch", "the meeting", "the tests
+/// directory", "the main branch", "the document"). A multi-word name merges
+/// only when every token is generic, so a proper name with a descriptive
+/// head ("Harbor directory") is not blocked by its head alone.
+const RENAME_GENERIC_NOUNS: &[&str] = &[
+    "branch",
+    "main",
+    "meeting",
+    "file",
+    "document",
+    "test",
+    "spec",
+    "directory",
+    "folder",
+    "dir",
+    "team",
+    "release",
+    "origin",
+    "stable",
+    "pipeline",
+    "project",
+    "system",
+    "service",
+    "database",
+    "config",
+];
+
+/// True when a rename endpoint is a common-noun phrase or a file name,
+/// never a proper name: "Branch", "main", "Meeting", "tests directory",
+/// "main branch", "Document", or any dotted/file-like name ("config.yaml",
+/// "README.md").
+fn rename_is_generic(display: &str, norm: &str) -> bool {
+    if display.contains('.') || display.contains('/') {
+        return true;
+    }
+    if norm.is_empty() {
+        return false;
+    }
+    norm.split_whitespace()
+        .all(|t| RENAME_GENERIC_NOUNS.contains(&t))
+}
+
+/// Determiner / possessive words for the written-form guard: a name written
+/// with one still carries the determiner, so "the repo" is a common-noun
+/// phrase even when the entity display is capitalised.
+const RENAME_DETERMINERS: &[&str] = &[
+    "the", "a", "an", "this", "that", "our", "my", "his", "her", "their", "its", "your",
+];
+
+/// Split raw text into alphanumeric surface tokens with the case preserved:
+/// returns `(folded, surface, gaps)` where `gaps[i]` is the raw text between
+/// token `i-1` and token `i` (gaps[0] is the leading gap). Folded tokens
+/// align with `text::fold` on the same text (hyphen etc. split the same way).
+fn raw_surface_tokens(raw: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let chars: Vec<char> = raw.chars().collect();
+    let n = chars.len();
+    let mut folded = Vec::new();
+    let mut surface = Vec::new();
+    let mut gaps = Vec::new();
+    let mut gap = String::new();
+    let mut i = 0;
+    while i < n && !chars[i].is_alphanumeric() {
+        gap.push(chars[i]);
+        i += 1;
+    }
+    while i < n {
+        let mut surf = String::new();
+        let mut j = i;
+        while j < n {
+            let c = chars[j];
+            if c.is_alphanumeric()
+                || ((c == '\'' || c == '\u{2019}' || c == '\u{02bc}')
+                    && j > 0
+                    && chars[j - 1].is_alphanumeric()
+                    && j + 1 < n
+                    && chars[j + 1].is_alphanumeric())
+            {
+                surf.push(c);
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        let fold = text::fold(&surf);
+        if !surf.is_empty() && !fold.is_empty() {
+            folded.push(fold);
+            surface.push(surf);
+            gaps.push(std::mem::take(&mut gap));
+        }
+        let mut g = String::new();
+        while j < n && !chars[j].is_alphanumeric() {
+            // Inner apostrophes belong to the previous token, not the gap.
+            let c = chars[j];
+            if (c == '\'' || c == '\u{2019}' || c == '\u{02bc}')
+                && j > 0
+                && chars[j - 1].is_alphanumeric()
+                && j + 1 < n
+                && chars[j + 1].is_alphanumeric()
+            {
+                break;
+            }
+            g.push(c);
+            j += 1;
+        }
+        gap = g;
+        i = j;
+    }
+    (folded, surface, gaps)
+}
+
+/// `(has_cased, all_lower, has_upper)` for one surface token. Uncased scripts
+/// (CJK, etc.) report `has_cased == false`.
+fn surface_case(surface: &str) -> (bool, bool, bool) {
+    let mut has_cased = false;
+    let mut all_lower = true;
+    let mut has_upper = false;
+    for c in surface.chars() {
+        if c.is_lowercase() {
+            has_cased = true;
+        } else if c.is_uppercase() {
+            has_cased = true;
+            all_lower = false;
+            has_upper = true;
+        }
+    }
+    (has_cased, has_cased && all_lower, has_upper)
+}
+
+/// True when `name` as WRITTEN in this write's text is a common noun rather
+/// than a proper name, judged by the occurrence next to the rename cue (not
+/// by a word list): all-lowercase in a cased script, except at the sentence
+/// start or hyphen-joined, is generic ("the repo", "now deprecated"); a
+/// determiner-following single capitalised word that is also written
+/// lowercase elsewhere is generic too. The closed `RENAME_GENERIC_NOUNS`
+/// list is kept only as an extra safety net; this is the main guard. Uncased
+/// scripts (N03) and any uppercase are never generic here.
+fn name_written_generic(content: &str, name: &str) -> bool {
+    let name_tokens: Vec<String> = text::fold(name)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if name_tokens.is_empty() || name_tokens.len() > 16 {
+        return false;
+    }
+    let is_single = name_tokens.len() == 1;
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in content.chars() {
+        if matches!(ch, '.' | ';' | '!' | '?' | '\n') {
+            sentences.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    sentences.push(current);
+    let cue_words = [
+        "renamed",
+        "rename",
+        "called",
+        "formerly",
+        "previously",
+        "changed",
+        "known",
+        "now",
+    ];
+    let mut per_sentence: Vec<(Vec<String>, Vec<String>, Vec<String>)> = Vec::new();
+    let mut cue_sentences: Vec<usize> = Vec::new();
+    for (idx, s) in sentences.iter().enumerate() {
+        let (folded, surface, gaps) = raw_surface_tokens(s);
+        if folded.iter().any(|w| cue_words.contains(&w.as_str())) {
+            cue_sentences.push(idx);
+        }
+        per_sentence.push((folded, surface, gaps));
+    }
+    let all: Vec<usize> = (0..sentences.len()).collect();
+    let consider: &[usize] = if cue_sentences.is_empty() {
+        &all
+    } else {
+        &cue_sentences
+    };
+    for &si in consider {
+        let (folded, surface, gaps) = &per_sentence[si];
+        if folded.len() < name_tokens.len() {
+            continue;
+        }
+        // (start, all_lower, has_upper, is_initial, hyphen, pred_det)
+        let mut occs: Vec<(usize, bool, bool, bool, bool, bool)> = Vec::new();
+        for s in 0..=folded.len() - name_tokens.len() {
+            if folded[s..s + name_tokens.len()] != name_tokens[..] {
+                continue;
+            }
+            let mut has_cased_any = false;
+            let mut all_lower_span = true;
+            let mut has_upper_span = false;
+            for k in 0..name_tokens.len() {
+                let (has_cased, all_lower_tok, has_upper_tok) = surface_case(&surface[s + k]);
+                if has_cased {
+                    has_cased_any = true;
+                }
+                if has_cased && !all_lower_tok {
+                    all_lower_span = false;
+                }
+                if has_upper_tok {
+                    has_upper_span = true;
+                }
+            }
+            let all_lower = has_cased_any && all_lower_span;
+            let is_initial = s == 0;
+            let mut hyphen = false;
+            if s + name_tokens.len() < gaps.len() && gaps[s + name_tokens.len()].contains('-') {
+                hyphen = true;
+            }
+            for k in 1..name_tokens.len() {
+                if gaps[s + k].contains('-') {
+                    hyphen = true;
+                }
+            }
+            let pred_det = s > 0 && RENAME_DETERMINERS.contains(&folded[s - 1].as_str());
+            occs.push((s, all_lower, has_upper_span, is_initial, hyphen, pred_det));
+        }
+        for (idx, (_, all_lower, _, is_initial, hyphen, _)) in occs.iter().enumerate() {
+            let _ = idx;
+            if *all_lower && !*is_initial && !*hyphen {
+                return true;
+            }
+        }
+        if is_single {
+            for (idx, (_, _, has_upper, _, _, pred_det)) in occs.iter().enumerate() {
+                if *pred_det && *has_upper {
+                    let lower_else = occs
+                        .iter()
+                        .enumerate()
+                        .any(|(j, (_, low2, _, _, _, _))| j != idx && *low2);
+                    if lower_else {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Clause end (word index, exclusive) after `cue_pos`: the next clause starts
+/// at a `,`/`;` gap or at an "and"/"but" token, so the hedge scan stops
+/// there. `folded` and `gaps` must come from `raw_surface_tokens`.
+fn clause_end_raw(cue_pos: usize, folded: &[String], gaps: &[String]) -> usize {
+    for (i, w) in folded.iter().enumerate().skip(cue_pos + 1) {
+        if w == "and" || w == "but" {
+            return i;
+        }
+        if gaps[i].contains(',') || gaps[i].contains(';') {
+            return i;
+        }
+    }
+    folded.len()
+}
+
+/// Same clause idea on folded words alone (no raw gaps): stop at "and"/"but".
+fn clause_end_words(words: &[String], cue_pos: usize) -> usize {
+    for (i, w) in words.iter().enumerate().skip(cue_pos + 1) {
+        if w == "and" || w == "but" {
+            return i;
+        }
+    }
+    words.len()
+}
+
+/// True when the rename sentence states a date that can order a rename
+/// against two competing live facts (a four-digit year, "in July 2026").
+fn rename_sentence_has_date(content: &str) -> bool {
+    text::fold(content)
+        .split_whitespace()
+        .any(|w| w.len() == 4 && w.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Does this entity have a live fact from a different memory (so a rename
+/// written in the current memory does not count as its own prior fact)?
+fn entity_has_live_facts(db: &Db, entity: i64, memory_id: i64) -> Result<bool> {
+    Ok(db.sql().query_row(
+        "SELECT EXISTS(SELECT 1 FROM relations r
+         WHERE (r.src=?1 OR r.dst=?1 OR r.subj=?1)
+           AND r.expired_at IS NULL AND r.valid_to IS NULL AND r.polarity=1
+           AND NOT EXISTS (SELECT 1 FROM relation_evidence e
+                           WHERE e.relation_id=r.id AND e.memory_id=?2))",
+        rusqlite::params![entity, memory_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Stored people whose first name (first norm token) is `token`, excluding
+/// the two ids already being renamed (so a person's own rename to another
+/// full name sharing the first name is not blocked by its own old name).
+fn shared_first_name_people(
+    db: &Db,
+    token: &str,
+    exclude_a: i64,
+    exclude_b: i64,
+) -> Result<Vec<(i64, String, String)>> {
+    if token.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut st = db.sql().prepare(
+        "SELECT id,name,type FROM entities
+         WHERE type='person' COLLATE NOCASE
+           AND (norm=?1 OR norm LIKE ?1 || ' %')",
+    )?;
+    let rows = st.query_map([token], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, name, kind) = row?;
+        if id != exclude_a && id != exclude_b {
+            out.push((id, name, kind));
+        }
+    }
+    Ok(out)
+}
+
+/// One rename candidate `(old name, new name, is_bare_now)` as stated in a
+/// write. `is_bare_now` marks the weakest cue ("X is now Y" / "(now Y)"):
+/// those text pairs need the stricter guard in `apply_rename_text_hint`.
+type RenameCandidate = (String, String, bool);
+
+/// Text rename candidates `(old name, new name, is_bare_now)` as stated in a
+/// write's prose. `is_bare_now` marks the weakest cue ("X is now Y" / "(now Y)").
+/// Text never merges under the fix-round-3 contract: a passing pair becomes a
+/// `renamed?` hint handled by `apply_rename_text_hint`, never a merge.
+/// Hedged, negated, questioned and reverted sentences never appear here.
+fn rename_pairs_text(
+    content: &str,
+    entities: &[EntityIn],
+    relations: &[RelationIn],
+) -> Vec<RenameCandidate> {
+    let mut out: Vec<RenameCandidate> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    // Entity names this write names (entities and relation endpoints).
+    let mut names: Vec<String> = Vec::new();
+    for e in entities {
+        let n = e.name.trim().to_string();
+        if !n.is_empty() && !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    for r in relations {
+        for n in [&r.source, &r.target] {
+            let n = n.trim().to_string();
+            if !n.is_empty() && !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    // Hyphens split ("harbor-ingest" names "Harbor"), unlike `words_of`.
+    let tokens = |s: &str| -> Vec<String> {
+        text::fold(s)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    let word_of: Vec<Vec<String>> = names.iter().map(|n| tokens(n)).collect();
+    // Sentence chunks with their terminator: a question ("Was Harbor
+    // renamed to Lantern?") is never a rename statement.
+    let mut sentences: Vec<(String, char)> = Vec::new();
+    let mut current = String::new();
+    for ch in content.chars() {
+        if matches!(ch, '.' | ';' | '!' | '?' | '\n') {
+            sentences.push((std::mem::take(&mut current), ch));
+        } else {
+            current.push(ch);
+        }
+    }
+    sentences.push((current, ' '));
+    for (sentence, terminator) in sentences {
+        if terminator == '?' {
+            continue;
+        }
+        let words = tokens(&sentence);
+        if words.len() < 3 {
+            continue;
+        }
+        // "then back to <old>" reverts the rename in the same sentence.
+        if words.windows(2).any(|w| w == ["back", "to"])
+            || words.iter().any(|w| w.starts_with("revert"))
+        {
+            continue;
+        }
+        // Fast path: most memories say nothing about a rename.
+        if !words.iter().any(|w| {
+            matches!(
+                w.as_str(),
+                "renamed"
+                    | "rename"
+                    | "called"
+                    | "formerly"
+                    | "previously"
+                    | "changed"
+                    | "known"
+                    | "now"
+            )
+        }) {
+            continue;
+        }
+        // Surface tokens for the clause-limited hedge scan: when they align
+        // with `words`, the post-cue scan stops at ",", ";" or "and"/"but".
+        let (surf_folded, _surf, gaps) = raw_surface_tokens(&sentence);
+        let aligned = surf_folded == words;
+        // (candidate index, start, len) occurrences in this sentence.
+        let mut occ: Vec<(usize, usize, usize)> = Vec::new();
+        for (ci, wseq) in word_of.iter().enumerate() {
+            if wseq.is_empty() || wseq.len() > words.len() {
+                continue;
+            }
+            for s in 0..=words.len() - wseq.len() {
+                if words[s..s + wseq.len()] == wseq[..] {
+                    occ.push((ci, s, wseq.len()));
+                }
+            }
+        }
+        // (candidate index, start, len, is_bare_now, cue) for each pair.
+        let mut pairs: Vec<(usize, usize, usize, bool)> = Vec::new();
+        let contains = |gap: &[String], cue: &[&str]| -> Option<usize> {
+            if cue.is_empty() || gap.len() < cue.len() {
+                return None;
+            }
+            gap.windows(cue.len())
+                .position(|w| w.iter().map(String::as_str).eq(cue.iter().copied()))
+        };
+        // Old-first gaps ("Harbor was renamed to Lantern"): the cue sits
+        // between the old occurrence and the new one, and must end
+        // immediately before the new name so "now called by the team"
+        // (agent after the cue) does not count as the rename target. No
+        // other candidate occurrence may sit between old and new: that
+        // would be the other rename's name ("Harbor was renamed to Lantern
+        // after Atlas was renamed to Beacon" must not also emit
+        // Lantern -> Beacon).
+        for &(oi, os, ol) in &occ {
+            for &(ni, ns, _) in &occ {
+                if ni == oi || ns <= os + ol {
+                    continue;
+                }
+                if occ
+                    .iter()
+                    .any(|(ci, s, _)| *ci != oi && *ci != ni && *s >= os + ol && *s < ns)
+                {
+                    continue;
+                }
+                let gap = &words[os + ol..ns];
+                if gap.len() > 8 {
+                    continue;
+                }
+                let mut cue_at: Option<usize> = None;
+                let mut bare_now_at = false;
+                for cue in [
+                    &["renamed", "to"][..],
+                    &["rename", "to"][..],
+                    &["now", "called"][..],
+                    &["now", "known", "as"][..],
+                ] {
+                    if let Some(p) = contains(gap, cue) {
+                        if p + cue.len() == gap.len() {
+                            cue_at = Some(os + ol + p);
+                        }
+                        break;
+                    }
+                }
+                if cue_at.is_none() {
+                    // "Kim Lee changed her name to Kim Stone": changed, an
+                    // optional possessive/determiner, "name to".
+                    if let Some(g) = gap.iter().position(|w| w == "changed") {
+                        let rest = &gap[g + 1..];
+                        if rest.len() <= 3
+                            && rest
+                                .iter()
+                                .position(|w| w == "name")
+                                .is_some_and(|p| p + 1 < rest.len() && rest[p + 1] == "to")
+                            && rest.last().is_some_and(|w| w == "to")
+                        {
+                            cue_at = Some(os + ol + g);
+                        }
+                    }
+                }
+                if cue_at.is_none() && gap.last().is_some_and(|w| w == "now") {
+                    // "Harbor is now Lantern" / "Atlas (now Beacon)": a bare
+                    // "now" immediately before the new name (with "is" for
+                    // the non-parenthetical form). This is the weakest cue.
+                    if gap.len() == 1 || gap.iter().any(|w| w == "is") {
+                        cue_at = Some(os + ol + gap.len() - 1);
+                        bare_now_at = true;
+                    }
+                }
+                if let Some(cue) = cue_at {
+                    pairs.push((oi, ni, cue, bare_now_at));
+                }
+            }
+            // Bare-verb order ("we renamed Harbor to Lantern"): the cue
+            // precedes the old occurrence, "to" follows it.
+            if let Some(cue_rel) = (os.saturating_sub(3)..os)
+                .find(|&i| matches!(words[i].as_str(), "rename" | "renamed"))
+            {
+                for &(ni, ns, _) in &occ {
+                    if ni == oi || ns <= os + ol {
+                        continue;
+                    }
+                    if occ
+                        .iter()
+                        .any(|(ci, s, _)| *ci != oi && *ci != ni && *s >= os + ol && *s < ns)
+                    {
+                        continue;
+                    }
+                    let gap = &words[os + ol..ns];
+                    if gap.len() <= 4 && gap.last().is_some_and(|w| w == "to") {
+                        pairs.push((oi, ni, cue_rel, false));
+                    }
+                }
+            }
+        }
+        // "renamed from <old> to <new>".
+        for c in 0..words.len().saturating_sub(1) {
+            if !matches!(words[c].as_str(), "renamed" | "rename") || words[c + 1] != "from" {
+                continue;
+            }
+            if let Some(&(oi, os, ol)) = occ.iter().find(|(_, s, _)| *s >= c + 2 && *s < c + 5) {
+                if let Some(&(ni, _ns, _)) = occ.iter().find(|(ci, s, _)| {
+                    *ci != oi
+                        && *s > os + ol
+                        && *s <= os + ol + 4
+                        && words[os + ol..*s].last().is_some_and(|w| w == "to")
+                }) {
+                    pairs.push((oi, ni, c, false));
+                }
+            }
+        }
+        // "<new> (renamed from <old>)" without "to": the new name precedes
+        // the cue, the old name trails "from".
+        for c in 0..words.len().saturating_sub(1) {
+            if !matches!(words[c].as_str(), "renamed" | "rename") || words[c + 1] != "from" {
+                continue;
+            }
+            let new = occ
+                .iter()
+                .filter(|(_, s, _)| *s < c)
+                .max_by_key(|(_, s, _)| *s);
+            let old = occ.iter().find(|(_, s, _)| *s >= c + 2 && *s < c + 5);
+            if let (Some(&(ni, _, _)), Some(&(oi, _, _))) = (new, old) {
+                if ni != oi {
+                    pairs.push((oi, ni, c, false));
+                }
+            }
+        }
+        // "formerly/previously <old>": the old name trails the cue, the new
+        // name is the nearest other name in the sentence.
+        for i in 0..words.len() {
+            if !matches!(words[i].as_str(), "formerly" | "previously") {
+                continue;
+            }
+            let old = occ.iter().find(|(_, s, _)| {
+                *s > i
+                    && *s < i + 4
+                    && words[i + 1..*s]
+                        .iter()
+                        .all(|w| matches!(w.as_str(), "called" | "known" | "as"))
+            });
+            if let Some(&(oi, os, _)) = old {
+                let new = occ
+                    .iter()
+                    .filter(|(ci, _, _)| *ci != oi)
+                    .min_by_key(|(_, s, _)| s.abs_diff(os));
+                if let Some(&(ni, _, _)) = new {
+                    pairs.push((oi, ni, i, false));
+                }
+            }
+        }
+        for (oi, ni, cue, bare_now) in pairs {
+            if oi == ni || (oi, ni) == (ni, oi) {
+                continue;
+            }
+            let clause_end = if aligned {
+                clause_end_raw(cue, &surf_folded, &gaps)
+            } else {
+                clause_end_words(&words, cue)
+            };
+            if rename_blocked(&words[..clause_end.min(words.len())], cue) {
+                continue;
+            }
+            let key = (text::norm_name(&names[oi]), text::norm_name(&names[ni]));
+            if key.0.is_empty() || key.0 == key.1 || !seen.insert(key.clone()) {
+                continue;
+            }
+            // A pair in both orders within one write keeps the first.
+            if seen.contains(&(key.1.clone(), key.0.clone())) {
+                continue;
+            }
+            out.push((names[oi].clone(), names[ni].clone(), bare_now));
+        }
+    }
+    out
+}
+
+/// Structured rename pairs stated by the caller as relations with a rename
+/// predicate. The caller has already judged this is a rename, so only the
+/// explicit `negated` flag suppresses a pair; content hedges, questions and
+/// reversions do not (the guard list here is about WHICH entity, not whether
+/// it is a name). Direction: old-first predicates
+/// (`renamed to`, `now called`, ...) read source=old/target=new, new-first
+/// predicates (`formerly called`, `renamed from`, ...) read the reverse.
+fn rename_pairs_structured(relations: &[RelationIn]) -> Vec<RenameCandidate> {
+    let mut out: Vec<RenameCandidate> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for r in relations {
+        if r.negated == Some(true) {
+            continue;
+        }
+        let folded = text::fold(&r.predicate);
+        let folded = folded.trim();
+        let pair = if RENAME_OLD_FIRST.contains(&folded) {
+            Some((r.source.clone(), r.target.clone()))
+        } else if RENAME_NEW_FIRST.contains(&folded) {
+            Some((r.target.clone(), r.source.clone()))
+        } else {
+            None
+        };
+        let Some((old, new)) = pair else { continue };
+        let key = (text::norm_name(&old), text::norm_name(&new));
+        if key.0.is_empty() || key.0 == key.1 || !seen.insert(key.clone()) {
+            continue;
+        }
+        if seen.contains(&(key.1.clone(), key.0.clone())) {
+            continue;
+        }
+        out.push((old, new, false));
+    }
+    out
+}
+
+/// Text rename pair: NEVER merges. All previous guards act as a filter for
+/// what is worth reporting; a pair that passes them becomes a `renamed?`
+/// hint naming both entities and the exact confirm call, storing nothing.
+/// Pairs that a guard blocks keep the old skip/candidates behavior and emit
+/// no `renamed?` hint (hedged/questioned/reverted pairs never reach here).
+#[allow(clippy::too_many_arguments)]
+fn apply_rename_text_hint(
+    db: &Db,
+    ids: &HashMap<String, i64>,
+    resolutions: &mut [EntityResolution],
+    old_name: &str,
+    new_name: &str,
+    content: &str,
+    memory_id: i64,
+    hints: &mut Vec<String>,
+    bare_now: bool,
+) -> Result<()> {
+    let norm_old = text::norm_name(old_name);
+    let norm_new = text::norm_name(new_name);
+    if norm_old.is_empty() || norm_old == norm_new {
+        return Ok(());
+    }
+    let Some(old_id) = ids.get(&norm_old).copied() else {
+        return Ok(());
+    };
+    let Some(new_id) = ids.get(&norm_new).copied() else {
+        return Ok(());
+    };
+    if old_id == new_id {
+        return Ok(());
+    }
+    let old_display: String =
+        db.sql()
+            .query_row("SELECT name FROM entities WHERE id=?1", [old_id], |r| {
+                r.get(0)
+            })?;
+    let new_display: String =
+        db.sql()
+            .query_row("SELECT name FROM entities WHERE id=?1", [new_id], |r| {
+                r.get(0)
+            })?;
+    let old_type: String =
+        db.sql()
+            .query_row("SELECT type FROM entities WHERE id=?1", [old_id], |r| {
+                r.get(0)
+            })?;
+    let new_type: String =
+        db.sql()
+            .query_row("SELECT type FROM entities WHERE id=?1", [new_id], |r| {
+                r.get(0)
+            })?;
+    if !old_type.is_empty() && !new_type.is_empty() && old_type != new_type {
+        hints.push(format!(
+            "rename skipped: \"{old_display}\" ({old_type}) and \"{new_display}\" ({new_type}) have different types"
+        ));
+        return Ok(());
+    }
+    // A common-noun phrase or file name never joins two proper names
+    // ("the branch", "the meeting", "README.md" merge nothing). The closed
+    // list is a safety net only; the written-form check below is the guard.
+    if rename_is_generic(&old_display, &norm_old) || rename_is_generic(&new_display, &norm_new) {
+        let which = if rename_is_generic(&old_display, &norm_old) {
+            &old_display
+        } else {
+            &new_display
+        };
+        hints.push(format!(
+            "rename skipped: \"{which}\" is a generic noun or file name, not a proper name"
+        ));
+        return Ok(());
+    }
+    // Written-form guard (main guard): a side written all-lowercase in this
+    // text (not at the sentence start, not hyphen-joined) is a common noun
+    // ("the repo", "is now deprecated"), even off the list. This blocks
+    // "The repo was renamed to Helios" and "is now deprecated" while keeping
+    // "The Zürich Hub project..." (capitalised/uncased) merging.
+    let written_old = name_written_generic(content, old_name);
+    let written_new = name_written_generic(content, new_name);
+    if written_old || written_new {
+        let which = if written_old {
+            &old_display
+        } else {
+            &new_display
+        };
+        hints.push(format!(
+            "rename skipped: \"{which}\" is written as a common noun, not a proper name"
+        ));
+        return Ok(());
+    }
+    // Bare "is now X" is the weakest cue: it merges only when the new name
+    // is capitalised/uncased in the text (a lowercase new name is already
+    // caught above) and is typed the same as the old name. A state word
+    // ("is now Deprecated") arrives untyped and returns candidates.
+    if bare_now {
+        let types_match = !old_type.is_empty()
+            && !new_type.is_empty()
+            && old_type.eq_ignore_ascii_case(&new_type);
+        if !types_match {
+            let positions: Vec<usize> = resolutions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| text::norm_name(&r.name) == norm_new)
+                .map(|(i, _)| i)
+                .collect();
+            for pos in positions {
+                resolutions[pos].candidates = vec![crate::engine::EntityCandidate {
+                    id: old_id,
+                    name: old_display.clone(),
+                    kind: old_type.clone(),
+                    description: String::new(),
+                    score: None,
+                }];
+                resolutions[pos].status = "ambiguous".into();
+            }
+            hints.push(format!(
+                "rename not applied: bare \"is now\" target \"{new_display}\" needs the same type as \"{old_display}\" (got \"{new_type}\" vs \"{old_type}\"); use a strong cue or merge it explicitly with neocortex merge"
+            ));
+            return Ok(());
+        }
+    }
+    // Several entities under the old name: merge nothing, offer candidates.
+    let named: Vec<i64> = {
+        let mut st = db.sql().prepare(
+            "SELECT DISTINCT x FROM (
+                 SELECT entity_id AS x FROM entity_aliases WHERE alias_norm=?1
+                 UNION SELECT id FROM entities WHERE norm=?1)",
+        )?;
+        let rows = st.query_map([&norm_old], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if named.len() > 1 {
+        let positions: Vec<usize> = resolutions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| text::norm_name(&r.name) == norm_old)
+            .map(|(i, _)| i)
+            .collect();
+        for pos in positions {
+            let mut candidates = Vec::new();
+            for id in &named {
+                let (name, kind): (String, String) = db.sql().query_row(
+                    "SELECT name,type FROM entities WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                candidates.push(crate::engine::EntityCandidate {
+                    id: *id,
+                    name,
+                    kind,
+                    description: String::new(),
+                    score: None,
+                });
+            }
+            resolutions[pos].candidates = candidates;
+            resolutions[pos].status = "ambiguous".into();
+        }
+        hints.push(format!(
+            "rename not applied: \"{old_display}\" names {} entities; merge it explicitly with neocortex merge",
+            named.len()
+        ));
+        return Ok(());
+    }
+    // Several entities under the NEW name: the same guard, symmetrically.
+    let named_new: Vec<i64> = {
+        let mut st = db.sql().prepare(
+            "SELECT DISTINCT x FROM (
+                 SELECT entity_id AS x FROM entity_aliases WHERE alias_norm=?1
+                 UNION SELECT id FROM entities WHERE norm=?1)",
+        )?;
+        let rows = st.query_map([&norm_new], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if named_new.len() > 1 {
+        let positions: Vec<usize> = resolutions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| text::norm_name(&r.name) == norm_new)
+            .map(|(i, _)| i)
+            .collect();
+        for pos in positions {
+            let mut candidates = Vec::new();
+            for id in &named_new {
+                let (name, kind): (String, String) = db.sql().query_row(
+                    "SELECT name,type FROM entities WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                candidates.push(crate::engine::EntityCandidate {
+                    id: *id,
+                    name,
+                    kind,
+                    description: String::new(),
+                    score: None,
+                });
+            }
+            resolutions[pos].candidates = candidates;
+            resolutions[pos].status = "ambiguous".into();
+        }
+        hints.push(format!(
+            "rename not applied: \"{new_display}\" names {} entities; merge it explicitly with neocortex merge",
+            named_new.len()
+        ));
+        return Ok(());
+    }
+    // A bare first name never renames: "Maya changed her name to Rio" stays
+    // a conflict when Maya Chen and Maya Patel share the first name (and a
+    // lone bare first name is still not a full-name rename). Full names
+    // sharing a first name ("Kim Lee" -> "Kim Stone") are unaffected.
+    for (norm, typ, display) in [
+        (&norm_old, &old_type, &old_display),
+        (&norm_new, &new_type, &new_display),
+    ] {
+        let mut tokens = norm.split_whitespace();
+        let (Some(first), second) = (tokens.next(), tokens.next()) else {
+            continue;
+        };
+        if second.is_some() {
+            continue;
+        }
+        let shared = shared_first_name_people(db, first, old_id, new_id)?;
+        let is_first_name = typ.eq_ignore_ascii_case("person") || !shared.is_empty();
+        if !is_first_name {
+            continue;
+        }
+        let positions: Vec<usize> = resolutions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| text::norm_name(&r.name) == *norm)
+            .map(|(i, _)| i)
+            .collect();
+        let mut candidates = Vec::new();
+        for (id, name, kind) in &shared {
+            candidates.push(crate::engine::EntityCandidate {
+                id: *id,
+                name: name.clone(),
+                kind: kind.clone(),
+                description: String::new(),
+                score: None,
+            });
+        }
+        if candidates.is_empty() {
+            let id = if norm == &norm_old { old_id } else { new_id };
+            let (name, kind): (String, String) =
+                db.sql()
+                    .query_row("SELECT name,type FROM entities WHERE id=?1", [id], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
+            candidates.push(crate::engine::EntityCandidate {
+                id,
+                name,
+                kind,
+                description: String::new(),
+                score: None,
+            });
+        }
+        for pos in positions {
+            resolutions[pos].candidates = candidates.clone();
+            resolutions[pos].status = "ambiguous".into();
+        }
+        hints.push(format!(
+            "rename not applied: \"{display}\" is a first name naming {} people; use a full name or merge it explicitly with neocortex merge",
+            shared.len()
+        ));
+        return Ok(());
+    }
+    // Two established things with their own live facts: without a date in
+    // the sentence there is no evidence which fact is stale, so the rename
+    // is a candidate, never a silent merge.
+    if entity_has_live_facts(db, old_id, memory_id)?
+        && entity_has_live_facts(db, new_id, memory_id)?
+        && !rename_sentence_has_date(content)
+    {
+        for (norm, other_id, other_display) in [
+            (&norm_old, new_id, &new_display),
+            (&norm_new, old_id, &old_display),
+        ] {
+            let (name, kind): (String, String) = db.sql().query_row(
+                "SELECT name,type FROM entities WHERE id=?1",
+                [other_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let _ = other_display;
+            let positions: Vec<usize> = resolutions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| text::norm_name(&r.name) == *norm)
+                .map(|(i, _)| i)
+                .collect();
+            for pos in positions {
+                resolutions[pos].candidates = vec![crate::engine::EntityCandidate {
+                    id: other_id,
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    description: String::new(),
+                    score: None,
+                }];
+                resolutions[pos].status = "ambiguous".into();
+            }
+        }
+        hints.push(format!(
+            "rename not applied: \"{old_display}\" and \"{new_display}\" each have live facts and the sentence states no date; merge it explicitly with neocortex merge"
+        ));
+        return Ok(());
+    }
+    hints.push(format!(
+        "renamed? \"{old_display}\" e{old_id} -> \"{new_display}\" e{new_id}: text states a rename but nothing was merged; if this is a real rename confirm by passing entities [{{\"name\":\"{new_display}\",\"same_as\":\"e{old_id}\"}}] or relations [{{\"source\":\"{old_display}\",\"predicate\":\"renamed to\",\"target\":\"{new_display}\"}}]",
+    ));
+    Ok(())
+}
+
+/// Write the "formerly called" holder fact for a confirmed (structured)
+/// rename. The holder carries the old display name but no alias/name-token
+/// row, so name lookups keep landing on the survivor while the fact reads
+/// "Lantern formerly called Harbor". Returns the new relation id. The fact
+/// is evidence of `memory_id`, so `forget`/`invalidate` retracts it like
+/// any other relation; a merge itself is never undone by forget.
+#[allow(clippy::too_many_arguments)]
+fn write_formerly_called_fact(
+    db: &Db,
+    new_id: i64,
+    old_display: &str,
+    norm_old: &str,
+    new_type: &str,
+    holder_vector: &[f32],
+    content_vector: &[f32],
+    memory_id: i64,
+    valid_from: i64,
+    now: i64,
+) -> Result<i64> {
+    let holder: i64 = db.sql().query_row(
+        "SELECT COALESCE(MAX(homonym),-1)+1 FROM entities WHERE norm=?1 AND type=?2",
+        params![norm_old, new_type],
+        |r| r.get(0),
+    )?;
+    db.sql().execute(
+        "INSERT INTO entities(name,norm,type,homonym,description,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,'',?5,?5)",
+        params![old_display, norm_old, new_type, holder, now],
+    )?;
+    let holder = db.sql().last_insert_rowid();
+    db.sql().execute(
+        &format!(
+            "INSERT INTO entities_vec(rowid,embedding) VALUES (?1,{})",
+            db.vec_sql("?2")
+        ),
+        params![holder, db.vec_blob(holder_vector)],
+    )?;
+    resolve::refresh_entity_fts(db, holder)?;
+    kg::project_entity_from_db(db, holder)?;
+    db.sql().execute(
+        "INSERT OR IGNORE INTO predicates(canonical,display,exclusive,group_id,symmetric,seeded)
+         VALUES ('formerly called','formerly called',0,0,0,0)",
+        [],
+    )?;
+    let pred_id: i64 = db.sql().query_row(
+        "SELECT id FROM predicates WHERE canonical='formerly called'",
+        [],
+        |r| r.get(0),
+    )?;
+    db.sql()
+        .execute("UPDATE predicates SET group_id=?1 WHERE id=?1", [pred_id])?;
+    db.sql().execute(
+        "INSERT OR IGNORE INTO predicate_aliases(alias_norm,predicate_id) VALUES ('formerly called',?1)",
+        [pred_id],
+    )?;
+    let has_vec: bool = db.sql().query_row(
+        "SELECT EXISTS(SELECT 1 FROM predicates_vec WHERE rowid=?1)",
+        [pred_id],
+        |r| r.get(0),
+    )?;
+    if !has_vec {
+        db.sql().execute(
+            &format!(
+                "INSERT INTO predicates_vec(rowid,embedding) VALUES (?1,{})",
+                db.vec_sql("?2")
+            ),
+            params![pred_id, db.vec_blob(content_vector)],
+        )?;
+    }
+    let new_display: String =
+        db.sql()
+            .query_row("SELECT name FROM entities WHERE id=?1", [new_id], |r| {
+                r.get(0)
+            })?;
+    let fact = format!("{new_display} formerly called {old_display}");
+    db.sql().execute(
+        "INSERT INTO relations(src,dst,predicate_id,predicate_text,subj,fact,weight,evidence_count,valid_from,created_at,polarity)
+         VALUES (?1,?2,?3,'formerly called',?4,?5,1,1,?6,?7,1)",
+        params![new_id, holder, pred_id, new_id, fact, valid_from, now],
+    )?;
+    let rid = db.sql().last_insert_rowid();
+    db.sql().execute(
+        "INSERT INTO relation_evidence(relation_id,memory_id) VALUES(?1,?2)",
+        params![rid, memory_id],
+    )?;
+    db.sql().execute(
+        "INSERT INTO relations_fts(rowid,fact,predicate) VALUES (?1,?2,'formerly called')",
+        params![rid, fact],
+    )?;
+    db.sql().execute(
+        &format!(
+            "INSERT INTO relations_vec(rowid,embedding) VALUES (?1,{})",
+            db.vec_sql("?2")
+        ),
+        params![rid, db.vec_blob(content_vector)],
+    )?;
+    kg::project_relation(db, rid, new_id, holder, "formerly called")?;
+    Ok(rid)
+}
+
+/// Structured (caller-asserted) rename: merge old into new. Only the guards
+/// about WHICH entity remain — different types skip, an ambiguous norm
+/// reports candidates. Name-shaped guards (word lists, written case, bare
+/// `now`, bare first name, both-live undated) do not apply: the caller has
+/// already judged this is a name. When the merge ends exclusive
+/// competitors they are reported in `invalidated` and in the hint.
+#[allow(clippy::too_many_arguments)]
+fn apply_rename_merge(
+    db: &Db,
+    ids: &mut HashMap<String, i64>,
+    resolutions: &mut [EntityResolution],
+    old_name: &str,
+    new_name: &str,
+    old_vector: &[f32],
+    content_vector: &[f32],
+    memory_id: i64,
+    valid_from: i64,
+    now: i64,
+    hints: &mut Vec<String>,
+    invalidated: &mut Vec<i64>,
+) -> Result<()> {
+    let norm_old = text::norm_name(old_name);
+    let norm_new = text::norm_name(new_name);
+    if norm_old.is_empty() || norm_old == norm_new {
+        return Ok(());
+    }
+    let Some(old_id) = ids.get(&norm_old).copied() else {
+        return Ok(());
+    };
+    let Some(new_id) = ids.get(&norm_new).copied() else {
+        return Ok(());
+    };
+    if old_id == new_id {
+        return Ok(());
+    }
+    let old_display: String =
+        db.sql()
+            .query_row("SELECT name FROM entities WHERE id=?1", [old_id], |r| {
+                r.get(0)
+            })?;
+    let new_display: String =
+        db.sql()
+            .query_row("SELECT name FROM entities WHERE id=?1", [new_id], |r| {
+                r.get(0)
+            })?;
+    let old_type: String =
+        db.sql()
+            .query_row("SELECT type FROM entities WHERE id=?1", [old_id], |r| {
+                r.get(0)
+            })?;
+    let new_type: String =
+        db.sql()
+            .query_row("SELECT type FROM entities WHERE id=?1", [new_id], |r| {
+                r.get(0)
+            })?;
+    if !old_type.is_empty() && !new_type.is_empty() && old_type != new_type {
+        hints.push(format!(
+            "rename skipped: \"{old_display}\" ({old_type}) and \"{new_display}\" ({new_type}) have different types"
+        ));
+        return Ok(());
+    }
+    for (norm, display) in [(&norm_old, &old_display), (&norm_new, &new_display)] {
+        let named: Vec<i64> = {
+            let mut st = db.sql().prepare(
+                "SELECT DISTINCT x FROM (
+                     SELECT entity_id AS x FROM entity_aliases WHERE alias_norm=?1
+                     UNION SELECT id FROM entities WHERE norm=?1)",
+            )?;
+            let rows = st.query_map([norm], |r| r.get::<_, i64>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if named.len() > 1 {
+            let positions: Vec<usize> = resolutions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| text::norm_name(&r.name) == *norm)
+                .map(|(i, _)| i)
+                .collect();
+            for pos in positions {
+                let mut candidates = Vec::new();
+                for id in &named {
+                    let (name, kind): (String, String) = db.sql().query_row(
+                        "SELECT name,type FROM entities WHERE id=?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    candidates.push(crate::engine::EntityCandidate {
+                        id: *id,
+                        name,
+                        kind,
+                        description: String::new(),
+                        score: None,
+                    });
+                }
+                resolutions[pos].candidates = candidates;
+                resolutions[pos].status = "ambiguous".into();
+            }
+            hints.push(format!(
+                "rename not applied: \"{display}\" names {} entities; merge it explicitly with neocortex merge",
+                named.len()
+            ));
+            return Ok(());
+        }
+    }
+    let done = crate::engine::merge_entities_in(db, new_id, old_id, now)?;
+    let mut ended_note = String::new();
+    if !done.invalidated.is_empty() {
+        let ids: Vec<String> = done.invalidated.iter().map(|r| format!("r{r}")).collect();
+        ended_note = format!("; ended {}", ids.join(", "));
+    }
+    invalidated.extend(done.invalidated);
+    for id in ids.values_mut() {
+        if *id == old_id {
+            *id = new_id;
+        }
+    }
+    for r in resolutions.iter_mut() {
+        if r.id == old_id {
+            r.id = new_id;
+        }
+    }
+    let rid = write_formerly_called_fact(
+        db,
+        new_id,
+        &old_display,
+        &norm_old,
+        &new_type,
+        old_vector,
+        content_vector,
+        memory_id,
+        valid_from,
+        now,
+    )?;
+    hints.push(format!(
+        "renamed: {old_display} -> {new_display}; kept \"{old_display}\" as an alias, formerly-called fact r{rid}{ended_note}"
+    ));
+    Ok(())
+}
+
+/// Is `target` (`same_as` value: a name, alias or `e<id>`) a different live
+/// entity from `resolved_id` the mention already landed on? Used to skip
+/// self-pairs. Alias rows count; the entity row is the merge endpoint.
+fn same_as_target_id(db: &Db, target: &str) -> Result<Option<i64>> {
+    if let Some(id) = crate::engine::parse_id(target, 'e') {
+        let exists: bool = db.sql().query_row(
+            "SELECT EXISTS(SELECT 1 FROM entities WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        return Ok(exists.then_some(id));
+    }
+    let norm = text::norm_name(target);
+    if norm.is_empty() {
+        return Ok(None);
+    }
+    Ok(db
+        .sql()
+        .query_row(
+            "SELECT entity_id FROM entity_aliases WHERE alias_norm=?1 ORDER BY entity_id LIMIT 1",
+            [norm],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Structured `same_as` rename: `{name:new, same_as:old}` merges old into new
+/// when both names already have their own entity row (the hint-confirm case:
+/// the text write created both). A fresh new name keeps the plain-alias
+/// semantics (old survives, no formerly fact). Returns true when a merge ran.
+#[allow(clippy::too_many_arguments)]
+fn apply_same_as_merge(
+    db: &Db,
+    ids: &mut HashMap<String, i64>,
+    resolutions: &mut [EntityResolution],
+    entity: &EntityIn,
+    old_vector: &[f32],
+    content_vector: &[f32],
+    memory_id: i64,
+    valid_from: i64,
+    now: i64,
+    hints: &mut Vec<String>,
+    invalidated: &mut Vec<i64>,
+) -> Result<bool> {
+    let Some(target) = entity.same_as.as_deref() else {
+        return Ok(false);
+    };
+    let norm_new = text::norm_name(&entity.name);
+    if norm_new.is_empty() {
+        return Ok(false);
+    }
+    let Some(old_id) = same_as_target_id(db, target)? else {
+        return Ok(false);
+    };
+    let Some(resolved_new) = ids.get(&norm_new).copied() else {
+        return Ok(false);
+    };
+    // The mention resolved via same_as to the old entity. The new name's own
+    // row, if it already exists, is the orphan that must survive.
+    let orphans: Vec<i64> = {
+        let mut st = db
+            .sql()
+            .prepare("SELECT id FROM entities WHERE norm=?1 AND id<>?2")?;
+        let rows = st.query_map(params![norm_new, old_id], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    if orphans.len() != 1 {
+        if orphans.len() > 1 {
+            hints.push(format!(
+                "rename not applied: \"{}\" names {} entities; merge it explicitly with neocortex merge",
+                entity.name,
+                orphans.len()
+            ));
+        }
+        return Ok(false);
+    }
+    let new_id = orphans[0];
+    if resolved_new != old_id {
+        // Already separate rows without aliasing (defensive): normal merge.
+        let old_display: String =
+            db.sql()
+                .query_row("SELECT name FROM entities WHERE id=?1", [old_id], |r| {
+                    r.get(0)
+                })?;
+        let new_display: String =
+            db.sql()
+                .query_row("SELECT name FROM entities WHERE id=?1", [new_id], |r| {
+                    r.get(0)
+                })?;
+        let old_type: String =
+            db.sql()
+                .query_row("SELECT type FROM entities WHERE id=?1", [old_id], |r| {
+                    r.get(0)
+                })?;
+        let new_type: String =
+            db.sql()
+                .query_row("SELECT type FROM entities WHERE id=?1", [new_id], |r| {
+                    r.get(0)
+                })?;
+        if !old_type.is_empty() && !new_type.is_empty() && old_type != new_type {
+            hints.push(format!(
+                "rename skipped: \"{old_display}\" ({old_type}) and \"{new_display}\" ({new_type}) have different types"
+            ));
+            return Ok(false);
+        }
+        let done = crate::engine::merge_entities_in(db, new_id, old_id, now)?;
+        let mut ended_note = String::new();
+        if !done.invalidated.is_empty() {
+            let ended: Vec<String> = done.invalidated.iter().map(|r| format!("r{r}")).collect();
+            ended_note = format!("; ended {}", ended.join(", "));
+        }
+        invalidated.extend(done.invalidated);
+        for id in ids.values_mut() {
+            if *id == old_id {
+                *id = new_id;
+            }
+        }
+        for r in resolutions.iter_mut() {
+            if r.id == old_id {
+                r.id = new_id;
+            }
+        }
+        let norm_old = text::norm_name(&old_display);
+        let rid = write_formerly_called_fact(
+            db,
+            new_id,
+            &old_display,
+            &norm_old,
+            &new_type,
+            old_vector,
+            content_vector,
+            memory_id,
+            valid_from,
+            now,
+        )?;
+        hints.push(format!(
+            "renamed: {old_display} -> {new_display}; kept \"{old_display}\" as an alias, formerly-called fact r{rid}{ended_note}"
+        ));
+        return Ok(true);
+    }
+    // The alias case (the usual hint-confirm): the write aliased the new name
+    // to the old id; move that id into the orphan new row so the display is
+    // the new name.
+    let old_display: String =
+        db.sql()
+            .query_row("SELECT name FROM entities WHERE id=?1", [old_id], |r| {
+                r.get(0)
+            })?;
+    let new_display: String =
+        db.sql()
+            .query_row("SELECT name FROM entities WHERE id=?1", [new_id], |r| {
+                r.get(0)
+            })?;
+    let old_type: String =
+        db.sql()
+            .query_row("SELECT type FROM entities WHERE id=?1", [old_id], |r| {
+                r.get(0)
+            })?;
+    let new_type: String =
+        db.sql()
+            .query_row("SELECT type FROM entities WHERE id=?1", [new_id], |r| {
+                r.get(0)
+            })?;
+    if !old_type.is_empty() && !new_type.is_empty() && old_type != new_type {
+        hints.push(format!(
+            "rename skipped: \"{old_display}\" ({old_type}) and \"{new_display}\" ({new_type}) have different types"
+        ));
+        return Ok(false);
+    }
+    let done = crate::engine::merge_entities_in(db, new_id, old_id, now)?;
+    let mut ended_note = String::new();
+    if !done.invalidated.is_empty() {
+        let ended: Vec<String> = done.invalidated.iter().map(|r| format!("r{r}")).collect();
+        ended_note = format!("; ended {}", ended.join(", "));
+    }
+    invalidated.extend(done.invalidated);
+    for id in ids.values_mut() {
+        if *id == old_id {
+            *id = new_id;
+        }
+    }
+    for r in resolutions.iter_mut() {
+        if r.id == old_id {
+            r.id = new_id;
+        }
+    }
+    let norm_old = text::norm_name(&old_display);
+    let rid = write_formerly_called_fact(
+        db,
+        new_id,
+        &old_display,
+        &norm_old,
+        &new_type,
+        old_vector,
+        content_vector,
+        memory_id,
+        valid_from,
+        now,
+    )?;
+    hints.push(format!(
+        "renamed: {old_display} -> {new_display}; kept \"{old_display}\" as an alias, formerly-called fact r{rid}{ended_note}"
+    ));
+    Ok(true)
+}
+
+/// Conservative negation cue for one relation: the clause must name the
 /// relation's own source, `text` must name the target within 3 tokens after
 /// the predicate verb, and a cue may only be separated from that verb by an
 /// auxiliary/adverb. Retraction phrasings are matched separately and only for
@@ -2829,6 +4268,90 @@ fn write_prepared(
         });
         crate::wtiming::end(crate::wtiming::RELATIONS);
     }
+    // Rename (H3-10, fix-round-4 contract). Text NEVER merges: a passing
+    // text pair becomes a `renamed?` hint storing nothing. Structured pairs
+    // the caller passed explicitly — a `renamed to` / `renamed from` relation,
+    // or `same_as` naming the other entity — merge old into new via
+    // merge_entities_in plus the formerly-called holder fact. Other call-shaped
+    // spellings ("formerly called", "now called", ...) are plain relations.
+    // Structured merges run first so a confirmed pair emits no text hint.
+    let mut rename_hints: Vec<String> = Vec::new();
+    if duplicate_of.is_none() {
+        let mut claimed: HashSet<(String, String)> = HashSet::new();
+        for (old_name, new_name, _) in rename_pairs_structured(&relations) {
+            let key = (text::norm_name(&old_name), text::norm_name(&new_name));
+            if key.0.is_empty() || key.0 == key.1 {
+                continue;
+            }
+            if claimed.contains(&key) || claimed.contains(&(key.1.clone(), key.0.clone())) {
+                continue;
+            }
+            claimed.insert(key.clone());
+            let norm_old = text::norm_name(&old_name);
+            let seen_entity = entities
+                .iter()
+                .any(|e| text::norm_name(&e.name) == norm_old)
+                || extra_index.contains_key(&norm_old);
+            let old_vector = if seen_entity {
+                endpoint_vector(&old_name).to_vec()
+            } else {
+                vectors[0].clone()
+            };
+            let content_vector = vectors[0].clone();
+            apply_rename_merge(
+                db,
+                &mut ids,
+                &mut resolutions,
+                &old_name,
+                &new_name,
+                &old_vector,
+                &content_vector,
+                id,
+                valid_from,
+                now,
+                &mut rename_hints,
+                &mut invalidated,
+            )?;
+        }
+        for entity in entities.iter().filter(|e| e.same_as.is_some()) {
+            let norm_new = text::norm_name(&entity.name);
+            if norm_new.is_empty() {
+                continue;
+            }
+            let old_vector = endpoint_vector(&entity.name).to_vec();
+            let content_vector = vectors[0].clone();
+            apply_same_as_merge(
+                db,
+                &mut ids,
+                &mut resolutions,
+                entity,
+                &old_vector,
+                &content_vector,
+                id,
+                valid_from,
+                now,
+                &mut rename_hints,
+                &mut invalidated,
+            )?;
+        }
+        for (old_name, new_name, bare_now) in rename_pairs_text(&content, &entities, &relations) {
+            let key = (text::norm_name(&old_name), text::norm_name(&new_name));
+            if claimed.contains(&key) || claimed.contains(&(key.1.clone(), key.0.clone())) {
+                continue;
+            }
+            apply_rename_text_hint(
+                db,
+                &ids,
+                &mut resolutions,
+                &old_name,
+                &new_name,
+                &content,
+                id,
+                &mut rename_hints,
+                bare_now,
+            )?;
+        }
+    }
     // Text can still retract a different fact ("Alice no longer leads the
     // team") when the agent supplied relations of its own: end the one live
     // relation the sentence names, or report candidates when the pair is
@@ -2878,6 +4401,7 @@ fn write_prepared(
         Vec::new()
     };
     hints.extend(nickname_hints);
+    hints.extend(rename_hints);
     if !conflicts.is_empty() {
         let c = &conflicts[0];
         hints.push(format!("r{} ({}) is also current; if the new fact replaces it call invalidate r{}, or re-send with exclusive=true", c.relation_id, c.fact, c.relation_id));

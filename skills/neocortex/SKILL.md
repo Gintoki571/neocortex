@@ -109,6 +109,26 @@ Store something when it will still matter next week:
   is reported in `hints` and is not added. Any relation whose two ends
   resolve to the same entity is dropped, and the reply names it in `hints`
   (`dropped self-relation: Robert Okafor nickname Bob (kept "Bob" as an alias)`).
+- **Renames need your confirmation; prose never merges**: a statement like "Harbor was renamed
+  to Lantern" in text only returns a `renamed?` hint naming both entities and the exact call —
+  nothing is merged. On a `renamed?` hint, if it is a real rename, confirm in a new `remember`
+  by passing `same_as` on the new name (`entities:[{"name":"Lantern","same_as":"e<old>"}]`)
+  or a relation `{"source":"Harbor","predicate":"renamed to","target":"Lantern"}`.
+  A caller-asserted rename merges only with predicate `renamed to` (old->new) or
+  `renamed from` (new->old), or `same_as`; call-shaped spellings (`formerly called`,
+  `previously called`, `now called`, `now known as`, `renamed`, ...) are plain relations
+  and never merge ("Ana previously called Bo" is a phone call). Different-type or
+  ambiguous-name structured renames are reported, not merged. After confirmation the old
+  name stays as an alias of the surviving (new) name, old facts move to it,
+  and a "Lantern formerly called Harbor" fact answers "what was Lantern called before".
+  Hedged ("might rename", "plan to rename", "planned for Q3"), negated
+  ("did not rename"), questioned ("Was X renamed?"), reverted ("then back
+  to Harbor"), passive ("called by the team"), lowercase-generic ("the repo",
+  "is now deprecated"), bare-first-name or
+  undated both-facts sentences emit no hint, so write them as a plan instead and
+  merge by hand when it happens. "X is now Y", "Y (now Z)" and "Y (renamed
+  from X)" also only hint; a bare "is now Y" hints only when Y is capitalised in
+  the text and typed like X.
 - **Text-only retraction**: a sentence with no relation ("Ivan left Acme; he no
   longer works there") ends the one live fact it names, at `valid_from`, and
   reports it as `invalidated`. It also runs on a write that supplies its own
