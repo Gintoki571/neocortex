@@ -464,7 +464,372 @@ fn is_name_predicate(predicate: &str) -> bool {
     )
 }
 
-/// Conservative negation cue for one relation: the clause must name the
+/// H3-08: a nickname stated only in memory text ("Elizabeth Ward, who goes
+/// by Liz, ...", "Dmitri (Dima) ...", "Robert, known as Bobby, ...", "Jorge
+/// Fuentes, called Jo by the team, ...") becomes an alias of the person it
+/// names, but only when the pattern is unambiguous: the full name is a
+/// supplied or stored person entity in the same sentence, the nickname is not
+/// already another entity's name or alias (that collision is reported, not
+/// added), and never for a place/org or any other non-person type. Patterns:
+/// a cue phrase (`goes by`, `known as`, `called`, `nicknamed`, `aka`) whose
+/// prefix names exactly one person entity, or a parenthetical right after the
+/// full name (`Dmitri Volkov (Dima)`). Mutates `entities` (supplied or
+/// heuristic) and appends stored-only additions to `adds`; collisions and
+/// ambiguity go to `hints`.
+fn apply_text_nicknames(
+    db: &Db,
+    content: &str,
+    entities: &mut Vec<EntityIn>,
+    heuristic: bool,
+    hints: &mut Vec<String>,
+    adds: &mut Vec<(String, String)>,
+) -> Result<()> {
+    // (prefix folded tokens, nickname surface, parenthetical?)
+    let mut pairs: Vec<(Vec<String>, String, bool)> = Vec::new();
+    let sentences: Vec<&str> = content
+        .split(['.', '!', '?', ';', '\n'])
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    const NICK_STOP: &[&str] = &[
+        "the", "a", "an", "he", "she", "it", "they", "we", "you", "his", "her", "its", "their",
+        "my", "our", "by", "as", "at", "on", "in", "of", "to", "is", "was", "are", "be", "been",
+        "being", "for",
+    ];
+    let is_nick = |word: &str, raw: &str| {
+        let word = word.trim();
+        word.len() >= 2
+            && !NICK_STOP.contains(&word)
+            && raw.chars().next().is_some_and(|c| c.is_uppercase())
+            && raw.chars().any(|c| c.is_lowercase())
+    };
+    let raw_words = |sentence: &str| -> Vec<String> {
+        sentence
+            .split_whitespace()
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-')
+                    .to_string()
+            })
+            .filter(|w| !w.is_empty())
+            .collect()
+    };
+    for sentence in &sentences {
+        let folded: Vec<String> = text::fold(sentence)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        if folded.len() < 3 {
+            continue;
+        }
+        let raws = raw_words(sentence);
+        let aligned = raws.len() == folded.len();
+        // Cue phrases, longest first.
+        const CUES: &[&[&str]] = &[
+            &["who", "goes", "by"],
+            &["also", "known", "as"],
+            &["goes", "by"],
+            &["known", "as"],
+            &["nicknamed"],
+            &["called"],
+            &["aka"],
+        ];
+        for (i, _) in folded.iter().enumerate() {
+            for cue in CUES {
+                if folded.len() < i + cue.len() || &folded[i..i + cue.len()] != *cue {
+                    continue;
+                }
+                let nick_i = i + cue.len();
+                let Some(nick_folded) = folded.get(nick_i) else {
+                    continue;
+                };
+                let nick_raw = if aligned {
+                    raws[nick_i].clone()
+                } else {
+                    nick_folded.clone()
+                };
+                if is_nick(nick_folded, &nick_raw) {
+                    pairs.push((folded[..i].to_vec(), nick_raw, false));
+                }
+                break;
+            }
+        }
+    }
+    // Parenthetical nicknames: "Dmitri Volkov (Dima)".
+    {
+        let bytes = content.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'(' {
+                i += 1;
+                continue;
+            }
+            let Some(close) = content[i..].find(')') else {
+                break;
+            };
+            let close = i + close;
+            let inside = content[i + 1..close].trim();
+            let inside_folded: Vec<String> = text::fold(inside)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            if inside_folded.len() == 1 && inside_folded[0].len() >= 2 {
+                let inside_raw: String = inside
+                    .trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-')
+                    .to_string();
+                if is_nick(&inside_folded[0], &inside_raw) {
+                    let sentence_start = content[..i]
+                        .rfind(['.', '!', '?', ';', '\n'])
+                        .map(|p| p + content[p..].chars().next().map(char::len_utf8).unwrap_or(1))
+                        .unwrap_or(0);
+                    let prefix: Vec<String> = text::fold(&content[sentence_start..i])
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect();
+                    pairs.push((prefix, inside_raw, true));
+                }
+            }
+            i = close + 1;
+        }
+    }
+    // Nickname owners: (id, name) for stored entities with this alias norm,
+    // plus entities whose name carries this single token ("Liz" already names
+    // "Liz Zhang": the token alone navigates to her, so landing it on a
+    // second person would hijack the lookup).
+    let owners = |db: &Db, nick_norm: &str| -> Result<Vec<(i64, String)>> {
+        let mut out: Vec<(i64, String)> = {
+            let mut st = db.sql().prepare(
+                "SELECT DISTINCT e.id, e.name FROM entity_aliases a
+                 JOIN entities e ON e.id=a.entity_id WHERE a.alias_norm=?1",
+            )?;
+            let rows = st.query_map([nick_norm], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut st = db.sql().prepare(
+            "SELECT DISTINCT e.id, e.name FROM name_tokens t
+             JOIN entities e ON e.id=t.entity_id WHERE t.token=?1",
+        )?;
+        let rows = st.query_map([nick_norm], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let row = row?;
+            if !out.contains(&row) {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    };
+    for (prefix, nick, paren) in &pairs {
+        let nick_norm = text::norm_name(nick);
+        if nick_norm.is_empty() {
+            continue;
+        }
+        // Distinct supplied/heuristic full names matching the prefix. The
+        // prefix is folded text; entity norms singularise ("Fuentes" ->
+        // "fuente"), so each candidate is re-normed as a whole span.
+        let mut matched: Vec<String> = Vec::new();
+        for item in entities.iter() {
+            let norm = text::norm_name(&item.name);
+            let want = norm.split_whitespace().count();
+            let hit = !norm.is_empty()
+                && want > 0
+                && prefix.len() >= want
+                && (0..=prefix.len() - want).any(|start| {
+                    if *paren && start + want != prefix.len() {
+                        return false;
+                    }
+                    text::norm_name(&prefix[start..start + want].join(" ")) == norm
+                });
+            if hit && !matched.contains(&norm) {
+                matched.push(norm);
+            }
+        }
+        // Parenthetical: the longest full name wins when one is a suffix of
+        // another ("Dmitri Volkov" over a bare "Dmitri" span); a tie only
+        // occurs for the same norm, so no ambiguity branch is needed there.
+        if *paren && matched.len() > 1 {
+            matched.sort_by_key(|n| std::cmp::Reverse(n.split_whitespace().count()));
+            let longest = matched[0].split_whitespace().count();
+            matched.retain(|n| n.split_whitespace().count() == longest);
+        }
+        if matched.len() == 1 {
+            let full_norm = matched[0].clone();
+            if nick_norm == full_norm {
+                continue;
+            }
+            let target = entities
+                .iter()
+                .position(|item| text::norm_name(&item.name) == full_norm)
+                .expect("matched norm came from entities");
+            if !nickname_person_ok(db, &entities[target])? {
+                continue;
+            }
+            if entities[target]
+                .aliases
+                .iter()
+                .any(|a| text::norm_name(a) == nick_norm)
+            {
+                continue;
+            }
+            // A nickname naming another supplied entity is a collision: the
+            // exact name, or one token of its name ("Liz" vs "Liz Zhang").
+            if !heuristic {
+                if let Some(holder) = entities.iter().enumerate().find(|(idx, item)| {
+                    let norm = text::norm_name(&item.name);
+                    *idx != target
+                        && (norm == nick_norm || norm.split_whitespace().any(|t| t == nick_norm))
+                }) {
+                    hints.push(format!(
+                        "nickname \"{}\" already names {}; not added as alias of {}",
+                        nick, holder.1.name, entities[target].name
+                    ));
+                    continue;
+                }
+            }
+            let held = owners(db, &nick_norm)?;
+            if held
+                .iter()
+                .any(|(_, name)| text::norm_name(name) == full_norm)
+            {
+                continue;
+            }
+            if let Some((_, holder)) = held.first() {
+                hints.push(format!(
+                    "nickname \"{}\" already names {}; not added as alias of {}",
+                    nick, holder, entities[target].name
+                ));
+                continue;
+            }
+            entities[target].aliases.push(nick.clone());
+            if heuristic {
+                // The nickname was also extracted as its own span; drop it so
+                // `entity <nick>` finds the person card, not a duplicate.
+                entities.retain(|item| {
+                    text::norm_name(&item.name) == full_norm
+                        || text::norm_name(&item.name) != nick_norm
+                });
+            }
+        } else if matched.len() > 1 {
+            hints.push(format!(
+                "nickname \"{}\" is ambiguous in this sentence; not added as an alias",
+                nick
+            ));
+        } else {
+            // Stored-only full name: the longest person-entity name appearing
+            // in the prefix (a suffix for a parenthetical, any position for a
+            // cue phrase).
+            let mut found: Vec<(usize, i64, String)> = Vec::new();
+            for n in 1..=3usize {
+                if prefix.len() < n {
+                    continue;
+                }
+                for start in 0..=prefix.len() - n {
+                    if *paren && start + n != prefix.len() {
+                        continue;
+                    }
+                    let ngram = text::norm_name(&prefix[start..start + n].join(" "));
+                    if ngram.is_empty() || nick_norm == ngram {
+                        continue;
+                    }
+                    let mut st = db
+                        .sql()
+                        .prepare("SELECT id,name,type FROM entities WHERE norm=?1")?;
+                    let rows = st.query_map([&ngram], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?;
+                    for row in rows {
+                        let row = row?;
+                        if !resolve::PERSON_TYPES.contains(&row.2.as_str()) {
+                            continue;
+                        }
+                        if !found.iter().any(|(_, id, _)| *id == row.0) {
+                            found.push((n, row.0, row.1.clone()));
+                        }
+                    }
+                }
+            }
+            let Some(longest) = found.iter().map(|(n, _, _)| *n).max() else {
+                continue;
+            };
+            let longest_ids: Vec<_> = found
+                .iter()
+                .filter(|(n, _, _)| *n == longest)
+                .map(|(_, id, _)| *id)
+                .collect();
+            if longest_ids.len() > 1 {
+                hints.push(format!(
+                    "nickname \"{}\" is ambiguous in this sentence; not added as an alias",
+                    nick
+                ));
+                continue;
+            }
+            let stored_id = longest_ids[0];
+            let stored_name = found
+                .iter()
+                .find(|(_, id, _)| *id == stored_id)
+                .map(|(_, _, name)| name.clone())
+                .expect("longest id came from found");
+            if adds
+                .iter()
+                .any(|(full, old)| full == &stored_name && old == nick)
+            {
+                continue;
+            }
+            let held = owners(db, &nick_norm)?;
+            if held.iter().any(|(id, _)| *id == stored_id) {
+                continue;
+            }
+            if let Some((_, holder)) = held.first() {
+                hints.push(format!(
+                    "nickname \"{}\" already names {}; not added as alias of {}",
+                    nick, holder, stored_name
+                ));
+                continue;
+            }
+            adds.push((stored_name, nick.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Is `item` a person entity for a text nickname (H3-08)? An explicit kind
+/// decides; an untyped item follows its stored type, or - when nothing is
+/// stored yet - the title-case first-and-last-name shape that keeps single-word
+/// places ("Paris") and trade names ("Novak Labs" needs its stored kind or an
+/// all-caps nickname guard) out.
+fn nickname_person_ok(db: &Db, item: &EntityIn) -> Result<bool> {
+    let kind = item.kind.as_deref().unwrap_or("").trim().to_lowercase();
+    if !kind.is_empty() {
+        return Ok(resolve::PERSON_TYPES.contains(&kind.as_str()));
+    }
+    let norm = text::norm_name(&item.name);
+    if norm.is_empty() {
+        return Ok(false);
+    }
+    let mut st = db
+        .sql()
+        .prepare("SELECT type FROM entities WHERE norm=?1")?;
+    let rows = st.query_map([&norm], |r| r.get::<_, String>(0))?;
+    let types: Vec<String> = rows.collect::<rusqlite::Result<_>>()?;
+    if !types.is_empty() {
+        return Ok(types
+            .iter()
+            .all(|t| !t.is_empty() && resolve::PERSON_TYPES.contains(&t.as_str())));
+    }
+    let parts: Vec<&str> = item.name.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Ok(false);
+    }
+    Ok(parts.iter().all(|w| {
+        let mut chars = w.chars();
+        chars.next().is_some_and(|c| c.is_uppercase()) && w.chars().any(|c| c.is_lowercase())
+    }))
+}
 /// relation's own source, `text` must name the target within 3 tokens after
 /// the predicate verb, and a cue may only be separated from that verb by an
 /// auxiliary/adverb. Retraction phrasings are matched separately and only for
@@ -1365,6 +1730,10 @@ struct Prepared {
     extra_index: HashMap<String, usize>,
     hash: String,
     supersedes: Vec<i64>,
+    nickname_hints: Vec<String>,
+    /// H3-08: stored-person aliases a text nickname names but the write did
+    /// not supply (`full name, nickname`); applied after resolution.
+    nickname_adds: Vec<(String, String)>,
     /// content, entity cards, fact sentences, relation endpoints not in
     /// entities, one phrase per distinct predicate
     texts: Vec<String>,
@@ -1624,6 +1993,7 @@ fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Resul
     tags.dedup();
     let tags = tags.join(" ");
     let mut entities = inp.entities.clone();
+    let heuristic = entities.is_empty();
     if entities.is_empty() {
         let known = |name: &str| resolve::alias_known(db, name).unwrap_or(false);
         entities = extract::heuristic_entities_with(&content, &known)
@@ -1637,6 +2007,21 @@ fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Resul
                 distinct_from: Vec::new(),
             })
             .collect();
+    }
+    // H3-08: a nickname stated only in the text ("Elizabeth Ward, who goes
+    // by Liz, ...", "Dmitri (Dima) ...", "Robert, known as Bobby, ...") is an
+    // alias of the person it names, when the pattern is unambiguous.
+    let mut nickname_hints: Vec<String> = Vec::new();
+    let mut nickname_adds: Vec<(String, String)> = Vec::new();
+    if !entities.is_empty() {
+        apply_text_nicknames(
+            db,
+            &content,
+            &mut entities,
+            heuristic,
+            &mut nickname_hints,
+            &mut nickname_adds,
+        )?;
     }
     // E4b: conservative text cue ("A because B") when the agent supplied no
     // facts. Both clause sides must name exactly one known entity.
@@ -1740,6 +2125,8 @@ fn prepare(db: &Db, cfg: &Config, clock: Clock, mut inp: RememberInput) -> Resul
         facts,
         extra_index,
         supersedes,
+        nickname_hints,
+        nickname_adds,
         texts,
         vectors: Vec::new(),
         fact_base,
@@ -1800,6 +2187,8 @@ fn write_prepared(
         extra_index,
         hash,
         supersedes,
+        nickname_hints,
+        nickname_adds,
         texts: _,
         vectors,
         fact_base,
@@ -1928,6 +2317,22 @@ fn write_prepared(
             similar: resolved.similar,
             candidates: resolved.candidates,
         });
+    }
+    // H3-08: stored-only text nicknames (the full name was not supplied in
+    // this write): add them to the person entity the text named.
+    for (full, nick) in &nickname_adds {
+        let norm = text::norm_name(full);
+        let stored: Option<i64> = db
+            .sql()
+            .query_row(
+                "SELECT id FROM entities WHERE norm=?1 AND type='person' ORDER BY id LIMIT 1",
+                [&norm],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(stored) = stored {
+            resolve::add_alias(db, stored, nick, "agent")?;
+        }
     }
     // Gazetteer: link known aliases that appear as whole-word n-grams in
     // the content (never agent-supplied entities, which are already in).
@@ -2472,6 +2877,7 @@ fn write_prepared(
     } else {
         Vec::new()
     };
+    hints.extend(nickname_hints);
     if !conflicts.is_empty() {
         let c = &conflicts[0];
         hints.push(format!("r{} ({}) is also current; if the new fact replaces it call invalidate r{}, or re-send with exclusive=true", c.relation_id, c.fact, c.relation_id));
