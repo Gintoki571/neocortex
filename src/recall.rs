@@ -1383,6 +1383,10 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     let k = input.k.unwrap_or(8).clamp(1, 50);
     let budget = input.budget.unwrap_or(1200).min(20_000);
     let negated = paths::negation_intent(&input.query);
+    // H2-03: a verb-phrase negation that asks for the excluded or ended value.
+    // The exclusion channel keeps H2-02 byte-identical, so the frame only
+    // applies when no typed exclusion was resolved.
+    let negated_value = paths::negated_value_frame(&input.query);
     // H2-02: "which service is not in Rust" names a type and a property; the
     // answer is the item that lacks it, not a memory containing a negation.
     let exclusion = if negated {
@@ -1390,6 +1394,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     } else {
         paths::exclusion_entities(&engine.db, &input.query, now)?
     };
+    let negated_value = negated_value && exclusion.is_none();
     let causal_query = paths::causal_intent(&input.query);
     let status_query = engine.cfg.status_rank && paths::status_intent(&input.query);
     let query_text = input
@@ -2067,10 +2072,20 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         candidates.push((f.id, score, f.ranks));
     }
     candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    // H2-03: when a verb-phrase negation asks for the excluded or ended value
+    // and such a fact exists, the ended/current memories are the answer even
+    // though they carry no negation cue. The check reuses the ended-fact
+    // paths below; when it finds nothing the filter is unchanged.
+    let negated_value_early = if negated_value {
+        negated_value_facts(engine, &query_vec, &query_alias_entities, cutoff)?
+    } else {
+        Vec::new()
+    };
+    let has_negated_value = !negated_value_early.is_empty();
     // A question about what is *not* the case must not be answered with the
     // positive facts: keep only memories that state a negative themselves,
     // in their wording or as evidence of a negative relation.
-    if negated {
+    if negated && !has_negated_value {
         let mut st = engine.db.sql().prepare_cached(
             "SELECT 1 FROM relation_evidence e JOIN relations r ON r.id = e.relation_id
              WHERE e.memory_id = ?1 AND r.polarity = 0 LIMIT 1",
@@ -2092,14 +2107,15 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // stored" (>= 0.185 on the holdout) from "not stored" (<= 0.180 on
     // off-domain probes), so the threshold sits between them.
     let best_vector = vec_ranked.first().map(|(_, cosine)| *cosine).unwrap_or(0.0);
-    let supported = !bm25.is_empty()
+    let mut supported = !bm25.is_empty()
         || !ent_seeds.is_empty()
         || relation_support
         || !path_ids.is_empty()
         || !causal_ids.is_empty()
         || window.is_some()
         || best_vector >= ABSTAIN_COSINE;
-    if !supported || candidates.is_empty() {
+    supported |= has_negated_value;
+    if (!supported || candidates.is_empty()) && !has_negated_value {
         return Ok(RecallOutput {
             memories: Vec::new(),
             facts: Vec::new(),
@@ -2414,6 +2430,71 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             .filter(|f| !facts.iter().any(|x| x.id == f.id && !x.memory))
             .collect();
         if !fresh.is_empty() {
+            let mut merged = fresh;
+            merged.extend(facts);
+            merged.truncate(8);
+            facts = merged;
+        }
+    }
+    // H2-03: a verb-phrase negation that asks for the excluded or ended value
+    // returns that value (ended with its end date, or a negated row) plus the
+    // current value for contrast, reusing the ended-fact path. This runs for
+    // both the negated branch (whose filter drops live positives) and the
+    // exclusion-without-a-known-property branch (whose history filter drops
+    // ended positives). Non-frame questions are unchanged.
+    if negated_value {
+        let mut anchors = query_alias_entities.clone();
+        for id in &top_entities {
+            anchors.insert(*id);
+        }
+        let extra = negated_value_facts(engine, &query_vec, &anchors, cutoff)?;
+        let fresh: Vec<FactHit> = extra
+            .into_iter()
+            .filter(|f| !facts.iter().any(|x| x.id == f.id && !x.memory))
+            .collect();
+        if !fresh.is_empty() {
+            // Ensure the evidence memories of the answer are visible even when
+            // the negated filter would have dropped them.
+            let mut evidence_ids: Vec<i64> = Vec::new();
+            {
+                let mut st = engine.db.sql().prepare_cached(
+                    "SELECT memory_id FROM relation_evidence WHERE relation_id=?1",
+                )?;
+                for fact in &fresh {
+                    for row in st.query_map([fact.id], |r| r.get::<_, i64>(0))? {
+                        let mid = row?;
+                        if !evidence_ids.contains(&mid) {
+                            evidence_ids.push(mid);
+                        }
+                    }
+                }
+            }
+            let rows_to_add = fetch_rows(&engine.db, &evidence_ids)?;
+            for id in evidence_ids {
+                if memories.iter().any(|memory| memory.id == id) {
+                    continue;
+                }
+                let Some(row) = rows_to_add.get(&id) else {
+                    continue;
+                };
+                if !eligible(row, as_of, history, input, since, until, now, planned_ok) {
+                    continue;
+                }
+                memories.push(MemoryHit {
+                    id,
+                    kind: row.2.clone(),
+                    content: row.1.clone(),
+                    valid_from: row.9,
+                    valid_to: row.10,
+                    ended: is_ended(row, cutoff),
+                    superseded_by: row.12,
+                    tags: row.3.split_whitespace().map(str::to_string).collect(),
+                    score: 0.0,
+                    reasons: vec!["negated#1".into()],
+                    duration: None,
+                    maybe_superseded_by: None,
+                });
+            }
             let mut merged = fresh;
             merged.extend(facts);
             merged.truncate(8);
@@ -3250,6 +3331,228 @@ fn ended_pair_facts(
         .query_map(params_from_iter(bind.iter()), |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     paths::facts_by_ids(&engine.db, &rel_ids, cutoff, 2)
+}
+
+/// H2-03: the excluded or ended value of a negated-value question, with the
+/// current value for contrast. Ended positives come first (most query-like),
+/// then a negated row if one exists, then one live value per ended predicate
+/// group. Anchored when the question names entities; otherwise the global
+/// relation KNN supplies candidates. Returns empty when there is nothing to
+/// surface, so non-frame behavior stays byte-identical.
+fn negated_value_facts(
+    engine: &Engine,
+    query_vec: &[f32],
+    anchors: &HashSet<i64>,
+    cutoff: i64,
+) -> Result<Vec<FactHit>> {
+    fn cosine_of(engine: &Engine, id: i64, query_vec: &[f32]) -> f32 {
+        engine
+            .db
+            .sql()
+            .query_row(
+                "SELECT embedding FROM relations_vec WHERE rowid=?1",
+                [id],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|blob| engine.db.blob_to_vec(&blob))
+            .map(|v| rank::cosine(query_vec, &v))
+            .unwrap_or(0.0)
+    }
+    // Candidate (ended/negated) relation ids, most query-like first.
+    let mut candidates: Vec<(f32, i64)> = Vec::new();
+    if anchors.is_empty() {
+        let mut st = engine.db.sql().prepare(&format!(
+            "SELECT rowid,1-distance FROM relations_vec
+             WHERE embedding MATCH {} AND k=20 ORDER BY distance",
+            engine.db.vec_sql("?1")
+        ))?;
+        let hits: Vec<(i64, f32)> = st
+            .query_map([engine.db.vec_blob(query_vec)], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, cosine) in hits {
+            let ok: bool = engine.db.sql().query_row(
+                "SELECT EXISTS(SELECT 1 FROM relations r WHERE r.id=?1 AND r.valid_from<=?2
+                 AND (r.polarity=0
+                      OR (r.polarity=1 AND (r.expired_at IS NOT NULL OR (r.valid_to IS NOT NULL AND r.valid_to<=?2)))))",
+                params![id, cutoff],
+                |r| r.get(0),
+            )?;
+            if ok {
+                candidates.push((cosine, id));
+            }
+        }
+    } else {
+        let mut ids: Vec<i64> = anchors.iter().copied().collect();
+        ids.sort_unstable();
+        ids.truncate(20);
+        let marks = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id FROM relations
+             WHERE valid_from<=? AND (src IN ({marks}) OR dst IN ({marks}))
+               AND (polarity=0
+                    OR (polarity=1 AND (expired_at IS NOT NULL OR (valid_to IS NOT NULL AND valid_to<=?))))
+             ORDER BY valid_from DESC, id DESC LIMIT 800"
+        );
+        let mut bind: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cutoff)];
+        for id in ids.iter().chain(ids.iter()) {
+            bind.push(Box::new(*id));
+        }
+        bind.push(Box::new(cutoff));
+        let mut st = engine.db.sql().prepare(&sql)?;
+        let rows: Vec<i64> = st
+            .query_map(
+                rusqlite::params_from_iter(bind.iter().map(|x| x.as_ref())),
+                |r| r.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in rows {
+            candidates.push((cosine_of(engine, id, query_vec), id));
+        }
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1)));
+        candidates.truncate(3);
+    }
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1)));
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ordered: Vec<i64> = candidates.iter().map(|(_, id)| *id).collect();
+    ordered.dedup();
+    // Current values for contrast: one live row per ended/negated group.
+    let mut groups: Vec<i64> = Vec::new();
+    for &id in &ordered {
+        let group: Option<i64> = engine
+            .db
+            .sql()
+            .query_row(
+                "SELECT COALESCE(NULLIF(p.group_id,0),p.id) FROM relations r
+                 JOIN predicates p ON p.id=r.predicate_id WHERE r.id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(group) = group {
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+    }
+    let mut live: Vec<i64> = Vec::new();
+    for group in groups {
+        let id: Option<i64> = if anchors.is_empty() {
+            engine
+                .db
+                .sql()
+                .query_row(
+                    "SELECT r.id FROM relations r JOIN predicates p ON p.id=r.predicate_id
+                     WHERE COALESCE(NULLIF(p.group_id,0),p.id)=?1 AND r.polarity=1
+                       AND r.valid_from<=?2 AND r.expired_at IS NULL
+                       AND (r.valid_to IS NULL OR r.valid_to>?2)
+                     ORDER BY r.id DESC LIMIT 1",
+                    params![group, cutoff],
+                    |r| r.get(0),
+                )
+                .optional()?
+        } else {
+            let mut ids: Vec<i64> = anchors.iter().copied().collect();
+            ids.sort_unstable();
+            ids.truncate(20);
+            let marks = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT r.id FROM relations r JOIN predicates p ON p.id=r.predicate_id
+                 WHERE COALESCE(NULLIF(p.group_id,0),p.id)=? AND r.polarity=1
+                   AND r.valid_from<=? AND r.expired_at IS NULL
+                   AND (r.valid_to IS NULL OR r.valid_to>?)
+                   AND (r.src IN ({marks}) OR r.dst IN ({marks}))
+                 ORDER BY r.id DESC LIMIT 20"
+            );
+            let mut bind: Vec<Box<dyn rusqlite::ToSql>> =
+                vec![Box::new(group), Box::new(cutoff), Box::new(cutoff)];
+            for id in ids.iter().chain(ids.iter()) {
+                bind.push(Box::new(*id));
+            }
+            let mut st = engine.db.sql().prepare(&sql)?;
+            let pool: Vec<i64> = st
+                .query_map(
+                    rusqlite::params_from_iter(bind.iter().map(|x| x.as_ref())),
+                    |r| r.get(0),
+                )?
+                .collect::<rusqlite::Result<_>>()?;
+            pool.into_iter().max_by(|a, b| {
+                cosine_of(engine, *a, query_vec).total_cmp(&cosine_of(engine, *b, query_vec))
+            })
+        };
+        if let Some(id) = id {
+            if !ordered.contains(&id) && !live.contains(&id) {
+                live.push(id);
+            }
+        }
+    }
+    // Include the current value for contrast only when it contrasts with an
+    // ended value, or with a negated row of the same subject: a negated row
+    // about a different subject ("who does not like jazz": Bob refuses, Priya
+    // likes) is already served by the negation filter, and surfacing the
+    // unrelated live value would leak a positive into a negative answer.
+    let mut ended: Vec<i64> = Vec::new();
+    let mut negated_rows: Vec<i64> = Vec::new();
+    let subject_of = |id: i64, engine: &Engine| -> Option<i64> {
+        engine
+            .db
+            .sql()
+            .query_row("SELECT src FROM relations WHERE id=?1", [id], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    };
+    for &id in &ordered {
+        let row: Option<(i64, Option<i64>, Option<i64>)> = engine
+            .db
+            .sql()
+            .query_row(
+                "SELECT polarity,expired_at,valid_to FROM relations WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((polarity, expired, valid_to)) = row {
+            let is_ended = expired.is_some() || valid_to.is_some_and(|v| v <= cutoff);
+            if polarity == 1 && is_ended {
+                ended.push(id);
+            } else if polarity == 0 {
+                negated_rows.push(id);
+            }
+        }
+    }
+    if !ended.is_empty() {
+        ordered.extend(live);
+    } else if !negated_rows.is_empty() {
+        let neg_subjects: Vec<Option<i64>> = negated_rows
+            .iter()
+            .map(|&id| subject_of(id, engine))
+            .collect();
+        let contrast: Vec<i64> = live
+            .iter()
+            .copied()
+            .filter(|&id| {
+                subject_of(id, engine).is_some_and(|src| neg_subjects.contains(&Some(src)))
+            })
+            .collect();
+        if contrast.is_empty() {
+            return Ok(Vec::new());
+        }
+        ordered.extend(contrast);
+    } else {
+        return Ok(Vec::new());
+    }
+    paths::facts_by_ids(&engine.db, &ordered, cutoff, ordered.len())
 }
 
 /// Live rows of the asked family touching a named entity on the side the

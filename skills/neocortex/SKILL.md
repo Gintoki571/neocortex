@@ -100,7 +100,13 @@ Store something when it will still matter next week:
   next to the explicit negative `fact` text.
 - **Nicknames are aliases**: `{"source": "Robert Okafor", "predicate":
   "nickname", "target": "Bob"}` stores no fact; the target becomes another name
-  of the same entity (prefer `entities[].aliases`). Any relation whose two ends
+  of the same entity (prefer `entities[].aliases`). A nickname written only in
+  the text also becomes an alias when the pattern is unambiguous: "Elizabeth
+  Ward, who goes by Liz", "Dmitri Volkov (Dima)", "Robert Kessler, known as
+  Bobby", "Jorge Fuentes, called Jo by the team" (the full name must be a person
+  you passed or one already stored; never for a place or organisation). A
+  nickname already naming someone else ("Liz" already navigates to "Liz Zhang")
+  is reported in `hints` and is not added. Any relation whose two ends
   resolve to the same entity is dropped, and the reply names it in `hints`
   (`dropped self-relation: Robert Okafor nickname Bob (kept "Bob" as an alias)`).
 - **Text-only retraction**: a sentence with no relation ("Ivan left Acme; he no

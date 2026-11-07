@@ -112,6 +112,120 @@ pub fn negation_intent(query: &str) -> bool {
     has_negation_cue(&kept)
 }
 
+/// True when the question asks for the value it excludes or that has ended
+/// (H2-03): the negation sits inside the question's verb phrase ("what
+/// database does Lumen not use", "what does Ana no longer work on", "who is
+/// not on the team anymore", "which tools did we stop using"). Discourse
+/// negations ("not sure", "why not", "isn't it") and the speaker's own
+/// memory verb are not this frame.
+pub fn negated_value_frame(query: &str) -> bool {
+    let folded = text::fold(query);
+    let words = bare_words(&folded);
+    if words.is_empty() {
+        return false;
+    }
+    // Speaker-memory negation ("I don't remember ...") is not about the world.
+    {
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let mut i = 0;
+        while i < refs.len() {
+            if memory_verb_negation(&refs, i) {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    if folded.contains("not sure") {
+        return false;
+    }
+    if folded.contains("why not") {
+        return false;
+    }
+    // "Why not ..." asks for a reason to use something, not for the excluded value.
+    if words.first().map(String::as_str) == Some("why")
+        && words.get(1).map(String::as_str) == Some("not")
+    {
+        return false;
+    }
+    // "Isn't it" / "aren't they": a tag question, not a negated predicate.
+    // A contraction + pronoun instance alone never counts.
+    let is_pronoun = |w: &str| {
+        matches!(
+            w,
+            "it" | "they"
+                | "them"
+                | "he"
+                | "she"
+                | "we"
+                | "you"
+                | "i"
+                | "this"
+                | "that"
+                | "these"
+                | "those"
+                | "there"
+        )
+    };
+    // "No longer" + a verb within three tokens ("no longer work on").
+    if folded.contains("no longer") {
+        if let Some(at) = folded.find("no longer") {
+            let tail = &folded[at + "no longer".len()..];
+            let tail_words = bare_words(tail);
+            if tail_words
+                .iter()
+                .take(3)
+                .any(|w| !w.is_empty() && w != "just" && w != "only")
+            {
+                return true;
+            }
+        }
+        // A bare "no longer" with no verb after it is not a frame on its own;
+        // the generic checks below may still fire on another cue.
+    }
+    // "Anymore" ("who is not on the team anymore") only counts with a negation
+    // elsewhere; the AUX+NOT check below covers the brief's example.
+    // "Stop" + a gerund ("did we stop using") names a property the subject had.
+    for (i, word) in words.iter().enumerate() {
+        if matches!(
+            word.as_str(),
+            "stop" | "stopped" | "stopping" | "cease" | "ceased"
+        ) && words.get(i + 1).is_some()
+        {
+            return true;
+        }
+    }
+    // AUX + negation + content ("does Lumen not use", "is not on").
+    for (i, word) in words.iter().enumerate() {
+        if AUXILIARIES.contains(&word.as_str()) {
+            let window_end = (i + 4).min(words.len());
+            for j in i + 1..window_end {
+                let neg = &words[j];
+                if (NEGATION_WORDS.contains(&neg.as_str()) || CONTRACTIONS.contains(&neg.as_str()))
+                    && j + 1 < words.len()
+                {
+                    if let Some(follow) = words.get(j + 1) {
+                        if follow == "sure" || is_pronoun(follow) {
+                            continue;
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // Contracted negation + verb ("services that don't use Redis").
+    for (i, word) in words.iter().enumerate() {
+        if CONTRACTIONS.contains(&word.as_str()) {
+            if let Some(follow) = words.get(i + 1) {
+                if follow != "sure" && !is_pronoun(follow) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn bare_words(value: &str) -> Vec<String> {
     value.split_whitespace().map(bare_word).collect()
 }
