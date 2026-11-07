@@ -456,17 +456,6 @@ const COMMON_NOUNS: &[&str] = &[
     "budget", "result", "talk", "exercise",
 ];
 
-/// A capitalised word that also appears lowercase elsewhere in the memory is a
-/// common word used at a sentence start, not a name.
-fn lowercase_elsewhere(text: &str, word: &str) -> bool {
-    let lower = word.to_lowercase();
-    text.match_indices(&lower).any(|(pos, _)| {
-        let before = text[..pos].chars().next_back();
-        let after = text[pos + lower.len()..].chars().next();
-        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
-    })
-}
-
 fn is_common_noun(word: &str) -> bool {
     COMMON_NOUNS.contains(&fold(word).as_str())
 }
@@ -605,7 +594,10 @@ fn word_candidates(
             if unit_label_follows(&words, text, k) {
                 break;
             }
-            if is_proper_word(w) && !is_unit_after_number(&words, text, k) {
+            if is_proper_word(w)
+                && !is_unit_after_number(&words, text, k)
+                && (!excluded_word(w) || is_status_word(w))
+            {
                 last = k;
                 k += 1;
             } else if is_connector(w)
@@ -674,21 +666,16 @@ fn word_candidates(
             // Non-ASCII title-case words (Ålesund, Москва, Νίκος) are kept: the
             // stopword/openers lexicons are English, so position is their only
             // English-word signal.
-            // EX-05: a sentence-initial word is also kept when the store
+            // EX-05 (nc-ex03): a sentence-initial word is kept when the store
             // already knows it as an entity or alias ("Cascais hosts the
-            // regatta"), or when a verb follows it and it is not an ordinary
-            // word or a status shout ("Paris is the capital", "Cypher runs").
+            // regatta"). Unknown sentence-initial words stay out (precision
+            // first: "Repo was renamed", "Release Notes" are not names).
             let keep = if is_sentence_start(text, w.start) {
                 is_acronym(w.text)
                     || has_inner_capital_or_digit(w.text)
                     || is_foreign_title_case(w.text)
                     || appears_capitalised_not_at_sentence_start(text, w.text)
                     || known(w.text)
-                    || (verb_like_follows(text, &words, s_idx)
-                        && !is_ordinary_word(w.text)
-                        && !is_status_word(w.text)
-                        && !is_common_noun(w.text)
-                        && !lowercase_elsewhere(text, w.text))
             } else {
                 true
             };
@@ -763,19 +750,6 @@ fn gap_is_space(text: &str, left: &Word<'_>, right: &Word<'_>) -> bool {
 /// compound ("cryo-ET", "IL-6"), never the start of a proper-noun span.
 fn is_hyphen_tail(text: &str, words: &[Word<'_>], idx: usize) -> bool {
     idx > 0 && text[words[idx - 1].end..words[idx].start] == *"-"
-}
-
-/// Verb-like words that mark the preceding sentence-initial word as its
-/// subject ("Paris is", "Cypher runs") (EX-05). A closed list: the rule must
-/// not fire on "Meeting was long".
-const VERB_CUES: &[&str] = &[
-    "is", "was", "has", "had", "runs", "said", "joined", "moved", "lives", "works",
-];
-
-fn verb_like_follows(text: &str, words: &[Word<'_>], idx: usize) -> bool {
-    words.get(idx + 1).is_some_and(|next| {
-        gap_is_space(text, &words[idx], next) && VERB_CUES.contains(&fold(next.text).as_str())
-    })
 }
 
 /// Measures that follow a number ("1.2 MB", "120 ms"): not entities (EX-02).
@@ -910,7 +884,8 @@ fn unit_label_candidates(text: &str, words: &[Word<'_>]) -> Vec<Candidate> {
 
 /// EX-03: "Cypher Memory nodes" is a known first word plus a noun when the
 /// first word is already an entity or alias, the compound is not, and the
-/// next word is in `SPAN_NOUNS`. Two-word spans only.
+/// next word is in `SPAN_NOUNS`. Two-word spans only. A compound that recurs
+/// capitalised elsewhere in the same text is kept (nc-ex03).
 fn is_known_head_span(
     text: &str,
     words: &[Word<'_>],
@@ -924,10 +899,12 @@ fn is_known_head_span(
     let Some(next) = words.get(e_idx + 1) else {
         return false;
     };
+    let compound = &text[words[s_idx].start..words[e_idx].end];
     SPAN_NOUNS.contains(&next.text)
         && gap_is_space(text, &words[e_idx], next)
         && known(words[s_idx].text)
-        && !known(&text[words[s_idx].start..words[e_idx].end])
+        && !known(compound)
+        && text.matches(compound).count() <= 1
 }
 
 fn word_hint(text: &str) -> Option<&'static str> {
@@ -1033,6 +1010,9 @@ fn excluded_word(word: &str) -> bool {
         || is_stopword(&norm)
         || is_weekday_or_month(&norm)
         || OPENERS.contains(&norm.as_str())
+        || norm
+            .strip_suffix('s')
+            .is_some_and(|base| OPENERS.contains(&base))
 }
 
 fn is_weekday_or_month(word: &str) -> bool {
