@@ -1148,18 +1148,6 @@ fn hint_bridge_followable(
     Ok(live <= HINT_MAX_DEGREE && frame_hit)
 }
 
-/// The wh-frame check alone (degree cap is in `hint_bridge_followable`).
-#[allow(dead_code)]
-fn relation_matches_frame(
-    engine: &Engine,
-    id: i64,
-    frame_forms: &HashSet<String>,
-    exclude: Option<i64>,
-    now: i64,
-) -> Result<bool> {
-    hint_bridge_followable(engine, id, frame_forms, exclude, now)
-}
-
 /// `follow`-ready hints for the hop retrieval could not finish: name the bridge
 /// entity (the end of the best partial chain, or a fuzzy seed) and the words to
 /// ask it for. Empty when the returned context already covers the wh-frame.
@@ -2393,7 +2381,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         .map(|x| x.0)
         .collect();
     // A time window asks about past states too, so ended facts stay in view.
-    let facts = facts_for(
+    let facts = facts_for_view(
         engine,
         &top_entities,
         history || since.is_some() || until.is_some(),
@@ -2402,6 +2390,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         8,
         Some(&ppr_score),
         Some(&query_vec),
+        None,
     )?;
     // The last hop of the best paths is often the only place the answer
     // appears ("Liam Vijappa lives in Denver"), and that relation belongs to an
@@ -2859,34 +2848,11 @@ fn community_span(engine: &Engine, community: i64) -> Result<Option<(i64, i64)>>
     Ok(start.zip(end))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn facts_for(
-    engine: &Engine,
-    ids: &[i64],
-    history: bool,
-    cutoff: i64,
-    (since, until): (Option<i64>, Option<i64>),
-    limit: usize,
-    ppr: Option<&HashMap<i64, f64>>,
-    query_vec: Option<&[f32]>,
-) -> Result<Vec<FactHit>> {
-    facts_for_view(
-        engine,
-        ids,
-        history,
-        cutoff,
-        (since, until),
-        limit,
-        ppr,
-        query_vec,
-        None,
-    )
-}
-
-/// Same as `facts_for` with a per-side view: `viewer` is the entity whose card
-/// or profile the facts are rendered for, so inverse relations ("A manages B"
+/// The facts of `ids`, best first. `viewer` is the entity whose card or
+/// profile the facts are rendered for, so inverse relations ("A manages B"
 /// stored after "B reports to A") and symmetric relations (married to, stored
-/// once in (min,max) order) are rendered with the viewer as subject.
+/// once in (min,max) order) are rendered with the viewer as subject; `None`
+/// renders every fact canonically.
 #[allow(clippy::too_many_arguments)]
 fn facts_for_view(
     engine: &Engine,
@@ -4354,7 +4320,7 @@ pub fn overview(engine: &Engine, query: Option<&str>, k: usize) -> Result<Overvi
             .take(3)
             .map(|id| card(engine, *id))
             .collect::<Result<Vec<_>>>()?;
-        let facts = facts_for(
+        let facts = facts_for_view(
             engine,
             &ordered_ids,
             false,
@@ -4362,6 +4328,7 @@ pub fn overview(engine: &Engine, query: Option<&str>, k: usize) -> Result<Overvi
             (None, None),
             3,
             ppr.as_ref(),
+            None,
             None,
         )?;
         let score = query
