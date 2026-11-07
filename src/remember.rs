@@ -67,12 +67,29 @@ const RETRACTIONS: &[(&[&str], &str)] = &[
     (&["separated", "from"], "married to"),
     (&["divorced"], "married to"),
     (&["sold"], "own"),
+    (&["stopped", "working"], "work at"),
+    (&["stopped"], ""),
     (&["stopped", "using"], "use"),
     (&["gave", "up"], "use"),
     (&["is", "no", "longer"], ""),
     (&["was", "no", "longer"], ""),
     (&["no", "longer"], ""),
     (&["ya", "no"], ""),
+];
+
+/// Cues that retract only when the gap names a verb: "stopped reviewing X" is
+/// a retraction, "stopped by Acme" is a visit, so a bare "stopped" needs the
+/// gerund to say which predicate ended.
+const VERB_REQUIRED_CUES: &[&[&str]] = &[&["stopped"]];
+
+/// Verb lemmas that state the same predicate for retraction matching but are
+/// not aliased in the predicate ontology ("head" is also a role noun, so
+/// `resolve` refuses to alias it to "lead"). Symmetric; a pair only matches
+/// when the rest of the phrase agrees, so "works with" still misses "works at".
+const RETRACTION_VERB_SYNONYMS: &[(&str, &str)] = &[
+    ("head", "lead"),
+    ("run", "manage"),
+    ("oversee", "supervise"),
 ];
 
 /// A clause boundary or a conjunction means the phrase and the target are not
@@ -86,6 +103,11 @@ const RETRACTION_BREAKS: &[&str] = &[
 const OBJECT_DETERMINERS: &[&str] = &[
     "the", "a", "an", "some", "any", "his", "her", "their", "its", "my", "our", "your", "this",
     "that", "these", "those",
+];
+
+/// Prepositions that can connect a verb to its object in a predicate phrase.
+const PREPOSITIONS: &[&str] = &[
+    "at", "in", "on", "to", "from", "for", "with", "by", "of", "about", "into",
 ];
 
 /// Followers that end the object with a clause boundary.
@@ -281,6 +303,25 @@ fn hedged(words: &[(usize, usize, &str)], from: usize, cue: usize) -> bool {
     words[from..cue].iter().any(|w| HEDGES.contains(&w.2))
 }
 
+/// A negating word directly before a retraction cue ("never stopped", "hasn't
+/// stopped"): the cue is a double negative and the fact stays live. Contracted
+/// negated auxiliaries count in every spelling the tokenisers keep ("hasn't",
+/// "hasn\u{2019}t", and "hasnt" once a tokeniser strips the curly apostrophe).
+fn negating_word(w: &str) -> bool {
+    /// Negating words, with the contracted auxiliaries written without their
+    /// apostrophe so "hasn't", "hasn\u{2019}t" and "hasnt" all match.
+    const NEGATIONS: &[&str] = &[
+        "not", "never", "aint", "arent", "cant", "couldnt", "didnt", "doesnt", "dont", "hadnt",
+        "hasnt", "havent", "isnt", "mightnt", "mustnt", "neednt", "shant", "shouldnt", "wasnt",
+        "werent", "wont", "wouldnt",
+    ];
+    let bare: String = w
+        .chars()
+        .filter(|c| *c != '\'' && *c != '\u{2019}')
+        .collect();
+    NEGATIONS.contains(&bare.as_str())
+}
+
 fn words_of(text: &str) -> Vec<String> {
     text.split_whitespace()
         .map(|w| {
@@ -463,7 +504,7 @@ fn infer_negated(text: &str, predicate: &str, group: &str, target: &str, source:
                 if let Some(cue_end) = cue_before(&words, verb_pos) {
                     if words[cue_end..verb_pos]
                         .iter()
-                        .all(|w| NEGATION_FILLERS.contains(&w.as_str()))
+                        .all(|w| NEGATION_FILLERS.contains(&w.as_str()) || adverb(w))
                     {
                         return true;
                     }
@@ -484,8 +525,31 @@ fn infer_negated(text: &str, predicate: &str, group: &str, target: &str, source:
                 .map(String::as_str)
                 .eq(phrase.iter().copied())
             {
+                // "never stopped liking" is a double negative: still positive.
+                if phrase[0] == "stopped" && start > 0 && negating_word(&words[start - 1]) {
+                    continue;
+                }
+                let no_longer = phrase.last().is_some_and(|w| *w == "longer");
                 let gap = &words[start + phrase.len()..target_pos];
-                if gap.len() <= 3 && !gap.iter().any(|w| RETRACTION_BREAKS.contains(&w.as_str())) {
+                if gap.len() <= 3
+                    && !gap.iter().any(|w| {
+                        scope_word(w, no_longer) || RETRACTION_BREAKS.contains(&w.as_str())
+                    })
+                    && !(start > 0 && scope_word(&words[start - 1], no_longer))
+                {
+                    // If the retraction group is generic, any verb in the gap
+                    // must match the predicate's verb.
+                    if retract_group.is_empty() {
+                        let non_prep = gap
+                            .iter()
+                            .find(|w| !PREPOSITIONS.contains(&w.as_str()) && !adverb(w));
+                        if let Some(vw) = non_prep {
+                            let pred_v = predicate.split_whitespace().next().unwrap_or("");
+                            if !same_verb(vw, pred_v) {
+                                continue;
+                            }
+                        }
+                    }
                     let end = start + phrase.len();
                     if best.is_none_or(|(seen, _)| end > seen) {
                         best = Some((end, retract_group));
@@ -534,7 +598,7 @@ fn cue_before(words: &[String], verb_pos: usize) -> Option<usize> {
             // "never stopped liking" is a double negative: still positive.
             if matches!(words[start].as_str(), "stopped" | "ceased")
                 && start > 0
-                && matches!(words[start - 1].as_str(), "never" | "not")
+                && negating_word(&words[start - 1])
             {
                 continue;
             }
@@ -544,12 +608,59 @@ fn cue_before(words: &[String], verb_pos: usize) -> Option<usize> {
     None
 }
 
+/// True for a word that modifies a verb rather than naming it ("no longer
+/// actively reviews"). A phrase whose only verb word ends in -ly ("applies")
+/// keeps it: an adverb needs a verb to modify.
+fn adverb(w: &str) -> bool {
+    w.len() > 3 && w.ends_with("ly") && w != "only"
+}
+
+/// "no longer only X" and "no longer just X" negate exclusivity, not the
+/// assertion, so they end nothing. "just" is a scope word only after a
+/// "no longer" cue.
+fn scope_word(w: &str, no_longer: bool) -> bool {
+    w == "only" || (no_longer && w == "just")
+}
+
+/// The verb phrase between the cue and the object, normalised. Prepositions
+/// are kept (they separate "works at" from "works with"); -ly adverbs are
+/// dropped when a verb word remains ("no longer actively reviews" ->
+/// "reviews"). `None` when the gap names no verb at all.
+fn verb_phrase(words: &[(usize, usize, &str)]) -> Option<String> {
+    let mut kept: Vec<&str> = words.iter().map(|w| w.2).collect();
+    let mut has_verb = false;
+    for w in &kept {
+        if !PREPOSITIONS.contains(w) && !adverb(w) {
+            has_verb = true;
+        }
+    }
+    if has_verb {
+        kept.retain(|w| !adverb(w));
+    }
+    if kept.is_empty() || kept.iter().all(|w| PREPOSITIONS.contains(w)) {
+        return None;
+    }
+    let vnorm = text::norm_predicate(&kept.join(" "));
+    (!vnorm.is_empty()).then_some(vnorm)
+}
+
+/// True when two verb words state the same predicate: the same lemma, or a
+/// retraction synonym pair ("heads"/"leads").
+fn same_verb(a: &str, b: &str) -> bool {
+    let (a, b) = (text::lemma_verb(a), text::lemma_verb(b));
+    a == b
+        || RETRACTION_VERB_SYNONYMS.iter().any(|(x, y)| {
+            (*x == a.as_str() && *y == b.as_str()) || (*x == b.as_str() && *y == a.as_str())
+        })
+}
+
 /// A retraction the text states without agent-supplied relations: the
 /// sentence names a subject and an object, and the phrase maps to a group.
 struct TextRetraction {
     subject: String,
     object: String,
     group: &'static str,
+    verb: Option<String>,
     /// The relation noun the sentence names ("no longer partners"); when set,
     /// only relations whose fact uses that noun match.
     noun: Option<&'static str>,
@@ -782,39 +893,79 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
             {
                 continue;
             }
+            // "never stopped liking" is a double negative: still positive.
+            if phrase[0] == "stopped" && p > 0 && negating_word(words[p - 1].2) {
+                continue;
+            }
             let phrase_start = words[p].0;
             let phrase_end = words[p + plen - 1].1;
-            let max_end = words.get(p + plen + 2).map(|w| w.1).unwrap_or(usize::MAX);
+            // The object may start up to three words after the cue; an -ly
+            // adverb modifies the verb and does not use up the lookahead
+            // ("no longer works remotely at Acme").
+            let max_end = words
+                .iter()
+                .skip(p + plen)
+                .filter(|w| !adverb(w.2))
+                .nth(2)
+                .map(|w| w.1)
+                .unwrap_or(usize::MAX);
             let mut object_span = spans
                 .spans
                 .iter()
                 .find(|(s, _, _)| *s >= phrase_end && *s <= max_end)
                 .cloned();
-            if object_span.is_none() && words.iter().skip(p + plen).take(4).any(|w| w.2 == "there")
-            {
-                object_span = spans
-                    .spans
+            let mut there_match = false;
+            let mut there_pos = 0;
+            if object_span.is_none() {
+                if let Some(pos) = words
                     .iter()
-                    .rev()
-                    .find(|(_, e, _)| *e <= phrase_start)
-                    .cloned();
+                    .skip(p + plen)
+                    .take(4)
+                    .position(|w| w.2 == "there")
+                {
+                    object_span = spans
+                        .spans
+                        .iter()
+                        .rev()
+                        .find(|(_, e, _)| *e <= phrase_start)
+                        .cloned();
+                    if object_span.is_some() {
+                        there_match = true;
+                        there_pos = p + plen + pos;
+                    }
+                }
             }
             let Some((object_start, object_end, object)) = object_span else {
                 continue;
             };
             let mut candidate = spans.ambiguous.contains(&(object_start, object_end));
-            if object_start >= phrase_end {
+            let mut verb: Option<String> = None;
+            let no_longer = phrase.last().is_some_and(|w| *w == "longer");
+            if there_match {
+                let vwords = &words[p + plen..there_pos];
+                if vwords.iter().any(|w| scope_word(w.2, no_longer)) {
+                    continue;
+                }
+                if group.is_empty() {
+                    verb = verb_phrase(vwords);
+                }
+            } else if object_start >= phrase_end {
                 // A span may start before the name it normalises to ("the
                 // Acme" from the alias n-grams), so the gap and the tail are
                 // measured from different edges.
                 let gap_end = words.partition_point(|w| w.0 < object_start);
                 let next_word = words.partition_point(|w| w.0 < object_end);
-                // Rule 1: a determiner between the cue and the name means the
-                // name is inside a longer noun phrase, not the object. The
-                // determiner that immediately precedes the name belongs to the
-                // object phrase itself ("the core team"), so only an earlier
-                // one rejects the match.
                 let gap = &words[p + plen..gap_end];
+                // "no longer only" / "not only" ends nothing. The scope word
+                // must sit between the cue and the object, or immediately
+                // before the cue; one after the object is a trailing clause
+                // stating the new state ("no longer works at Acme, only at
+                // Brightline"), not a scope on the retracted assertion.
+                if gap.iter().any(|w| scope_word(w.2, no_longer))
+                    || (p > 0 && scope_word(words[p - 1].2, no_longer))
+                {
+                    continue;
+                }
                 let earlier = gap.split_last().map_or(gap, |(_, rest)| rest);
                 if earlier.iter().any(|w| OBJECT_DETERMINERS.contains(&w.2)) {
                     continue;
@@ -838,6 +989,21 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
                     .unwrap_or(0);
                 let from = words.partition_point(|w| w.0 < clause);
                 candidate |= hedged(&words, from, p);
+
+                if group.is_empty() {
+                    let vwords = if gap
+                        .last()
+                        .is_some_and(|w| OBJECT_DETERMINERS.contains(&w.2))
+                    {
+                        &gap[..gap.len() - 1]
+                    } else {
+                        gap
+                    };
+                    verb = verb_phrase(vwords);
+                    if verb.is_none() && VERB_REQUIRED_CUES.contains(phrase) {
+                        continue;
+                    }
+                }
             }
             let min_start = words.get(p.saturating_sub(10)).map(|w| w.0).unwrap_or(0);
             let Some((subject_start, subject_end, subject)) = spans
@@ -856,6 +1022,7 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
                     subject,
                     object,
                     group,
+                    verb,
                     noun: None,
                     candidate,
                 },
@@ -882,6 +1049,7 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
             r.subject == retraction.subject
                 && r.object == retraction.object
                 && r.group == retraction.group
+                && r.verb == retraction.verb
         }) {
             // A plain statement of the same retraction outranks a hedged one.
             seen.candidate &= retraction.candidate;
@@ -940,6 +1108,9 @@ fn pair_retractions(
             {
                 q += 1;
             }
+            if words.get(q).is_some_and(|w| w.2 == "only") || (p > 0 && words[p - 1].2 == "only") {
+                continue;
+            }
             let Some(&(_, _, seen)) = words.get(q) else {
                 continue;
             };
@@ -987,6 +1158,7 @@ fn pair_retractions(
                     subject: a.2.clone(),
                     object: b.2.clone(),
                     group,
+                    verb: None,
                     // Only the generic group needs the fact-noun filter.
                     noun: group.is_empty().then_some(noun),
                     candidate,
@@ -1040,7 +1212,8 @@ fn end_text_retractions(
         // correction branch retire it. Ended rows still need to contain the
         // retraction date.
         let mut st = db.sql().prepare(
-            "SELECT r.id,r.fact,r.valid_from FROM relations r
+            "SELECT r.id, r.fact, r.valid_from, p.canonical, COALESCE(NULLIF(p.group_id,0),p.id)
+             FROM relations r
              JOIN predicates p ON p.id=r.predicate_id
              JOIN entities s ON s.id=r.src
              JOIN entities d ON d.id=r.dst
@@ -1049,22 +1222,30 @@ fn end_text_retractions(
                AND (r.valid_to IS NULL OR (r.valid_from<=?3 AND r.valid_to>?3))
                AND (?4 IS NULL OR COALESCE(NULLIF(p.group_id,0),p.id)=?4)",
         )?;
-        let rows: Vec<(i64, String, i64)> = st
+        let rows: Vec<(i64, String, i64, String, i64)> = st
             .query_map(
                 params![retraction.subject, retraction.object, at, group_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )?
             .collect::<rusqlite::Result<_>>()?;
         let rows: Vec<(i64, String, i64)> = rows
             .into_iter()
-            .filter(|(rid, _, _)| !sink.exclude.contains(rid))
-            .filter(|(_, fact, _)| {
+            .filter(|(rid, _, _, _, _)| !sink.exclude.contains(rid))
+            .filter(|(_, fact, _, _, _)| {
                 retraction.noun.is_none_or(|noun| {
                     words_of(fact)
                         .iter()
                         .any(|w| w == noun || text::singularize(w) == noun)
                 })
             })
+            .filter(|(_, _, _, pred_canonical, pred_group_id)| {
+                if let Some(ref verb) = retraction.verb {
+                    verb_matches_relation(db, verb, pred_canonical, *pred_group_id).unwrap_or(false)
+                } else {
+                    true
+                }
+            })
+            .map(|(rid, fact, valid_from, _, _)| (rid, fact, valid_from))
             .collect();
         match rows.as_slice() {
             [(rid, _, old_from)] if !retraction.candidate => {
@@ -1101,6 +1282,49 @@ fn end_text_retractions(
         }
     }
     Ok(())
+}
+
+/// Check if the verb in a generic text retraction matches the relation's predicate:
+/// same predicate canonical, same predicate group in the database ontology,
+/// the same verb lemma (with compatible prepositions), or a retraction
+/// synonym pair ("heads"/"leads").
+fn verb_matches_relation(
+    db: &Db,
+    retract_verb: &str,
+    pred_canonical: &str,
+    pred_group_id: i64,
+) -> Result<bool> {
+    if retract_verb == pred_canonical {
+        return Ok(true);
+    }
+    let retract_group_id: Option<i64> = db
+        .sql()
+        .query_row(
+            "SELECT COALESCE(NULLIF(p.group_id,0), p.id)
+             FROM predicates p
+             LEFT JOIN predicate_aliases pa ON pa.predicate_id = p.id
+             WHERE p.canonical = ?1 OR pa.alias_norm = ?1",
+            [retract_verb],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(gid) = retract_group_id {
+        if gid == pred_group_id {
+            return Ok(true);
+        }
+    }
+    let rv_words = words_of(retract_verb);
+    let pv_words = words_of(pred_canonical);
+    if rv_words.is_empty() || pv_words.is_empty() {
+        return Ok(false);
+    }
+    if !same_verb(&rv_words[0], &pv_words[0]) {
+        return Ok(false);
+    }
+    if rv_words.len() > 1 && pv_words.len() > 1 {
+        return Ok(rv_words[1..] == pv_words[1..]);
+    }
+    Ok(true)
 }
 
 pub fn check_embedder(db: &Db, emb: &dyn Embedder) -> Result<()> {
@@ -2781,6 +3005,22 @@ mod negation_tests {
                 "like",
                 "jazz",
                 "Alice",
+                false,
+            ),
+            (
+                "Alice no longer only likes jazz",
+                "like",
+                "like",
+                "jazz",
+                "Alice",
+                false,
+            ),
+            (
+                "Tomasz Nowak no longer approves payment-adjacent code",
+                "review",
+                "review",
+                "payment-adjacent code",
+                "Tomasz Nowak",
                 false,
             ),
             (

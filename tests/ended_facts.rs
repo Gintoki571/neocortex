@@ -46,6 +46,30 @@ fn project(name: &str) -> EntityIn {
     }
 }
 
+fn place(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("place".into()),
+        ..Default::default()
+    }
+}
+
+fn org(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("org".into()),
+        ..Default::default()
+    }
+}
+
+fn group(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("group".into()),
+        ..Default::default()
+    }
+}
+
 fn rel(src: &str, predicate: &str, dst: &str, exclusive: bool) -> RelationIn {
     RelationIn {
         source: src.into(),
@@ -105,6 +129,19 @@ fn retract(e: &Engine, content: &str) -> neocortex::engine::RememberOutput {
         ..Default::default()
     })
     .unwrap()
+}
+
+/// Ingest a "leads the team" relation and return its id.
+fn tomasz_leads_team(e: &Engine) -> i64 {
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak leads the team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("team")],
+            relations: vec![rel("Tomasz Nowak", "leads", "team", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    out.relations[0].id
 }
 
 // ------------------------------------------------------------- H3-09
@@ -342,4 +379,613 @@ fn h3_11_question_without_still_is_unchanged() {
             .any(|l| l.contains("→ npm") && l.contains("ended")),
         "a question without a status cue showed the ended fact:\n{shown}"
     );
+}
+
+// ------------------------------------------------------------- H3-12
+
+#[test]
+fn h3_12_approves_does_not_end_reviews() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract(&e, "Tomasz Nowak no longer approves payment-adjacent code.");
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "approves ended reviews fact: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+#[test]
+fn h3_12_no_longer_only_ends_nothing() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract(
+        &e,
+        "Tomasz Nowak no longer only reviews payment-adjacent code.",
+    );
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "no longer only ended fact: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+#[test]
+fn h3_12_same_verb_reviews_ends_fact() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract(&e, "Tomasz Nowak no longer reviews payment-adjacent code.");
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "same verb reviews failed to end fact: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+#[test]
+fn h3_12_stopped_using_npm_ends_uses_npm() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Atlas uses npm for building packages.".into(),
+            entities: vec![project("Atlas"), tool("npm")],
+            relations: vec![rel("Atlas", "uses", "npm", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Atlas stopped using npm.".into(),
+            entities: vec![project("Atlas"), tool("npm")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "stopped using did not end uses: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+#[test]
+fn h3_12_left_acme_ends_works_at_acme() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Ivan works at Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Ivan left Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "left did not end works at: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+#[test]
+fn h3_12_no_longer_lives_in_pune_ends_lives_in_pune() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Carol lives in Pune.".into(),
+            entities: vec![person("Carol"), place("Pune")],
+            relations: vec![rel("Carol", "lives in", "Pune", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Carol no longer lives in Pune.".into(),
+            entities: vec![person("Carol"), place("Pune")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "no longer lives in did not end lives in: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+#[test]
+fn h3_12_no_longer_works_with_does_not_end_works_at() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Ivan works at Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+
+    let out2 = e
+        .remember(RememberInput {
+            content: "Ivan no longer works with Ana.".into(),
+            entities: vec![person("Ivan"), person("Ana")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!out2.invalidated_relations.contains(&rid));
+    assert_eq!(relation_end(&e, rid), None);
+
+    let out3 = e
+        .remember(RememberInput {
+            content: "Ivan no longer works with Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        !out3.invalidated_relations.contains(&rid),
+        "works with ended works at: {out3:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+#[test]
+fn h3_12_retraction_with_relations_passed_by_caller_is_unchanged() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Ivan works at Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid1 = out1.relations[0].id;
+
+    let out2 = e
+        .remember(RememberInput {
+            content: "Ivan joined Globex; he left Acme.".into(),
+            entities: vec![person("Ivan"), org("Globex"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Globex", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid1),
+        "old relation not ended: {out2:?}"
+    );
+    let rid2 = out2.relations[0].id;
+    assert!(
+        !out2.invalidated_relations.contains(&rid2),
+        "new relation ended itself: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid1), Some(NOW));
+    assert_eq!(relation_end(&e, rid2), None);
+}
+
+/// S01: "heads" is outside the predicate ontology (it is also a role noun), so
+/// the retraction matcher carries the heads/leads synonym pair explicitly.
+#[test]
+fn h3_12_no_longer_heads_ends_leads() {
+    let e = engine();
+    let rid = tomasz_leads_team(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer heads the team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("team")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "heads did not end leads: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// R02: the same synonym in the past tense.
+#[test]
+fn h3_12_no_longer_headed_ends_leads() {
+    let e = engine();
+    let rid = tomasz_leads_team(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer headed the team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("team")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "headed did not end leads: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// R01: the same verb still ends, so the synonym path did not replace it.
+#[test]
+fn h3_12_no_longer_leads_ends_leads() {
+    let e = engine();
+    let rid = tomasz_leads_team(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer leads the team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("team")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "leads did not end leads: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// X01: an -ly adverb between the cue and the verb is not part of the verb.
+#[test]
+fn h3_12_adverb_between_cue_and_verb_ends() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer actively reviews payment-adjacent code.".into(),
+            entities: vec![person("Tomasz Nowak")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "adverb hid the verb: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// X02: the adverb is stripped, the preposition still tells "works at" apart.
+#[test]
+fn h3_12_no_longer_works_remotely_ends_works_at() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Ivan works at Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            relations: vec![rel("Ivan", "works at", "Acme", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Ivan no longer works remotely at Acme.".into(),
+            entities: vec![person("Ivan"), org("Acme")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "remotely hid works at: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// N02: "no longer just X" negates exclusivity, like "no longer only X".
+#[test]
+fn h3_12_no_longer_just_does_not_end() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer just reviews payment-adjacent code.".into(),
+            entities: vec![person("Tomasz Nowak")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "no longer just ended the fact: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+/// The run/manage synonym pair: a second entry in the table, and its negative
+/// side, so the table cannot silently over-match.
+#[test]
+fn h3_12_no_longer_runs_ends_manages() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak manages the platform team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("platform team")],
+            relations: vec![rel("Tomasz Nowak", "manages", "platform team", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak no longer runs the platform team.".into(),
+            entities: vec![person("Tomasz Nowak"), group("platform team")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "runs did not end manages: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// A synonym pair never matches outside itself: "oversees" is paired with
+/// "supervises", so it must not end "reviews".
+#[test]
+fn h3_12_oversees_does_not_end_reviews() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract(&e, "Tomasz Nowak no longer oversees payment-adjacent code.");
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "oversees ended reviews: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+/// S02/S05 (round-2 defect 2): "stopped <verb>ing" is a retraction cue too.
+#[test]
+fn h3_12_stopped_working_at_ends_works_at() {
+    let e = engine();
+    let rid = tomasz_works_at_acme(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak stopped working at Acme.",
+        vec![person("Tomasz Nowak"), org("Acme")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "stopped working at did not end works at: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+#[test]
+fn h3_12_has_stopped_reviewing_ends_reviews() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak has stopped reviewing payment-adjacent code.",
+        vec![person("Tomasz Nowak")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "has stopped reviewing did not end reviews: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// The generic "stopped" cue still respects the verb: another verb ends nothing.
+#[test]
+fn h3_12_stopped_approving_does_not_end_reviews() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak stopped approving payment-adjacent code.",
+        vec![person("Tomasz Nowak")],
+    );
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "stopped approving ended reviews: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+/// Y01-Y09, P5: a trailing `, only ...` / `, just ...` clause states the new
+/// state, so the retraction still ends the fact (main behaviour; round 1
+/// regressed here). The scope check applies between the cue and the object and
+/// immediately before the cue, never after the object.
+fn tomasz_works_at_acme(e: &Engine) -> i64 {
+    let out = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak works at Acme.".into(),
+            valid_from: Some("2026-01-04".into()),
+            entities: vec![person("Tomasz Nowak"), org("Acme"), org("Brightline")],
+            relations: vec![rel("Tomasz Nowak", "works at", "Acme", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    out.relations[0].id
+}
+
+fn retract_with(
+    e: &Engine,
+    content: &str,
+    entities: Vec<EntityIn>,
+) -> neocortex::engine::RememberOutput {
+    e.remember(RememberInput {
+        content: content.into(),
+        entities,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+#[test]
+fn h3_12_trailing_scope_clause_still_ends_works_at() {
+    for text in [
+        "Tomasz Nowak no longer works at Acme, only at Brightline.",
+        "Tomasz Nowak no longer works at Acme, just at Brightline.",
+        "Tomasz Nowak no longer works at Acme; only Brightline remains.",
+        "Tomasz Nowak no longer works at Acme, only there.",
+        "Tomasz Nowak no longer works at Acme, just not there.",
+    ] {
+        let e = engine();
+        let rid = tomasz_works_at_acme(&e);
+        let out = retract_with(
+            &e,
+            text,
+            vec![person("Tomasz Nowak"), org("Acme"), org("Brightline")],
+        );
+        assert!(
+            out.invalidated_relations.contains(&rid),
+            "{text}: trailing clause kept the fact live: {out:?}"
+        );
+        assert_eq!(relation_end(&e, rid), Some(NOW), "{text}");
+    }
+}
+
+/// Y05: synonym verb plus a trailing scope clause.
+#[test]
+fn h3_12_trailing_scope_clause_still_ends_synonym_verb() {
+    let e = engine();
+    let rid = tomasz_leads_team(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak no longer heads the team, only advises it.",
+        vec![person("Tomasz Nowak"), group("team")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "trailing clause kept the synonym retraction live: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// Y07: trailing clause naming a different object ("the docs").
+#[test]
+fn h3_12_trailing_scope_clause_still_ends_reviews() {
+    let e = engine();
+    let rid = tomasz_reviews_payment(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak no longer reviews payment-adjacent code, only the docs.",
+        vec![person("Tomasz Nowak")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "trailing clause kept reviews live: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// Y12 control: a scope word between the cue and the object still ends nothing.
+#[test]
+fn h3_12_no_longer_only_with_trailing_contrast_ends_nothing() {
+    let e = engine();
+    let rid = tomasz_works_at_acme(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak no longer only works at Acme, but also at Brightline.",
+        vec![person("Tomasz Nowak"), org("Acme"), org("Brightline")],
+    );
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "no longer only ended the fact: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+#[test]
+fn h3_12_coordinated_pair_retraction_unchanged() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Acme Corp and Northwind are partners since 2023.".into(),
+            entities: vec![org("Acme Corp"), org("Northwind")],
+            relations: vec![rel("Acme Corp", "partners with", "Northwind", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Acme Corp and Northwind are no longer partners.".into(),
+            entities: vec![org("Acme Corp"), org("Northwind")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out2.invalidated_relations.contains(&rid),
+        "pair partners not ended: {out2:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// B10/B12 (round-3 defect 1): a negating word before the cue keeps the fact
+/// live, including contracted auxiliaries ("hasn't", straight or curly
+/// apostrophe) and the spaced "has not" / "did not" forms.
+#[test]
+fn h3_12_negated_auxiliary_before_stopped_keeps_works_at_live() {
+    for text in [
+        "Tomasz Nowak hasn't stopped working at Acme.",
+        "Tomasz Nowak hasn\u{2019}t stopped working at Acme.",
+        "Tomasz Nowak has not stopped working at Acme.",
+        "Tomasz Nowak never stopped working at Acme.",
+        "Tomasz Nowak did not stop working at Acme.",
+        "Tomasz Nowak didn't stop working at Acme.",
+    ] {
+        let e = engine();
+        let rid = tomasz_works_at_acme(&e);
+        let out = retract_with(
+            &e,
+            text,
+            vec![person("Tomasz Nowak"), org("Acme"), org("Brightline")],
+        );
+        assert!(
+            !out.invalidated_relations.contains(&rid),
+            "{text}: double negative ended works at: {out:?}"
+        );
+        assert_eq!(relation_end(&e, rid), None, "{text}");
+    }
+}
+
+#[test]
+fn h3_12_negated_auxiliary_before_stopped_keeps_reviews_live() {
+    for text in [
+        "Tomasz Nowak hasn't stopped reviewing payment-adjacent code.",
+        "Tomasz Nowak hasn\u{2019}t stopped reviewing payment-adjacent code.",
+        "Tomasz Nowak hasn't stopped approving payment-adjacent code.",
+        "Tomasz Nowak has not stopped reviewing payment-adjacent code.",
+    ] {
+        let e = engine();
+        let rid = tomasz_reviews_payment(&e);
+        let out = retract_with(&e, text, vec![person("Tomasz Nowak")]);
+        assert!(
+            !out.invalidated_relations.contains(&rid),
+            "{text}: double negative ended reviews: {out:?}"
+        );
+        assert_eq!(relation_end(&e, rid), None, "{text}");
+    }
+}
+
+/// B13: the same guard on the "stopped using" cue.
+#[test]
+fn h3_12_hasnt_stopped_using_keeps_uses_live() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Atlas uses npm for building packages.".into(),
+            entities: vec![project("Atlas"), tool("npm")],
+            relations: vec![rel("Atlas", "uses", "npm", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    for text in [
+        "Atlas hasn't stopped using npm.",
+        "Atlas hasn't stopped using npm for builds.",
+    ] {
+        let out2 = retract_with(&e, text, vec![project("Atlas"), tool("npm")]);
+        assert!(
+            !out2.invalidated_relations.contains(&rid),
+            "{text}: double negative ended uses: {out2:?}"
+        );
+        assert_eq!(relation_end(&e, rid), None, "{text}");
+    }
 }
