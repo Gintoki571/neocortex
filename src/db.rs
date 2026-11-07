@@ -261,6 +261,9 @@ impl Db {
             }
         }
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
+        // One recall touches more distinct cached statements than rusqlite's
+        // default 16, so a long-lived process (MCP, eval) re-prepared them all.
+        conn.set_prepared_statement_cache_capacity(64);
         // Loading the bundled graphqlite extension runs its schema DDL, and a
         // no-op `CREATE INDEX IF NOT EXISTS` takes the write lock (OPS-FLAKE):
         // with a writer active, every open then waited its whole busy timeout
