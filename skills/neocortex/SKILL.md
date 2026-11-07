@@ -107,9 +107,12 @@ Store something when it will still matter next week:
   to Lantern" in text only returns a `renamed?` hint naming both entities and the exact call —
   nothing is merged. On a `renamed?` hint, if it is a real rename, confirm in a new `remember`
   by passing `same_as` on the new name (`entities:[{"name":"Lantern","same_as":"e<old>"}]`)
-  or a relation `{"source":"Lantern","predicate":"formerly called","target":"Harbor"}`
-  (structured renames merge via the same merge core; different-type or ambiguous-name
-  structured renames are reported, not merged). After confirmation the old
+  or a relation `{"source":"Harbor","predicate":"renamed to","target":"Lantern"}`.
+  A caller-asserted rename merges only with predicate `renamed to` (old->new) or
+  `renamed from` (new->old), or `same_as`; call-shaped spellings (`formerly called`,
+  `previously called`, `now called`, `now known as`, `renamed`, ...) are plain relations
+  and never merge ("Ana previously called Bo" is a phone call). Different-type or
+  ambiguous-name structured renames are reported, not merged. After confirmation the old
   name stays as an alias of the surviving (new) name, old facts move to it,
   and a "Lantern formerly called Harbor" fact answers "what was Lantern called before".
   Hedged ("might rename", "plan to rename", "planned for Q3"), negated

@@ -119,7 +119,7 @@ fn has_any_rename_hint(out: &RememberOutput) -> bool {
 }
 
 /// Text cue passed the guards and hinted, but stored nothing: hints carry
-/// both names, both `e<id>`s, `same_as` and the formerly-called relation.
+/// both names, both `e<id>`s, and the surviving confirm calls (same_as, renamed to).
 fn assert_renamed_question_hint(out: &RememberOutput, old: &str, new: &str) {
     let hint = out
         .hints
@@ -134,8 +134,8 @@ fn assert_renamed_question_hint(out: &RememberOutput, old: &str, new: &str) {
         "hint tells same_as confirm: {hint}"
     );
     assert!(
-        hint.contains("formerly called"),
-        "hint tells formerly-called confirm: {hint}"
+        hint.contains("renamed to"),
+        "hint tells renamed-to confirm: {hint}"
     );
 }
 
@@ -148,7 +148,8 @@ fn assert_no_rename_hint(out: &RememberOutput) {
     );
 }
 
-/// Structured confirm via a `formerly called` relation (new-first).
+/// Structured confirm via a `renamed from` relation (new-first, merges).
+/// (Narrowed contract: `formerly called` is a plain relation, not a merge trigger.)
 fn confirm_rename_relation(
     engine: &Engine,
     old: &str,
@@ -158,11 +159,11 @@ fn confirm_rename_relation(
 ) -> RememberOutput {
     remember_at(
         engine,
-        &format!("{new} formerly called {old}."),
+        &format!("{new} was renamed from {old}."),
         vec![typed(old, kind), typed(new, kind)],
         vec![neocortex::engine::RelationIn {
             source: new.into(),
-            predicate: "formerly called".into(),
+            predicate: "renamed from".into(),
             target: old.into(),
             ..Default::default()
         }],
@@ -462,15 +463,13 @@ fn structured_rename_via_relation_predicate_merges() {
         .any(|f| f.fact.contains("formerly called")));
 }
 
-/// Structured direction mapping: old-first vs new-first predicates.
+/// Structured direction mapping (narrowed): only `renamed to` (old-first)
+/// and `renamed from` (new-first) merge; call-shaped spellings do not.
 #[test]
 fn structured_rename_direction_mapping() {
     for (pred, src, dst) in [
         ("renamed to", "Harbor", "Lantern"),
-        ("now called", "Harbor", "Lantern"),
-        ("formerly called", "Lantern", "Harbor"),
         ("renamed from", "Lantern", "Harbor"),
-        ("previously called", "Lantern", "Harbor"),
     ] {
         let engine = new_engine();
         seed_entity(&engine, "Harbor", "project", "2026-01-05");
@@ -1314,7 +1313,7 @@ fn t03_lowercase_text_no_hint_but_structured_merges() {
         vec![typed("harbor", "project"), typed("lantern", "project")],
         vec![neocortex::engine::RelationIn {
             source: "lantern".into(),
-            predicate: "formerly called".into(),
+            predicate: "renamed from".into(),
             target: "harbor".into(),
             ..Default::default()
         }],
@@ -1398,7 +1397,7 @@ fn structured_merge_ignores_written_form_guard() {
         vec![typed("Repo", "repo"), untyped("Helios")],
         vec![neocortex::engine::RelationIn {
             source: "Helios".into(),
-            predicate: "formerly called".into(),
+            predicate: "renamed from".into(),
             target: "Repo".into(),
             ..Default::default()
         }],
@@ -1482,7 +1481,7 @@ fn structured_merge_different_types_skips() {
         vec![project("Harbor"), typed("Lantern", "city")],
         vec![neocortex::engine::RelationIn {
             source: "Lantern".into(),
-            predicate: "formerly called".into(),
+            predicate: "renamed from".into(),
             target: "Harbor".into(),
             ..Default::default()
         }],
@@ -2077,4 +2076,238 @@ fn and_hedge_does_not_block_true_rename_hint() {
         vec![project("Harbor"), project("Lantern")],
     );
     assert_text_hint_no_merge(&e, &out, "Harbor", "Lantern", "Harbor", "Lantern");
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 4 (narrowed contract): only `renamed to` / `renamed from` and
+// `same_as` merge. Call-shaped spellings are plain facts, byte-identical in
+// storage semantics to main (no merge, no formerly-called holder, no alias).
+// B1/B1b/B2/B7 from verify4.
+// ---------------------------------------------------------------------------
+
+fn assert_plain_relation_no_merge(engine: &Engine, a: &str, b: &str, out: &RememberOutput) {
+    assert_no_merge(engine, a, b);
+    assert!(
+        !has_merge_hint(out),
+        "call-shaped spelling must not merge, got {:?}",
+        out.hints
+    );
+    // No merge-produced alias: a merge aliases b -> a's survivor.
+    let card_a = engine.entity(a, 20).unwrap().card;
+    let card_b = engine.entity(b, 20).unwrap().card;
+    let norm_b = neocortex::text::norm_name(b);
+    assert!(
+        !card_a
+            .aliases
+            .iter()
+            .any(|al| neocortex::text::norm_name(al) == norm_b),
+        "merge must not alias {b} onto {a}, got {:?}",
+        card_a.aliases
+    );
+    let _ = card_b;
+}
+
+fn remember_call_relation(
+    engine: &Engine,
+    source: &str,
+    predicate: &str,
+    target: &str,
+    source_kind: Option<&str>,
+    target_kind: Option<&str>,
+) -> RememberOutput {
+    let mut entities = vec![EntityIn {
+        name: source.into(),
+        kind: source_kind.map(str::to_string),
+        ..Default::default()
+    }];
+    entities.push(EntityIn {
+        name: target.into(),
+        kind: target_kind.map(str::to_string),
+        ..Default::default()
+    });
+    remember_at(
+        engine,
+        &format!("{source} {predicate} {target} about the invoice."),
+        entities,
+        vec![neocortex::engine::RelationIn {
+            source: source.into(),
+            predicate: predicate.into(),
+            target: target.into(),
+            ..Default::default()
+        }],
+        "2026-03-01",
+    )
+}
+
+/// B1: "Ana previously called Bo" (phone call, both person) is a plain fact.
+#[test]
+fn b1_previously_called_phone_call_stores_plain_fact() {
+    let engine = new_engine();
+    let out = remember_call_relation(
+        &engine,
+        "Ana",
+        "previously called",
+        "Bo",
+        Some("person"),
+        Some("person"),
+    );
+    assert_plain_relation_no_merge(&engine, "Ana", "Bo", &out);
+    assert!(
+        !out.relations.is_empty(),
+        "relation must be stored as a plain fact"
+    );
+}
+
+/// B1b: "Ana formerly called Bo" (phone call, both person) is a plain fact.
+#[test]
+fn b1b_formerly_called_phone_call_stores_plain_fact() {
+    let engine = new_engine();
+    let out = remember_call_relation(
+        &engine,
+        "Ana",
+        "formerly called",
+        "Bo",
+        Some("person"),
+        Some("person"),
+    );
+    assert_plain_relation_no_merge(&engine, "Ana", "Bo", &out);
+    assert!(
+        !out.relations.is_empty(),
+        "relation must be stored as a plain fact"
+    );
+}
+
+/// B2: "Lantern now called Ana" (a call, both untyped) is a plain fact.
+#[test]
+fn b2_now_called_untyped_call_stores_plain_fact() {
+    let engine = new_engine();
+    let out = remember_call_relation(&engine, "Lantern", "now called", "Ana", None, None);
+    assert_plain_relation_no_merge(&engine, "Lantern", "Ana", &out);
+    assert!(
+        !out.relations.is_empty(),
+        "relation must be stored as a plain fact"
+    );
+}
+
+/// B7: bare superset predicates beyond the narrowed merge set are plain facts.
+#[test]
+fn b7_bare_superset_predicates_store_plain_facts() {
+    for (pred, src, dst) in [
+        ("renamed", "Ana", "Bo"),
+        ("rename to", "Ana", "Bo"),
+        ("formerly", "Ana", "Bo"),
+        ("previously", "Ana", "Bo"),
+        ("now known as", "Ana", "Bo"),
+    ] {
+        let engine = new_engine();
+        let out = remember_call_relation(&engine, src, pred, dst, Some("person"), Some("person"));
+        assert_plain_relation_no_merge(&engine, src, dst, &out);
+        assert!(
+            !out.relations.is_empty(),
+            "predicate {pred} must be stored as a plain fact"
+        );
+    }
+}
+
+/// `renamed to` (old-first) still merges.
+#[test]
+fn narrowed_renamed_to_still_merges() {
+    let engine = new_engine();
+    seed_entity(&engine, "Harbor", "project", "2026-01-05");
+    seed_entity(&engine, "Lantern", "project", "2026-01-05");
+    let out = remember_at(
+        &engine,
+        "Harbor was renamed to Lantern.",
+        vec![project("Harbor"), project("Lantern")],
+        vec![neocortex::engine::RelationIn {
+            source: "Harbor".into(),
+            predicate: "renamed to".into(),
+            target: "Lantern".into(),
+            ..Default::default()
+        }],
+        "2026-06-01",
+    );
+    assert!(
+        has_merge_hint(&out),
+        "renamed to must merge, got {:?}",
+        out.hints
+    );
+    assert_merged(&engine, "Harbor", "Lantern");
+}
+
+/// `renamed from` (new-first) still merges.
+#[test]
+fn narrowed_renamed_from_still_merges() {
+    let engine = new_engine();
+    seed_entity(&engine, "Harbor", "project", "2026-01-05");
+    seed_entity(&engine, "Lantern", "project", "2026-01-05");
+    let out = remember_at(
+        &engine,
+        "Lantern was renamed from Harbor.",
+        vec![project("Harbor"), project("Lantern")],
+        vec![neocortex::engine::RelationIn {
+            source: "Lantern".into(),
+            predicate: "renamed from".into(),
+            target: "Harbor".into(),
+            ..Default::default()
+        }],
+        "2026-06-01",
+    );
+    assert!(
+        has_merge_hint(&out),
+        "renamed from must merge, got {:?}",
+        out.hints
+    );
+    assert_merged(&engine, "Harbor", "Lantern");
+}
+
+/// `same_as` still merges (hint-confirm path).
+#[test]
+fn narrowed_same_as_still_merges() {
+    let engine = new_engine();
+    seed_entity(&engine, "Harbor", "project", "2026-01-05");
+    seed_entity(&engine, "Lantern", "project", "2026-01-05");
+    let out = confirm_rename_same_as(&engine, "Lantern", "Harbor", "project", "2026-06-01");
+    assert!(
+        has_merge_hint(&out),
+        "same_as must merge, got {:?}",
+        out.hints
+    );
+    assert_merged(&engine, "Harbor", "Lantern");
+}
+
+/// The `renamed?` text hint names only the surviving confirm calls: `same_as`
+/// and a `renamed to` relation. It must NOT suggest `formerly called` (which
+/// no longer merges under the narrowed contract) and must stay token-cheap.
+#[test]
+fn renamed_hint_names_only_surviving_confirm_calls() {
+    let engine = new_engine();
+    seed_entity(&engine, "Harbor", "project", "2026-01-05");
+    let out = remember_at(
+        &engine,
+        "The Harbor pipeline was renamed to Lantern.",
+        vec![project("Harbor"), project("Lantern")],
+        vec![],
+        "2026-07-03",
+    );
+    let hint = out
+        .hints
+        .iter()
+        .find(|h| h.contains("renamed?"))
+        .expect("expected renamed? hint");
+    assert!(hint.contains("same_as"), "hint must name same_as: {hint}");
+    assert!(
+        hint.contains("renamed to"),
+        "hint must name renamed to: {hint}"
+    );
+    assert!(
+        !hint.contains("formerly called"),
+        "hint must not suggest formerly called (no longer merges): {hint}"
+    );
+    // Token-cheap: a short, single hint.
+    assert!(
+        hint.split_whitespace().count() <= 80,
+        "hint should stay token-cheap, got {} words: {hint}",
+        hint.split_whitespace().count()
+    );
 }

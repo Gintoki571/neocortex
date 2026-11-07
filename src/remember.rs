@@ -478,22 +478,15 @@ const RENAME_HEDGES: &[&str] = &[
     "maybe",
 ];
 
-/// Agent-supplied rename predicates, by direction. `text::fold` keeps "now"
-/// (unlike `norm_predicate`, which strips it), so the surface forms match.
-const RENAME_OLD_FIRST: &[&str] = &[
-    "renamed to",
-    "rename to",
-    "renamed",
-    "now called",
-    "now known as",
-];
-const RENAME_NEW_FIRST: &[&str] = &[
-    "formerly called",
-    "formerly",
-    "previously called",
-    "previously",
-    "renamed from",
-];
+/// Agent-supplied rename predicates that TRIGGER a merge, by direction.
+/// Narrowed (fix round 4): only unambiguous rename assertions merge. Call-shaped
+/// spellings ("formerly called", "previously called", "now called", "now known as",
+/// "renamed", "rename to", "formerly", "previously") are plain relations —
+/// "Ana previously called Bo" is a phone call, not a rename — and must stay
+/// byte-identical in storage to main. `same_as` still merges (handled separately).
+/// `text::fold` keeps "now" (unlike `norm_predicate`), so surface forms match.
+const RENAME_OLD_FIRST: &[&str] = &["renamed to"];
+const RENAME_NEW_FIRST: &[&str] = &["renamed from"];
 
 /// True when the sentence words just before the rename cue hedge or negate
 /// it ("might rename", "was not renamed"), or the words after the cue plan
@@ -1459,7 +1452,7 @@ fn apply_rename_text_hint(
         return Ok(());
     }
     hints.push(format!(
-        "renamed? \"{old_display}\" e{old_id} -> \"{new_display}\" e{new_id}: text states a rename but nothing was merged; if this is a real rename confirm by passing entities [{{\"name\":\"{new_display}\",\"same_as\":\"e{old_id}\"}}] or relations [{{\"source\":\"{new_display}\",\"predicate\":\"formerly called\",\"target\":\"{old_display}\"}}]",
+        "renamed? \"{old_display}\" e{old_id} -> \"{new_display}\" e{new_id}: text states a rename but nothing was merged; if this is a real rename confirm by passing entities [{{\"name\":\"{new_display}\",\"same_as\":\"e{old_id}\"}}] or relations [{{\"source\":\"{old_display}\",\"predicate\":\"renamed to\",\"target\":\"{new_display}\"}}]",
     ));
     Ok(())
 }
@@ -3868,12 +3861,13 @@ fn write_prepared(
         });
         crate::wtiming::end(crate::wtiming::RELATIONS);
     }
-    // Rename (H3-10, fix-round-3 contract). Text NEVER merges: a passing
+    // Rename (H3-10, fix-round-4 contract). Text NEVER merges: a passing
     // text pair becomes a `renamed?` hint storing nothing. Structured pairs
-    // the caller passed explicitly — a rename-predicate relation, or a
-    // `same_as` naming the other entity — merge old into new via
-    // merge_entities_in plus the formerly-called holder fact. Structured
-    // merges run first so a confirmed pair emits no text hint.
+    // the caller passed explicitly — a `renamed to` / `renamed from` relation,
+    // or `same_as` naming the other entity — merge old into new via
+    // merge_entities_in plus the formerly-called holder fact. Other call-shaped
+    // spellings ("formerly called", "now called", ...) are plain relations.
+    // Structured merges run first so a confirmed pair emits no text hint.
     let mut rename_hints: Vec<String> = Vec::new();
     if duplicate_of.is_none() {
         let mut claimed: HashSet<(String, String)> = HashSet::new();
