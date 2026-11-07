@@ -618,6 +618,7 @@ fn relation_seeds_with_config(
     as_of: Option<i64>,
     history: bool,
     prefix_min: usize,
+    relation_knn: &[(i64, f32)],
     options: RelationSeedOptions<'_>,
 ) -> Result<(SeedPairs, SeedPairs)> {
     let vis = paths::Visibility {
@@ -714,14 +715,7 @@ fn relation_seeds_with_config(
             add(id, src, dst, f64::from(cosine) * 0.5)?;
         }
     } else {
-        let mut st = db.sql().prepare(&format!(
-            "SELECT rowid,1-distance FROM relations_vec
-             WHERE embedding MATCH {} AND k=10 ORDER BY distance",
-            db.vec_sql("?1")
-        ))?;
-        let hits: Vec<(i64, f32)> = st
-            .query_map([db.vec_blob(query_vec)], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
+        let hits = &relation_knn[..relation_knn.len().min(10)];
         let ids: Vec<i64> = hits
             .iter()
             .filter(|(_, cosine)| *cosine >= 0.5)
@@ -746,7 +740,7 @@ fn relation_seeds_with_config(
                     visible.insert(id, (src, dst));
                 }
             }
-            for (id, cosine) in hits {
+            for &(id, cosine) in hits {
                 if let Some(&(src, dst)) = visible.get(&id) {
                     add(id, src, dst, f64::from(cosine) * 0.5)?;
                 }
@@ -1586,7 +1580,15 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             }
         }
     }
-    // (c) relation-fact hits.
+    // (c) relation-fact hits. One relations_vec KNN serves these seeds (its
+    // first 10 hits: vec0's top-k selection is prefix-stable, so they are a
+    // k=10 query's hits) and the semantic beam below (all SEM_FACTS).
+    let seed_knn = !engine.cfg.rel_prefilter || query_alias_entities.is_empty();
+    let relation_knn = if seed_knn || (!negated && engine.cfg.w_sempath > 0.0) {
+        paths::relation_knn(&engine.db, &query_vec)?
+    } else {
+        Vec::new()
+    };
     let (relation_entities, relation_memories) = relation_seeds_with_config(
         &engine.db,
         &query_text,
@@ -1595,6 +1597,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         as_of,
         history,
         engine.cfg.fts_prefix_min,
+        &relation_knn,
         RelationSeedOptions {
             query_entities: &query_alias_entities,
             fact_entity_boost: engine.cfg.fact_entity_boost,
@@ -1779,6 +1782,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                 &blocking,
                 anchors.prose,
                 &nearest_memories,
+                &relation_knn,
                 vis,
                 engine.cfg.hop_scorer == "on",
                 engine.cfg.name_part_hop,

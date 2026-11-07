@@ -1201,6 +1201,21 @@ pub(crate) fn search(db: &Db, query: &str, seeds: &[i64], vis: Visibility) -> Re
 /// Facts recognised as relevant to the question: one KNN over relation fact
 /// vectors bounds the semantic beam below.
 pub(crate) const SEM_FACTS: usize = 100;
+
+/// The `SEM_FACTS` relations nearest the question, best first, with cosine.
+pub(crate) fn relation_knn(db: &Db, query_vec: &[f32]) -> Result<Vec<(i64, f32)>> {
+    Ok(db
+        .sql()
+        .prepare_cached(&format!(
+            "SELECT rowid,1-distance FROM relations_vec
+             WHERE embedding MATCH {} AND k=?2 ORDER BY distance",
+            db.vec_sql("?1")
+        ))?
+        .query_map(params![db.vec_blob(query_vec), SEM_FACTS as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
 /// Edges taken from one entity in the semantic beam.
 const SEM_EDGES: usize = 6;
 /// Most relations an entity may carry before the semantic beam stops
@@ -1298,6 +1313,7 @@ pub(crate) fn search_semantic(
     anchors: &[i64],
     prose_hops: bool,
     nearest_memories: &[i64],
+    relation_knn: &[(i64, f32)],
     vis: Visibility,
     use_scorer: bool,
     name_hop: f64,
@@ -1309,18 +1325,10 @@ pub(crate) fn search_semantic(
     for t in text::tokens(query) {
         query_forms.extend(token_forms(&t));
     }
-    // Facts the question recognises; their vectors are read lazily, only for
-    // the edges the beam reaches (a vec0 vector read costs ~0.3 ms).
-    let relevant: HashSet<i64> = db
-        .sql()
-        .prepare_cached(&format!(
-            "SELECT rowid FROM relations_vec WHERE embedding MATCH {} AND k=?2",
-            db.vec_sql("?1")
-        ))?
-        .query_map(params![db.vec_blob(query_vec), SEM_FACTS as i64], |r| {
-            r.get::<_, i64>(0)
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    // Facts the question recognises (`relation_knn`); their vectors are read
+    // lazily, only for the edges the beam reaches (a vec0 vector read costs
+    // ~0.3 ms).
+    let relevant: HashSet<i64> = relation_knn.iter().map(|(id, _)| *id).collect();
     let mut relation_vector_st = db
         .sql()
         .prepare_cached("SELECT embedding FROM relations_vec WHERE rowid=?1")?;
@@ -2913,6 +2921,7 @@ mod name_part_tests {
             &[seed],
             true,
             &[1],
+            &super::relation_knn(db, &query).unwrap(),
             vis,
             false,
             NAME_PART_HOP,
@@ -3085,6 +3094,7 @@ mod widen_tests {
             &[noor],
             false,
             &[],
+            &super::relation_knn(&db, &query).unwrap(),
             vis,
             false,
             super::NAME_PART_HOP,
