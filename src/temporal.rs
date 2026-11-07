@@ -790,10 +790,78 @@ pub fn ordering_intent(text: &str) -> bool {
                     return true;
                 }
             }
-            "before" | "earlier" | "later" => return true,
+            // H3-13b: "who led X before Mira" names a successor, not a
+            // sequence question. A time value after "before" ("who did I
+            // meet before 2024", "before March") still orders by date.
+            "before" => {
+                if before_is_sequence(&toks, i) {
+                    return true;
+                }
+            }
+            "earlier" | "later" => return true,
             // "the first thing I do", "first place": an idiom, not a sequence.
             "first" if !matches!(next, Some("thing" | "things" | "place")) => return true,
             _ => {}
+        }
+    }
+    false
+}
+
+/// The past predicates a predecessor frame can carry ("who led X before Y").
+/// The same list `past_state_intent` recognises, so the frame and the boost
+/// agree on what a past-tense question is.
+fn is_past_predicate(tok: &str) -> bool {
+    matches!(
+        tok,
+        "led"
+            | "lead"
+            | "used"
+            | "use"
+            | "owned"
+            | "own"
+            | "managed"
+            | "manage"
+            | "worked"
+            | "work"
+            | "lived"
+            | "live"
+            | "reviewed"
+            | "review"
+    )
+}
+
+/// True when the question's subject is unknown and the holder is asked —
+/// "who led X before Y" — rather than named with the object asked ("who did
+/// Tessa lead before Y", "which project did Tessa lead before Y"). Only the
+/// first shape is a predecessor frame: in the second the answer is a list of
+/// objects, so the chronological order is the answer.
+fn subject_unknown(toks: &[&str], i: usize) -> bool {
+    toks[..i]
+        .windows(2)
+        .any(|w| w[0] == "who" && is_past_predicate(w[1]))
+}
+
+/// The "before"-arm classification shared by [`ordering_intent`] and
+/// [`predecessor_frame`]: true when the frame names a date (a sequence
+/// question), false when it names a successor ("who led ... before <non-time
+/// word>").
+fn before_is_sequence(toks: &[&str], i: usize) -> bool {
+    let next = toks.get(i + 1).copied();
+    !subject_unknown(toks, i) || next.is_some_and(is_time_word)
+}
+
+/// H3-13b: true when the question carries the predecessor frame — a
+/// "who <past predicate> ... before <non-time word>" question that names a
+/// successor (the answer is the holder whose relation ended when the
+/// successor's began). `ordering_intent` excludes these; recall restores the
+/// date sort for them when no predecessor hit materialises (no ended
+/// candidate the question anchors to the successor).
+pub fn predecessor_frame(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let toks: Vec<&str> = words(&lower).iter().map(|&(s, e)| &lower[s..e]).collect();
+    for (i, tok) in toks.iter().enumerate() {
+        if *tok == "before" && !before_is_sequence(&toks, i) {
+            return true;
         }
     }
     false
@@ -865,6 +933,19 @@ fn weekday_plural(tok: &str) -> bool {
         .is_some_and(|base| base.len() >= 4 && weekday_index(base).is_some())
 }
 
+/// A time reference a frame word points at ("before 2024", "before March",
+/// "before Friday"): the question still orders by date, unlike "before
+/// Mira", where that word is a successor.
+fn is_time_word(tok: &str) -> bool {
+    (!tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit()))
+        || month_index(tok).is_some()
+        || weekday_index(tok).is_some()
+        || matches!(
+            tok,
+            "yesterday" | "today" | "tomorrow" | "noon" | "midnight"
+        )
+}
+
 /// True when the query asks about the past state of things ("used to",
 /// "previously", "before", "formerly", "history", "changed", "did ... use").
 pub fn history_intent(text: &str) -> bool {
@@ -933,6 +1014,23 @@ pub fn past_state_intent(text: &str) -> bool {
             toks.iter().enumerate().any(|(i, &(start, end))| {
                 &lower[start..end] == "led"
                     && !toks.get(i + 1).is_some_and(|&(a, b)| &lower[a..b] == "by")
+            })
+        }
+        || {
+            // A relative clause "the launch that Mira led" names a past
+            // predicate without a "before"/"used to" cue.
+            let toks = words(&lower);
+            toks.iter().enumerate().any(|(i, &(start, end))| {
+                &lower[start..end] == "that"
+                    && toks[i + 1..(i + 6).min(toks.len())].iter().enumerate().any(
+                        |(j, &(a, b))| {
+                            let next_idx = i + 1 + j + 1;
+                            is_past_predicate(&lower[a..b])
+                                && !toks
+                                    .get(next_idx)
+                                    .is_some_and(|&(c, d)| &lower[c..d] == "by")
+                        },
+                    )
             })
         }
         || {
@@ -2061,6 +2159,55 @@ mod tests {
         }
         for text in ["where does Alice live", "what is my favourite colour"] {
             assert!(!ordering_intent(text), "ordering_intent({text:?})");
+        }
+        // H3-13b: "before <successor>" is a predecessor frame, not a
+        // sequence question; a date after "before" still orders.
+        for text in [
+            "who led the Birch launch before Noah Imani",
+            "who used pnpm before yarn",
+            "who owned the Orchid archive before Pavel Duran",
+        ] {
+            assert!(!ordering_intent(text), "ordering_intent({text:?})");
+            assert!(predecessor_frame(text), "predecessor_frame({text:?})");
+        }
+        // A named subject with the object asked is a listing, not a holder
+        // question: the date sort is the answer.
+        for text in [
+            "which tool did Cobalt use before yarn",
+            "which project did Tessa Nakamura lead before Aspen refresh",
+        ] {
+            assert!(ordering_intent(text), "ordering_intent({text:?})");
+            assert!(!predecessor_frame(text), "predecessor_frame({text:?})");
+        }
+        for text in [
+            "who did I meet before 2024",
+            "who did I meet before March",
+            "who did I meet before Friday",
+            "what did Mira Sol do before lunch",
+        ] {
+            assert!(ordering_intent(text), "ordering_intent({text:?})");
+            assert!(!predecessor_frame(text), "predecessor_frame({text:?})");
+        }
+        // An object-asking shape ("which X came before Y") is an ordering
+        // question: the answer is the list of things, oldest first, and no
+        // handover boost is needed to find it.
+        assert!(ordering_intent("which microscope came before the Krios"));
+        assert!(!predecessor_frame("which microscope came before the Krios"));
+        // Only "who <past predicate> ... before <successor>" asks for the
+        // holder; a named subject with the object asked keeps the date sort.
+        for text in [
+            "who did Tessa Nakamura lead before Emil Sorensen",
+            "which project did Tessa Nakamura lead before Aspen refresh",
+        ] {
+            assert!(ordering_intent(text), "ordering_intent({text:?})");
+            assert!(!predecessor_frame(text), "predecessor_frame({text:?})");
+        }
+        for text in [
+            "who did I meet before 2024",
+            "who did I meet before March",
+            "who did I meet before Friday",
+        ] {
+            assert!(ordering_intent(text), "ordering_intent({text:?})");
         }
         // Idioms and phrasal verbs are not sequence questions.
         for text in [

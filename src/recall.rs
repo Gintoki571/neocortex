@@ -1311,26 +1311,34 @@ fn memory_has_ended_anchor_relation(
     if anchors.is_empty() {
         return Ok(false);
     }
-    let placeholders = std::iter::repeat_n("?", anchors.len())
+    let anchor_marks = (3..3 + anchors.len())
+        .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(",");
-    let predicate_param = 3 + 2 * anchors.len();
+    let predicate_param = 3 + anchors.len();
     let sql = format!(
         "SELECT EXISTS(
              SELECT 1 FROM relation_evidence e JOIN relations r ON r.id=e.relation_id
              JOIN predicates p ON p.id=r.predicate_id
              WHERE e.memory_id=?1 AND (r.expired_at IS NOT NULL OR r.valid_to IS NOT NULL AND r.valid_to<=?2)
-               AND (r.src IN ({placeholders}) OR r.dst IN ({placeholders}))
+               AND (
+                   r.src IN ({anchor_marks}) OR r.dst IN ({anchor_marks})
+                   OR EXISTS (
+                       SELECT 1 FROM relations r_succ
+                       WHERE (r_succ.src IN ({anchor_marks}) OR r_succ.dst IN ({anchor_marks}))
+                         AND r_succ.predicate_id = r.predicate_id
+                         AND r_succ.id != r.id
+                         AND (r_succ.src = r.src OR r_succ.dst = r.dst OR r_succ.src = r.dst OR r_succ.dst = r.src)
+                         AND (
+                             (r.valid_to IS NOT NULL AND (r_succ.valid_from IS NULL OR r.valid_to <= r_succ.valid_from))
+                             OR r.expired_at IS NOT NULL
+                         )
+                   )
+               )
                AND (instr(?{predicate_param}, lower(r.predicate_text)) > 0 OR instr(?{predicate_param}, lower(p.canonical)) > 0 OR instr(?{predicate_param}, lower(p.display)) > 0)
          )"
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(memory_id), Box::new(cutoff)];
-    params.extend(
-        anchors
-            .iter()
-            .copied()
-            .map(|id| Box::new(id) as Box<dyn rusqlite::ToSql>),
-    );
     params.extend(
         anchors
             .iter()
@@ -1365,6 +1373,10 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         || temporal::wants_plans(&input.query)
         || window.as_ref().is_some_and(|w| w.start >= now);
     let ordering = temporal::ordering_intent(&input.query);
+    // H3-13b: the predecessor frame is excluded from ordering_intent, but
+    // it still wants the date sort when no ended candidate anchored to the
+    // successor materialised (the corpus had no handover to boost).
+    let predecessor_frame = temporal::predecessor_frame(&input.query);
     let duration_query = temporal::duration_intent(&input.query);
     let ordered = ordering || duration_query;
     let history = input.include_history || history_query || as_of.is_some() || ordered;
@@ -1976,6 +1988,14 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         0.0
     };
     let mut candidates = Vec::new();
+    // Set when the question is a predecessor frame and at least one ended
+    // candidate was anchor-linked to the successor (H3-13b). Only then does
+    // relevance outrank the chronological paging; without the structured
+    // signal the oldest-first order stays, exactly as before. An ordering
+    // question that merely carries a past-tense cue ("which project did
+    // Tessa first lead") keeps its date sort: the ended pair it can reach is
+    // not what the question asks for, and `predecessor_frame` is false there.
+    let mut predecessor_hit = false;
     for f in fused {
         let Some(row) = rows.get(&f.id) else { continue };
         // H2-10: a calendar window in the question is a filter, not only a
@@ -2004,6 +2024,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                     )?;
                 score *= if past_state_query {
                     if ended_pair {
+                        predecessor_hit = predecessor_frame;
                         engine.cfg.history_boost.max(4.0)
                     } else {
                         1.0
@@ -2417,11 +2438,18 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             };
         }
     }
-    // An ordering question wants the intervals themselves, oldest first.
+    // An ordering question wants the intervals themselves, oldest first. So
+    // does a predecessor frame whose ended predecessor never materialised (no
+    // ended candidate the question anchors to the successor). Only a
+    // predecessor frame that did find it keeps relevance order, because the
+    // answer is the holder whose relation ended when the successor's began,
+    // not the oldest memory in the corpus (H3-13b). An explicit sequence cue
+    // ("first", "after <date>") still sorts even when a past-tense verb put an
+    // ended pair in view: the question asks which one came first.
     // A duration question asks about one interval ("how long was the offsite"),
     // so it keeps relevance order: sorting it by date put unrelated older
     // memories above the answer.
-    if ordering {
+    if ordering || (predecessor_frame && !predecessor_hit) {
         memories.sort_by_key(|m| (m.valid_from, m.id));
         facts.sort_by_key(|f| (f.valid_from, f.id));
     }
