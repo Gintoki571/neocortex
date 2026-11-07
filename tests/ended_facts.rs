@@ -271,6 +271,289 @@ fn h3_13_negated_retraction_is_not_resurrected_as_live() {
     assert!(!out.facts.iter().any(|fact| fact.id == 1 && !fact.ended));
 }
 
+// ------------------------------------------------------------- H3-13b
+
+fn setup_lead_handover_with_competitors(e: &Engine) {
+    e.remember(RememberInput {
+        content: "Mira Sol led the Birch launch.".into(),
+        valid_from: Some("2026-01-10".into()),
+        entities: vec![person("Mira Sol"), project("Birch launch")],
+        relations: vec![rel("Mira Sol", "leads", "Birch launch", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        content: "Noah Imani took over as lead of the Birch launch.".into(),
+        valid_from: Some("2026-02-10".into()),
+        entities: vec![person("Noah Imani"), project("Birch launch")],
+        relations: vec![rel("Noah Imani", "leads", "Birch launch", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    for i in 0..30 {
+        let colleague = format!("Colleague {i:02}");
+        e.remember(RememberInput {
+            content: format!(
+                "{colleague} reviewed Birch launch planning notes during meeting {i:02}."
+            ),
+            valid_from: Some(format!("2026-01-0{}", (i % 9) + 1)),
+            entities: vec![person(&colleague), project("Birch launch")],
+            relations: vec![rel(&colleague, "reviewed notes for", "Birch launch", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+}
+
+fn setup_tool_handover_with_competitors(e: &Engine) {
+    e.remember(RememberInput {
+        content: "Cobalt uses pnpm for package management.".into(),
+        valid_from: Some("2026-01-10".into()),
+        entities: vec![project("Cobalt"), tool("pnpm")],
+        relations: vec![rel("Cobalt", "uses", "pnpm", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        content: "Cobalt switched from pnpm to yarn.".into(),
+        valid_from: Some("2026-02-10".into()),
+        entities: vec![project("Cobalt"), tool("pnpm"), tool("yarn")],
+        relations: vec![rel("Cobalt", "uses", "yarn", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    for i in 0..30 {
+        let colleague = format!("Colleague {i:02}");
+        e.remember(RememberInput {
+            content: format!("{colleague} reviewed pnpm planning notes during meeting {i:02}."),
+            valid_from: Some(format!("2026-01-0{}", (i % 9) + 1)),
+            entities: vec![person(&colleague), tool("pnpm")],
+            relations: vec![rel(&colleague, "reviewed notes for", "pnpm", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+}
+
+fn setup_owner_handover_with_competitors(e: &Engine) {
+    e.remember(RememberInput {
+        content: "Lena Ortiz owns the Orchid archive.".into(),
+        valid_from: Some("2026-01-10".into()),
+        entities: vec![person("Lena Ortiz"), project("Orchid archive")],
+        relations: vec![rel("Lena Ortiz", "owns", "Orchid archive", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        content: "Pavel Duran took over ownership of the Orchid archive.".into(),
+        valid_from: Some("2026-02-10".into()),
+        entities: vec![person("Pavel Duran"), project("Orchid archive")],
+        relations: vec![rel("Pavel Duran", "owns", "Orchid archive", true)],
+        ..Default::default()
+    })
+    .unwrap();
+    for i in 0..30 {
+        let colleague = format!("Colleague {i:02}");
+        e.remember(RememberInput {
+            content: format!(
+                "{colleague} reviewed Orchid archive planning notes during meeting {i:02}."
+            ),
+            valid_from: Some(format!("2026-01-0{}", (i % 9) + 1)),
+            entities: vec![person(&colleague), project("Orchid archive")],
+            relations: vec![rel(
+                &colleague,
+                "reviewed notes for",
+                "Orchid archive",
+                false,
+            )],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn h3_13b_relative_clause_and_before_successor_lead_ranks_ended_memory_in_top_3() {
+    let e = engine();
+    setup_lead_handover_with_competitors(&e);
+    for query in [
+        "the Birch launch that Mira Sol led",
+        "the Birch launch that Mira Sol lead",
+        "who led Birch launch before Noah Imani",
+        "who lead Birch launch before Noah Imani",
+    ] {
+        let out = recall(&e, query);
+        let rank = out.memories.iter().position(|m| m.id == 1).map(|i| i + 1);
+        assert!(
+            rank.is_some_and(|r| r <= 3),
+            "{query}: ended memory rank is {rank:?}, expected <= 3; top memories: {:?}",
+            out.memories
+                .iter()
+                .take(5)
+                .map(|m| (m.id, &m.content, m.score))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Controls:
+    // "who leads Birch launch" -> live memory (m2) is #1, m1 is not #1
+    let cur = recall(&e, "who leads Birch launch");
+    assert_eq!(cur.memories.first().map(|m| m.id), Some(2));
+    // "what did Mira Sol do before lunch" -> m1 is not boosted
+    let lunch = recall(&e, "what did Mira Sol do before lunch");
+    let m1_lunch = lunch.memories.iter().find(|m| m.id == 1);
+    assert!(m1_lunch.is_none() || m1_lunch.unwrap().score < 2.0);
+    // passive "led by" -> live memory is #1
+    let passive = recall(&e, "the Birch launch led by Noah Imani");
+    assert_eq!(passive.memories.first().map(|m| m.id), Some(2));
+}
+
+#[test]
+fn h3_13b_relative_clause_and_before_successor_tool_ranks_ended_memory_in_top_3() {
+    let e = engine();
+    setup_tool_handover_with_competitors(&e);
+    for query in [
+        "the pnpm that Cobalt used",
+        "the pnpm that Cobalt use",
+        "who used pnpm before yarn",
+        "who use pnpm before yarn",
+    ] {
+        let out = recall(&e, query);
+        let rank = out.memories.iter().position(|m| m.id == 1).map(|i| i + 1);
+        assert!(
+            rank.is_some_and(|r| r <= 3),
+            "{query}: ended memory rank is {rank:?}, expected <= 3; top memories: {:?}",
+            out.memories
+                .iter()
+                .take(5)
+                .map(|m| (m.id, &m.content, m.score))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Controls:
+    let cur = recall(&e, "which package manager does Cobalt use");
+    assert_eq!(cur.memories.first().map(|m| m.id), Some(2));
+    let lunch = recall(&e, "what did Cobalt do before lunch");
+    let m1_lunch = lunch.memories.iter().find(|m| m.id == 1);
+    assert!(m1_lunch.is_none() || m1_lunch.unwrap().score < 2.0);
+}
+
+#[test]
+fn h3_13b_relative_clause_and_before_successor_ownership_ranks_ended_memory_in_top_3() {
+    let e = engine();
+    setup_owner_handover_with_competitors(&e);
+    for query in [
+        "the Orchid archive that Lena Ortiz owned",
+        "the Orchid archive that Lena Ortiz own",
+        "who owned Orchid archive before Pavel Duran",
+        "who own Orchid archive before Pavel Duran",
+    ] {
+        let out = recall(&e, query);
+        let rank = out.memories.iter().position(|m| m.id == 1).map(|i| i + 1);
+        assert!(
+            rank.is_some_and(|r| r <= 3),
+            "{query}: ended memory rank is {rank:?}, expected <= 3; top memories: {:?}",
+            out.memories
+                .iter()
+                .take(5)
+                .map(|m| (m.id, &m.content, m.score))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Controls:
+    let cur = recall(&e, "who owns Orchid archive");
+    assert_eq!(cur.memories.first().map(|m| m.id), Some(2));
+    let lunch = recall(&e, "what did Lena Ortiz do before lunch");
+    let m1_lunch = lunch.memories.iter().find(|m| m.id == 1);
+    assert!(m1_lunch.is_none() || m1_lunch.unwrap().score < 2.0);
+}
+
+/// The verifier's ordering corpus (nc-h313b verify1 section 3b): three
+/// projects Tessa Nakamura led, oldest first, then a handover that ends the
+/// newest one. An ordering question that also carries a past-tense cue must
+/// still answer with the chronologically first project.
+fn tessa_ordering_corpus(e: &Engine) {
+    for (project_name, day) in [
+        ("Elm rollout", "2023-02-01"),
+        ("Aspen refresh", "2023-09-01"),
+        ("Rowan migration", "2024-01-05"),
+    ] {
+        e.remember(RememberInput {
+            content: format!("Tessa Nakamura led the {project_name}."),
+            valid_from: Some(day.into()),
+            entities: vec![person("Tessa Nakamura"), project(project_name)],
+            relations: vec![rel("Tessa Nakamura", "leads", project_name, true)],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    e.remember(RememberInput {
+        content: "Emil Sorensen took over as lead of the Rowan migration.".into(),
+        valid_from: Some("2025-01-05".into()),
+        entities: vec![person("Emil Sorensen"), project("Rowan migration")],
+        relations: vec![rel("Emil Sorensen", "leads", "Rowan migration", true)],
+        ..Default::default()
+    })
+    .unwrap();
+}
+
+/// The answer to an ordering question: the chronologically first project,
+/// "Elm rollout" (m1). The ended Rowan fact (m3) must not outrank it just
+/// because the question carries a past-tense verb.
+#[test]
+fn h3_13b_ordering_question_with_past_tense_cue_keeps_date_order() {
+    let e = engine();
+    tessa_ordering_corpus(&e);
+    for query in [
+        // R1, R3, R4, R5, R9, R11 from verify1 section 3b.
+        "which project did Tessa Nakamura first lead",
+        "the first project that Tessa Nakamura led",
+        "which project did Tessa Nakamura lead after 2023-03-01",
+        "which project did Tessa Nakamura lead before May",
+        "which project did Tessa Nakamura lead before Aspen refresh",
+        "which project did Tessa Nakamura lead first, Elm or Rowan",
+    ] {
+        let out = recall(&e, query);
+        assert_eq!(
+            out.memories.first().map(|m| m.id),
+            Some(1),
+            "{query}: expected the earliest project first, got {:?}",
+            out.memories
+                .iter()
+                .take(5)
+                .map(|m| (m.id, &m.content, m.score))
+                .collect::<Vec<_>>()
+        );
+    }
+    // R10: "who did Tessa lead before Emil" names the old holder, but its
+    // object ("who") is the asked side and the named subject is Tessa, so it
+    // stays an ordering question. It must not put the ended fact first.
+    let out = recall(&e, "who did Tessa Nakamura lead before Emil Sorensen");
+    assert!(
+        !out.memories.iter().take(1).any(|m| m.id == 3),
+        "R10 put the ended Rowan fact first: {:?}",
+        out.memories
+            .iter()
+            .take(5)
+            .map(|m| (m.id, &m.content, m.score))
+            .collect::<Vec<_>>()
+    );
+    // Controls: the two target frames still put the ended memory in the top 3,
+    // and the current-state question still answers with the successor.
+    for query in [
+        "the Rowan migration that Tessa Nakamura led",
+        "who led the Rowan migration before Emil Sorensen",
+    ] {
+        let out = recall(&e, query);
+        let rank = out.memories.iter().position(|m| m.id == 3).map(|i| i + 1);
+        assert!(
+            rank.is_some_and(|r| r <= 3),
+            "{query}: ended memory rank is {rank:?}, expected <= 3"
+        );
+    }
+    let cur = recall(&e, "who leads the Rowan migration");
+    assert_eq!(cur.memories.first().map(|m| m.id), Some(4));
+}
+
 // ------------------------------------------------------------- H3-11
 
 /// Atlas used npm, then switched to pnpm: the npm fact is ended. Eight other

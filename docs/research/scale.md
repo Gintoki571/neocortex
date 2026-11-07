@@ -629,6 +629,45 @@ specifically for real-model deployments where accuracy is invariant.
 
 Orchestrator note: real-model deployments are the case that matters (identical accuracy, -19% p50 at 108k); the hash-embedder loss comes from sign bits on non-negative sparse vectors. A real-model-only default needs a real-model 293k DB first (open item BIT-DEFAULT).
 
+## After nc-hay1: crowding channels (2026-11-07)
+
+Keeping a hand-written set findable inside the 108,667-memory world-10000 store
+(`eval --haystack lanes/tmp/nc-scale2/w10k-int8.db`, real UltraBERT, `NEOCORTEX_VEC=int8`).
+Diagnosis (`examples/hay_diag.rs`, loss table in `loop/reports/nc-hay1.md`): 27
+answered-alone/missed-in-haystack queries across fixtures/holdout/multihop-holdout.
+Three loss classes: **fusion crowding** (dominant: gold at graph#1-39 / bm25#2-9 / vec
+ahead of the world, but a fused score of 0.04-0.25 loses to distractors that sit top-5
+in two channels, because the graph channel mirrors the vec channel through its 0.6
+memory-seed mass); **semantic-beam hop loss** (multi-hop answers split on the rendered
+context: a hop-2/hop-3 relation ranks >2000 in the 42k `relations_vec` and is outside
+the beam's KNN-100, so the chain never walks); **pool loss** (gold outside every
+channel's fixed-size pool for a few anchor-less paraphrases; unchanged by any fix
+below).
+
+Three product changes (two scale-activated at 50k stored memories, one shelf-wide):
+
+1. `anchor` channel (`Config.w_anchor` 2.5, gated by `ANCHOR_MIN_MEMORIES` = 50_000):
+   memories mentioning a strong anchor inside the top PPR window (bounded by
+   `fetch_depth`, no new scans, one mentions probe), cosine-ranked. At the small
+   sets the same top memories already follow from the PPR seeds and the sibling boost
+   re-orders them for the worse (fixtures 0.953 -> 0.929 at full weight), so it is
+   silent below the gate. Inside the 108k store: holdout recall 0.744 -> 0.834,
+   fixtures 0.875 -> 0.869, multihop-holdout unchanged (no anchors in its questions),
+   blind multihop-holdout2 0.660 -> 0.650 (−1 query, gate-insensitive at every weight
+   >= 1.0, and saw no benefit below 1.0).
+2. Semantic-beam bridge admission (`SEM_WIDEN_CAP` 32, gated by
+   `SEM_WIDEN_MIN_STORE` = 50_000): a frontier entity with <= 32 incident
+   relations always lets its own facts through the relevance gate, whatever their
+   cosine. Beam depth stays 3 (depth 4 measured worse: 0.850 -> 0.812). Inside the
+   haystack: mh1 acc 0.825 -> 0.850 (with the bridge change below, per-item below).
+3. `bridge_pull` bridge candidate pool 3 -> 6 entities (ungated): mh1 alone
+   0.863 -> 0.912, mh1 in the haystack 0.825 -> 0.900. All alone gates hold or
+   improve (fixtures 0.953, holdout 0.914, mh1 0.912, blind 0.820,
+   world-300 acc 0.998/recall 0.969).
+
+Reproduce: `./target/release/neocortex eval <set>.json --haystack <w10k-int8.db>` (or
+`--load-db <saved haystack copy>` for re-scoring without re-ingesting).
+
 ## Reproduce
 
 ```bash

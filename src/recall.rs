@@ -50,6 +50,11 @@ const STATUS_FTS_SQL: &str = "SELECT rowid FROM memories_fts WHERE memories_fts 
 /// Top dense-retrieval cosine below which a query with no lexical or entity
 /// support is treated as "nothing relevant is stored".
 const ABSTAIN_COSINE: f64 = 0.18;
+/// Store size (memories) at which the anchor channel activates fully. At
+/// 108k anchored golds lose the fusion to two-channel distractors; at a few
+/// hundred memories the same top memories already follow from the PPR seeds
+/// and the sibling boost re-orders them for the worse.
+const ANCHOR_MIN_MEMORIES: i64 = 50_000;
 /// Most `next` hints one recall may carry.
 const HINT_MAX: usize = 2;
 /// Words whose frame names what the question asks for.
@@ -950,7 +955,7 @@ fn bridge_pull_facts(
             }
         }
     }
-    bridges.truncate(3);
+    bridges.truncate(6);
     if bridges.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
@@ -1311,26 +1316,34 @@ fn memory_has_ended_anchor_relation(
     if anchors.is_empty() {
         return Ok(false);
     }
-    let placeholders = std::iter::repeat_n("?", anchors.len())
+    let anchor_marks = (3..3 + anchors.len())
+        .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(",");
-    let predicate_param = 3 + 2 * anchors.len();
+    let predicate_param = 3 + anchors.len();
     let sql = format!(
         "SELECT EXISTS(
              SELECT 1 FROM relation_evidence e JOIN relations r ON r.id=e.relation_id
              JOIN predicates p ON p.id=r.predicate_id
              WHERE e.memory_id=?1 AND (r.expired_at IS NOT NULL OR r.valid_to IS NOT NULL AND r.valid_to<=?2)
-               AND (r.src IN ({placeholders}) OR r.dst IN ({placeholders}))
+               AND (
+                   r.src IN ({anchor_marks}) OR r.dst IN ({anchor_marks})
+                   OR EXISTS (
+                       SELECT 1 FROM relations r_succ
+                       WHERE (r_succ.src IN ({anchor_marks}) OR r_succ.dst IN ({anchor_marks}))
+                         AND r_succ.predicate_id = r.predicate_id
+                         AND r_succ.id != r.id
+                         AND (r_succ.src = r.src OR r_succ.dst = r.dst OR r_succ.src = r.dst OR r_succ.dst = r.src)
+                         AND (
+                             (r.valid_to IS NOT NULL AND (r_succ.valid_from IS NULL OR r.valid_to <= r_succ.valid_from))
+                             OR r.expired_at IS NOT NULL
+                         )
+                   )
+               )
                AND (instr(?{predicate_param}, lower(r.predicate_text)) > 0 OR instr(?{predicate_param}, lower(p.canonical)) > 0 OR instr(?{predicate_param}, lower(p.display)) > 0)
          )"
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(memory_id), Box::new(cutoff)];
-    params.extend(
-        anchors
-            .iter()
-            .copied()
-            .map(|id| Box::new(id) as Box<dyn rusqlite::ToSql>),
-    );
     params.extend(
         anchors
             .iter()
@@ -1365,6 +1378,10 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         || temporal::wants_plans(&input.query)
         || window.as_ref().is_some_and(|w| w.start >= now);
     let ordering = temporal::ordering_intent(&input.query);
+    // H3-13b: the predecessor frame is excluded from ordering_intent, but
+    // it still wants the date sort when no ended candidate anchored to the
+    // successor materialised (the corpus had no handover to boost).
+    let predecessor_frame = temporal::predecessor_frame(&input.query);
     let duration_query = temporal::duration_intent(&input.query);
     let ordered = ordering || duration_query;
     let history = input.include_history || history_query || as_of.is_some() || ordered;
@@ -1673,6 +1690,69 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         .take(depth)
         .collect();
 
+    // ---------------------------------------------------------- anchor
+    // The memories of the exact anchors (the entities the question names),
+    // ranked by query cosine. At 108k distractors, even a graph#1 hit loses
+    // the fused ranking to memories that sit top-5 in two channels, so an
+    // anchored answer needs a channel that no common word in the question
+    // can crowd out. The candidate universe is the top PPR window (bounded
+    // by fetch_depth, no new scans: a world hub touches at most that many
+    // rows), re-ordered by cosine. Only strong anchors qualify; weak
+    // (anchor_tiers) ones keep their seed/beam roles only.
+    // Inert below ANCHOR_MIN_MEMORIES: in a small store the same top
+    // memories already follow from the PPR seeds, and the sibling boost
+    // re-orders them for the worse (measured: 0.953 -> 0.929 on the small
+    // fixture set at full weight).
+    let mut anchor_ids: Vec<i64> = Vec::new();
+    let anchor_on = engine.cfg.w_anchor > 0.0 && !anchors.strong.is_empty() && {
+        let n: i64 = engine
+            .db
+            .sql()
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+            .unwrap_or(0);
+        n >= ANCHOR_MIN_MEMORIES
+    };
+    if anchor_on {
+        let strong: Vec<i64> = anchors.strong.clone();
+        let mut cand: Vec<i64> = Vec::new();
+        if !graph_ids.is_empty() {
+            let marks = std::iter::repeat_n("?", graph_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let emarks = std::iter::repeat_n("?", strong.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT DISTINCT memory_id FROM mentions
+                 WHERE memory_id IN ({marks}) AND entity_id IN ({emarks})"
+            );
+            let mut st = engine.db.sql().prepare(&sql)?;
+            let mut p: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            for id in &graph_ids {
+                p.push(Box::new(*id) as Box<dyn rusqlite::ToSql>);
+            }
+            for id in &strong {
+                p.push(Box::new(*id) as Box<dyn rusqlite::ToSql>);
+            }
+            for id in st.query_map(
+                rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
+                |r| r.get::<_, i64>(0),
+            )? {
+                cand.push(id?);
+            }
+        }
+        // Cosine rank inside the anchor's neighborhood: at 108k the global
+        // dense rank is drowned by the world cluster, but among the anchor's
+        // own top-PPR memories the on-topic hit is near the head.
+        anchor_ids = top_by_cosine(&engine.db, &cand, &query_vec, depth)?;
+        anchor_ids.retain(|id| {
+            rows.get(id).is_some_and(|row| {
+                eligible(row, as_of, history, input, since, until, now, planned_ok)
+            })
+        });
+        anchor_ids.truncate(depth);
+    }
+
     // ------------------------------------------------------------ path
     // Query-directed beam search over relations. This is what answers "where
     // does the manager of X live": the destination memory shares no words with
@@ -1864,6 +1944,11 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             ids: &graph_ids,
         },
         rank::Channel {
+            name: "anchor",
+            weight: engine.cfg.w_anchor,
+            ids: &anchor_ids,
+        },
+        rank::Channel {
             name: "time",
             weight: engine.cfg.w_temporal,
             ids: &time_ids,
@@ -1976,6 +2061,14 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         0.0
     };
     let mut candidates = Vec::new();
+    // Set when the question is a predecessor frame and at least one ended
+    // candidate was anchor-linked to the successor (H3-13b). Only then does
+    // relevance outrank the chronological paging; without the structured
+    // signal the oldest-first order stays, exactly as before. An ordering
+    // question that merely carries a past-tense cue ("which project did
+    // Tessa first lead") keeps its date sort: the ended pair it can reach is
+    // not what the question asks for, and `predecessor_frame` is false there.
+    let mut predecessor_hit = false;
     for f in fused {
         let Some(row) = rows.get(&f.id) else { continue };
         // H2-10: a calendar window in the question is a filter, not only a
@@ -2004,6 +2097,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                     )?;
                 score *= if past_state_query {
                     if ended_pair {
+                        predecessor_hit = predecessor_frame;
                         engine.cfg.history_boost.max(4.0)
                     } else {
                         1.0
@@ -2417,11 +2511,18 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             };
         }
     }
-    // An ordering question wants the intervals themselves, oldest first.
+    // An ordering question wants the intervals themselves, oldest first. So
+    // does a predecessor frame whose ended predecessor never materialised (no
+    // ended candidate the question anchors to the successor). Only a
+    // predecessor frame that did find it keeps relevance order, because the
+    // answer is the holder whose relation ended when the successor's began,
+    // not the oldest memory in the corpus (H3-13b). An explicit sequence cue
+    // ("first", "after <date>") still sorts even when a past-tense verb put an
+    // ended pair in view: the question asks which one came first.
     // A duration question asks about one interval ("how long was the offsite"),
     // so it keeps relevance order: sorting it by date put unrelated older
     // memories above the answer.
-    if ordering {
+    if ordering || (predecessor_frame && !predecessor_hit) {
         memories.sort_by_key(|m| (m.valid_from, m.id));
         facts.sort_by_key(|f| (f.valid_from, f.id));
     }

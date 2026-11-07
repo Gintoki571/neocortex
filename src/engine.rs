@@ -172,6 +172,14 @@ pub struct Config {
     /// `relations_vec` KNN. Anchor-less questions keep the global KNN. Off by
     /// default: measured in `docs/research/scale.md`.
     pub rel_prefilter: bool,
+    /// RRF weight of the exact-anchor memory channel (`recall.rs`): memories
+    /// mentioning one of the entities the question names, ranked by query
+    /// cosine. 0 disables the channel (a byte-identical recall) — useful for
+    /// A/B measurement; otherwise kept on (nc-hay1: at 108k distractors even
+    /// a graph#1 hit loses the fusion to two-channel modest hits, so an
+    /// anchored answer needs a channel that no word in the question can crowd
+    /// out).
+    pub w_anchor: f64,
 }
 
 impl Default for Config {
@@ -224,6 +232,7 @@ impl Default for Config {
             vec_prefilter_n: 10,
             correction_hints: false,
             rel_prefilter: false,
+            w_anchor: 2.5,
         }
     }
 }

@@ -275,7 +275,13 @@ always win.
 The channel set is extensible: two measured experiments are built in but off by
 default (`--set w_tlink=…` temporal neighbours, `--set w_causal=…` why-question
 causal evidence; `--set causal_extract=1` also extracts one conservative
-"because" relation when you pass no relations). The relation-fact seed retriever
+"because" relation when you pass no relations). Two more channels exist but sit
+silent in small stores and only engage once the database passes fifty thousand
+memories: an exact-anchor channel (the memories of the entities the question
+names, ranked against the question — an anchored answer needs a channel no
+common word crowds out), and the semantic beam's admission of a small-degree
+bridge's own facts, since at 108k distractors a hop's relation can rank below
+the bottom of the top-100 relevance KNN. The relation-fact seed retriever
 is also a knob: `eval --set rel_prefilter=on` reads only the relations incident
 to the first 20 query anchors instead of scanning the global relation-vector
 index; it is off by default (see `docs/research/scale.md` for the 108k
