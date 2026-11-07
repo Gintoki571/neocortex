@@ -358,17 +358,7 @@ also render the interval with a computed duration ("3 years 2 months",
   keep the memory on a placeholder entity so nothing is lost. `distinct_from`
   (entity tool, CLI `alias`-family) forces a homonym split; `merge <a> <b>`
   converges them again.
-- Renames join the old and new name: "Harbor was renamed to Lantern" (as text,
-  or as a relation with predicate "renamed to" / "now called" / "formerly
-  called") makes one entity — the old name becomes an alias of the surviving
-  (new) name, old facts move to it, and a "Lantern formerly called Harbor"
-  fact keeps the old name answerable. Hedged ("might rename", "planned for
-  Q3"), negated ("did not rename"), questioned, reverted ("then back to
-  Harbor"), passive ("called by the team"), written-generic (a side written
-  all-lowercase in this text — "the repo", "is now deprecated" — or the
-  word-list nouns "the branch", "the meeting", a file name), bare-first-name,
-  or undated both-facts renames merge nothing. A bare "is now Y" additionally
-  needs Y capitalised/uncased in the text and typed like X.
+- Renames need confirmation; text never merges: "Harbor was renamed to Lantern" in prose only returns a `renamed?` hint naming both entities and the exact call, and stores nothing. Confirm a real rename in a new write with `same_as` on the new name or a "formerly called" relation; then the old name becomes an alias of the surviving (new) name, old facts move to it, and a "Lantern formerly called Harbor" fact answers "what was Lantern called before". Hedged ("might rename", "planned for Q3"), negated ("did not rename"), questioned, reverted ("then back to Harbor"), passive ("called by the team"), written-lowercase-generic ("the repo", "is now deprecated"), bare-first-name or undated both-facts sentences emit no hint; a bare "is now Y" also needs Y capitalised and typed like X to hint. A structured rename (relation "renamed to" / "now called" / "formerly called" or `same_as`) merges; different-type or ambiguous-name structured renames are reported, not merged.
 - Inverse and symmetric phrases: "X reports to Y" is stored once as "Y manages
   X" (or, for "married to", with both ends in storage order) and every side
   renders its own view: `entity` shows the phrase that starts with the profile,
