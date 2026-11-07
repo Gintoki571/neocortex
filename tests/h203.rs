@@ -914,3 +914,185 @@ fn a12_adv6_org_subject_no_cross_leak() {
         out.facts
     );
 }
+
+// ---- Fix round 2 (r2) ----
+
+fn ended_facts(out: &RecallOutput) -> Vec<String> {
+    out.facts
+        .iter()
+        .filter(|f| f.ended)
+        .map(|f| f.fact.clone())
+        .collect()
+}
+
+#[test]
+fn n11_global_fallback_does_not_inject_unrelated_ended_row() {
+    // Only unrelated ended row in DB (Dana/Vim). "what is not idempotent"
+    // names no entity and has no lexical/predicate tie to use/Vim; main
+    // returns no injected fact. The global fallback must not answer.
+    let e = engine();
+    remember(&e, "Dana uses Vim.", |i| {
+        i.entities = vec![person("Dana"), entity("Vim")];
+        i.relations = vec![RelationIn {
+            source: "Dana".into(),
+            predicate: "uses".into(),
+            target: "Vim".into(),
+            exclusive: Some(true),
+            ..Default::default()
+        }];
+        i.valid_from = Some("2024-01-01".into());
+        i.valid_to = Some("2025-01-01".into());
+    });
+    let out = e
+        .recall(&RecallInput {
+            query: "what is not idempotent".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let ended = ended_facts(&out);
+    assert!(
+        !ended
+            .iter()
+            .any(|f| f.contains("Dana") || f.contains("Vim")),
+        "unrelated Dana/Vim must not be injected: {ended:?} facts={:?}",
+        out.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn n12_global_fallback_does_not_inject_unrelated_subject_for_tools() {
+    // No entity named; only Dana/Vim ended. "which tools did we stop using"
+    // must not return Dana's fact (unrelated subject; main returns none).
+    let e = engine();
+    remember(&e, "Dana uses Vim.", |i| {
+        i.entities = vec![person("Dana"), entity("Vim")];
+        i.relations = vec![RelationIn {
+            source: "Dana".into(),
+            predicate: "uses".into(),
+            target: "Vim".into(),
+            exclusive: Some(true),
+            ..Default::default()
+        }];
+        i.valid_from = Some("2024-01-01".into());
+        i.valid_to = Some("2025-01-01".into());
+    });
+    let out = e
+        .recall(&RecallInput {
+            query: "which tools did we stop using".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let ended = ended_facts(&out);
+    assert!(
+        !ended
+            .iter()
+            .any(|f| f.contains("Dana") || f.contains("Vim")),
+        "unrelated Dana/Vim must not be injected: {ended:?} facts={:?}",
+        out.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn n15_bare_first_name_anchors_when_unique_person() {
+    // "Elizabeth" (bare) uniquely identifies Elizabeth Ward.
+    let e = engine();
+    remember(&e, "Elizabeth Ward uses Emacs.", |i| {
+        i.entities = vec![person("Elizabeth Ward"), entity("Emacs")];
+        i.relations = vec![RelationIn {
+            source: "Elizabeth Ward".into(),
+            predicate: "uses".into(),
+            target: "Emacs".into(),
+            exclusive: Some(true),
+            ..Default::default()
+        }];
+        i.valid_from = Some("2024-01-01".into());
+        i.valid_to = Some("2025-01-01".into());
+    });
+    remember(&e, "Elizabeth Ward uses Vim.", |i| {
+        i.entities = vec![person("Elizabeth Ward"), entity("Vim")];
+        i.relations = vec![RelationIn {
+            source: "Elizabeth Ward".into(),
+            predicate: "uses".into(),
+            target: "Vim".into(),
+            exclusive: Some(true),
+            ..Default::default()
+        }];
+        i.valid_from = Some("2025-01-01".into());
+    });
+    remember(&e, "Bo uses Nano.", |i| {
+        i.entities = vec![person("Bo"), entity("Nano")];
+        i.relations = vec![RelationIn {
+            source: "Bo".into(),
+            predicate: "uses".into(),
+            target: "Nano".into(),
+            exclusive: Some(true),
+            ..Default::default()
+        }];
+        i.valid_from = Some("2024-01-01".into());
+        i.valid_to = Some("2025-01-01".into());
+    });
+    let out = e
+        .recall(&RecallInput {
+            query: "what did Elizabeth and Bo stop using".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let ended = ended_facts(&out);
+    assert!(
+        ended.iter().any(|f| f.contains("Emacs")),
+        "Elizabeth (bare, unique) must anchor -> Emacs ended: {ended:?}"
+    );
+    assert!(
+        ended.iter().any(|f| f.contains("Nano")),
+        "Bo must anchor -> Nano ended: {ended:?}"
+    );
+}
+
+#[test]
+fn n15_two_elizabeths_bare_first_name_anchors_nothing() {
+    // Two Elizabeths: bare "Elizabeth" is ambiguous, must not anchor either.
+    let e = engine();
+    for (name, tool) in [("Elizabeth Ward", "Emacs"), ("Elizabeth Moore", "Helix")] {
+        remember(&e, &format!("{name} uses {tool}."), |i| {
+            i.entities = vec![person(name), entity(tool)];
+            i.relations = vec![RelationIn {
+                source: name.into(),
+                predicate: "uses".into(),
+                target: tool.into(),
+                exclusive: Some(true),
+                ..Default::default()
+            }];
+            i.valid_from = Some("2024-01-01".into());
+            i.valid_to = Some("2025-01-01".into());
+        });
+    }
+    remember(&e, "Bo uses Nano.", |i| {
+        i.entities = vec![person("Bo"), entity("Nano")];
+        i.relations = vec![RelationIn {
+            source: "Bo".into(),
+            predicate: "uses".into(),
+            target: "Nano".into(),
+            exclusive: Some(true),
+            ..Default::default()
+        }];
+        i.valid_from = Some("2024-01-01".into());
+        i.valid_to = Some("2025-01-01".into());
+    });
+    let out = e
+        .recall(&RecallInput {
+            query: "what did Elizabeth and Bo stop using".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let ended = ended_facts(&out);
+    assert!(
+        !ended
+            .iter()
+            .any(|f| f.contains("Emacs") || f.contains("Helix")),
+        "ambiguous bare Elizabeth must not anchor either Elizabeth: {ended:?}"
+    );
+    assert!(
+        ended.iter().any(|f| f.contains("Nano")),
+        "Bo still anchored -> Nano ended: {ended:?}"
+    );
+}
