@@ -1216,6 +1216,7 @@ pub(crate) fn relation_knn(db: &Db, query_vec: &[f32]) -> Result<Vec<(i64, f32)>
         })?
         .collect::<rusqlite::Result<_>>()?)
 }
+
 /// Edges taken from one entity in the semantic beam.
 const SEM_EDGES: usize = 6;
 /// Most relations an entity may carry before the semantic beam stops
@@ -2576,6 +2577,49 @@ pub fn aggregate(engine: &Engine, input: &AggregateInput) -> Result<AggregateOut
         memories,
         truncated: total > limit,
     })
+}
+
+#[cfg(test)]
+mod relation_knn_tests {
+    use crate::db::Db;
+    use rusqlite::params;
+
+    /// recall's relation-fact seeds are the first 10 hits of the shared
+    /// SEM_FACTS scan; that equals a k=10 query only while vec0's top-k is
+    /// prefix-stable, exact distance ties included.
+    #[test]
+    fn the_first_ten_shared_hits_are_a_k10_query() {
+        let db = Db::open_in_memory().unwrap();
+        for id in 1..=300i64 {
+            let mut v = vec![0.0f32; 768];
+            v[0] = 1.0;
+            v[1 + (id % 7) as usize] = (id % 5) as f32 * 0.1;
+            db.sql()
+                .execute(
+                    "INSERT INTO relations_vec(rowid,embedding) VALUES (?1,?2)",
+                    params![id, db.vec_blob(&v)],
+                )
+                .unwrap();
+        }
+        let mut query = vec![0.0f32; 768];
+        query[0] = 1.0;
+        query[2] = 0.3;
+        let shared = super::relation_knn(&db, &query).unwrap();
+        let k10: Vec<(i64, f32)> = db
+            .sql()
+            .prepare(&format!(
+                "SELECT rowid,1-distance FROM relations_vec
+                 WHERE embedding MATCH {} AND k=10 ORDER BY distance",
+                db.vec_sql("?1")
+            ))
+            .unwrap()
+            .query_map([db.vec_blob(&query)], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(shared.len(), super::SEM_FACTS);
+        assert_eq!(shared[..10], k10[..]);
+    }
 }
 
 #[cfg(test)]
