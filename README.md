@@ -364,9 +364,11 @@ also render the interval with a computed duration ("3 years 2 months",
   (new) name, old facts move to it, and a "Lantern formerly called Harbor"
   fact keeps the old name answerable. Hedged ("might rename", "planned for
   Q3"), negated ("did not rename"), questioned, reverted ("then back to
-  Harbor"), passive ("called by the team"), generic ("the branch", "the
-  meeting", a file name), bare-first-name, or undated both-facts renames
-  merge nothing.
+  Harbor"), passive ("called by the team"), written-generic (a side written
+  all-lowercase in this text — "the repo", "is now deprecated" — or the
+  word-list nouns "the branch", "the meeting", a file name), bare-first-name,
+  or undated both-facts renames merge nothing. A bare "is now Y" additionally
+  needs Y capitalised/uncased in the text and typed like X.
 - Inverse and symmetric phrases: "X reports to Y" is stored once as "Y manages
   X" (or, for "married to", with both ends in storage order) and every side
   renders its own view: `entity` shows the phrase that starts with the profile,

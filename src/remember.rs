@@ -497,7 +497,10 @@ const RENAME_NEW_FIRST: &[&str] = &[
 
 /// True when the sentence words just before the rename cue hedge or negate
 /// it ("might rename", "was not renamed"), or the words after the cue plan
-/// it ("planned for Q3"): such statements merge nothing.
+/// it ("planned for Q3"): such statements merge nothing. The caller limits
+/// the post-cue slice to the cue's clause (stopping at ",", ";" or " and "
+/// / " but "), so a hedge in a following clause ("... and we may expand it
+/// later") does not block a true rename in the first clause.
 fn rename_blocked(words: &[String], cue_pos: usize) -> bool {
     let from = cue_pos.saturating_sub(5);
     let hedge = |w: &String| {
@@ -552,6 +555,232 @@ fn rename_is_generic(display: &str, norm: &str) -> bool {
     }
     norm.split_whitespace()
         .all(|t| RENAME_GENERIC_NOUNS.contains(&t))
+}
+
+/// Determiner / possessive words for the written-form guard: a name written
+/// with one still carries the determiner, so "the repo" is a common-noun
+/// phrase even when the entity display is capitalised.
+const RENAME_DETERMINERS: &[&str] = &[
+    "the", "a", "an", "this", "that", "our", "my", "his", "her", "their", "its", "your",
+];
+
+/// Split raw text into alphanumeric surface tokens with the case preserved:
+/// returns `(folded, surface, gaps)` where `gaps[i]` is the raw text between
+/// token `i-1` and token `i` (gaps[0] is the leading gap). Folded tokens
+/// align with `text::fold` on the same text (hyphen etc. split the same way).
+fn raw_surface_tokens(raw: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let chars: Vec<char> = raw.chars().collect();
+    let n = chars.len();
+    let mut folded = Vec::new();
+    let mut surface = Vec::new();
+    let mut gaps = Vec::new();
+    let mut gap = String::new();
+    let mut i = 0;
+    while i < n && !chars[i].is_alphanumeric() {
+        gap.push(chars[i]);
+        i += 1;
+    }
+    while i < n {
+        let mut surf = String::new();
+        let mut j = i;
+        while j < n {
+            let c = chars[j];
+            if c.is_alphanumeric()
+                || ((c == '\'' || c == '\u{2019}' || c == '\u{02bc}')
+                    && j > 0
+                    && chars[j - 1].is_alphanumeric()
+                    && j + 1 < n
+                    && chars[j + 1].is_alphanumeric())
+            {
+                surf.push(c);
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        let fold = text::fold(&surf);
+        if !surf.is_empty() && !fold.is_empty() {
+            folded.push(fold);
+            surface.push(surf);
+            gaps.push(std::mem::take(&mut gap));
+        }
+        let mut g = String::new();
+        while j < n && !chars[j].is_alphanumeric() {
+            // Inner apostrophes belong to the previous token, not the gap.
+            let c = chars[j];
+            if (c == '\'' || c == '\u{2019}' || c == '\u{02bc}')
+                && j > 0
+                && chars[j - 1].is_alphanumeric()
+                && j + 1 < n
+                && chars[j + 1].is_alphanumeric()
+            {
+                break;
+            }
+            g.push(c);
+            j += 1;
+        }
+        gap = g;
+        i = j;
+    }
+    (folded, surface, gaps)
+}
+
+/// `(has_cased, all_lower, has_upper)` for one surface token. Uncased scripts
+/// (CJK, etc.) report `has_cased == false`.
+fn surface_case(surface: &str) -> (bool, bool, bool) {
+    let mut has_cased = false;
+    let mut all_lower = true;
+    let mut has_upper = false;
+    for c in surface.chars() {
+        if c.is_lowercase() {
+            has_cased = true;
+        } else if c.is_uppercase() {
+            has_cased = true;
+            all_lower = false;
+            has_upper = true;
+        }
+    }
+    (has_cased, has_cased && all_lower, has_upper)
+}
+
+/// True when `name` as WRITTEN in this write's text is a common noun rather
+/// than a proper name, judged by the occurrence next to the rename cue (not
+/// by a word list): all-lowercase in a cased script, except at the sentence
+/// start or hyphen-joined, is generic ("the repo", "now deprecated"); a
+/// determiner-following single capitalised word that is also written
+/// lowercase elsewhere is generic too. The closed `RENAME_GENERIC_NOUNS`
+/// list is kept only as an extra safety net; this is the main guard. Uncased
+/// scripts (N03) and any uppercase are never generic here.
+fn name_written_generic(content: &str, name: &str) -> bool {
+    let name_tokens: Vec<String> = text::fold(name)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if name_tokens.is_empty() || name_tokens.len() > 16 {
+        return false;
+    }
+    let is_single = name_tokens.len() == 1;
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in content.chars() {
+        if matches!(ch, '.' | ';' | '!' | '?' | '\n') {
+            sentences.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    sentences.push(current);
+    let cue_words = [
+        "renamed",
+        "rename",
+        "called",
+        "formerly",
+        "previously",
+        "changed",
+        "known",
+        "now",
+    ];
+    let mut per_sentence: Vec<(Vec<String>, Vec<String>, Vec<String>)> = Vec::new();
+    let mut cue_sentences: Vec<usize> = Vec::new();
+    for (idx, s) in sentences.iter().enumerate() {
+        let (folded, surface, gaps) = raw_surface_tokens(s);
+        if folded.iter().any(|w| cue_words.contains(&w.as_str())) {
+            cue_sentences.push(idx);
+        }
+        per_sentence.push((folded, surface, gaps));
+    }
+    let all: Vec<usize> = (0..sentences.len()).collect();
+    let consider: &[usize] = if cue_sentences.is_empty() {
+        &all
+    } else {
+        &cue_sentences
+    };
+    for &si in consider {
+        let (folded, surface, gaps) = &per_sentence[si];
+        if folded.len() < name_tokens.len() {
+            continue;
+        }
+        // (start, all_lower, has_upper, is_initial, hyphen, pred_det)
+        let mut occs: Vec<(usize, bool, bool, bool, bool, bool)> = Vec::new();
+        for s in 0..=folded.len() - name_tokens.len() {
+            if folded[s..s + name_tokens.len()] != name_tokens[..] {
+                continue;
+            }
+            let mut has_cased_any = false;
+            let mut all_lower_span = true;
+            let mut has_upper_span = false;
+            for k in 0..name_tokens.len() {
+                let (has_cased, all_lower_tok, has_upper_tok) = surface_case(&surface[s + k]);
+                if has_cased {
+                    has_cased_any = true;
+                }
+                if has_cased && !all_lower_tok {
+                    all_lower_span = false;
+                }
+                if has_upper_tok {
+                    has_upper_span = true;
+                }
+            }
+            let all_lower = has_cased_any && all_lower_span;
+            let is_initial = s == 0;
+            let mut hyphen = false;
+            if s + name_tokens.len() < gaps.len() && gaps[s + name_tokens.len()].contains('-') {
+                hyphen = true;
+            }
+            for k in 1..name_tokens.len() {
+                if gaps[s + k].contains('-') {
+                    hyphen = true;
+                }
+            }
+            let pred_det = s > 0 && RENAME_DETERMINERS.contains(&folded[s - 1].as_str());
+            occs.push((s, all_lower, has_upper_span, is_initial, hyphen, pred_det));
+        }
+        for (idx, (_, all_lower, _, is_initial, hyphen, _)) in occs.iter().enumerate() {
+            let _ = idx;
+            if *all_lower && !*is_initial && !*hyphen {
+                return true;
+            }
+        }
+        if is_single {
+            for (idx, (_, _, has_upper, _, _, pred_det)) in occs.iter().enumerate() {
+                if *pred_det && *has_upper {
+                    let lower_else = occs
+                        .iter()
+                        .enumerate()
+                        .any(|(j, (_, low2, _, _, _, _))| j != idx && *low2);
+                    if lower_else {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Clause end (word index, exclusive) after `cue_pos`: the next clause starts
+/// at a `,`/`;` gap or at an "and"/"but" token, so the hedge scan stops
+/// there. `folded` and `gaps` must come from `raw_surface_tokens`.
+fn clause_end_raw(cue_pos: usize, folded: &[String], gaps: &[String]) -> usize {
+    for (i, w) in folded.iter().enumerate().skip(cue_pos + 1) {
+        if w == "and" || w == "but" {
+            return i;
+        }
+        if gaps[i].contains(',') || gaps[i].contains(';') {
+            return i;
+        }
+    }
+    folded.len()
+}
+
+/// Same clause idea on folded words alone (no raw gaps): stop at "and"/"but".
+fn clause_end_words(words: &[String], cue_pos: usize) -> usize {
+    for (i, w) in words.iter().enumerate().skip(cue_pos + 1) {
+        if w == "and" || w == "but" {
+            return i;
+        }
+    }
+    words.len()
 }
 
 /// True when the rename sentence states a date that can order a rename
@@ -610,8 +839,10 @@ fn shared_first_name_people(
     Ok(out)
 }
 
-/// One rename candidate `(old name, new name)` as stated in a write.
-type RenameCandidate = (String, String);
+/// One rename candidate `(old name, new name, is_bare_now)` as stated in a
+/// write. `is_bare_now` marks the weakest cue ("X is now Y" / "(now Y)"):
+/// those pairs need the stricter guard in `apply_rename`.
+type RenameCandidate = (String, String, bool);
 
 /// Rename pairs stated in the write, from its text or its relations.
 /// Returns display names; the caller resolves them to entity ids and
@@ -689,6 +920,10 @@ fn rename_pairs(
         }) {
             continue;
         }
+        // Surface tokens for the clause-limited hedge scan: when they align
+        // with `words`, the post-cue scan stops at ",", ";" or "and"/"but".
+        let (surf_folded, _surf, gaps) = raw_surface_tokens(&sentence);
+        let aligned = surf_folded == words;
         // (candidate index, start, len) occurrences in this sentence.
         let mut occ: Vec<(usize, usize, usize)> = Vec::new();
         for (ci, wseq) in word_of.iter().enumerate() {
@@ -701,7 +936,8 @@ fn rename_pairs(
                 }
             }
         }
-        let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
+        // (candidate index, start, len, is_bare_now, cue) for each pair.
+        let mut pairs: Vec<(usize, usize, usize, bool)> = Vec::new();
         let contains = |gap: &[String], cue: &[&str]| -> Option<usize> {
             if cue.is_empty() || gap.len() < cue.len() {
                 return None;
@@ -712,10 +948,20 @@ fn rename_pairs(
         // Old-first gaps ("Harbor was renamed to Lantern"): the cue sits
         // between the old occurrence and the new one, and must end
         // immediately before the new name so "now called by the team"
-        // (agent after the cue) does not count as the rename target.
+        // (agent after the cue) does not count as the rename target. No
+        // other candidate occurrence may sit between old and new: that
+        // would be the other rename's name ("Harbor was renamed to Lantern
+        // after Atlas was renamed to Beacon" must not also emit
+        // Lantern -> Beacon).
         for &(oi, os, ol) in &occ {
             for &(ni, ns, _) in &occ {
                 if ni == oi || ns <= os + ol {
+                    continue;
+                }
+                if occ
+                    .iter()
+                    .any(|(ci, s, _)| *ci != oi && *ci != ni && *s >= os + ol && *s < ns)
+                {
                     continue;
                 }
                 let gap = &words[os + ol..ns];
@@ -723,6 +969,7 @@ fn rename_pairs(
                     continue;
                 }
                 let mut cue_at: Option<usize> = None;
+                let mut bare_now_at = false;
                 for cue in [
                     &["renamed", "to"][..],
                     &["rename", "to"][..],
@@ -755,13 +1002,14 @@ fn rename_pairs(
                 if cue_at.is_none() && gap.last().is_some_and(|w| w == "now") {
                     // "Harbor is now Lantern" / "Atlas (now Beacon)": a bare
                     // "now" immediately before the new name (with "is" for
-                    // the non-parenthetical form).
+                    // the non-parenthetical form). This is the weakest cue.
                     if gap.len() == 1 || gap.iter().any(|w| w == "is") {
                         cue_at = Some(os + ol + gap.len() - 1);
+                        bare_now_at = true;
                     }
                 }
                 if let Some(cue) = cue_at {
-                    pairs.push((oi, ni, cue));
+                    pairs.push((oi, ni, cue, bare_now_at));
                 }
             }
             // Bare-verb order ("we renamed Harbor to Lantern"): the cue
@@ -773,9 +1021,15 @@ fn rename_pairs(
                     if ni == oi || ns <= os + ol {
                         continue;
                     }
+                    if occ
+                        .iter()
+                        .any(|(ci, s, _)| *ci != oi && *ci != ni && *s >= os + ol && *s < ns)
+                    {
+                        continue;
+                    }
                     let gap = &words[os + ol..ns];
                     if gap.len() <= 4 && gap.last().is_some_and(|w| w == "to") {
-                        pairs.push((oi, ni, cue_rel));
+                        pairs.push((oi, ni, cue_rel, false));
                     }
                 }
             }
@@ -792,7 +1046,7 @@ fn rename_pairs(
                         && *s <= os + ol + 4
                         && words[os + ol..*s].last().is_some_and(|w| w == "to")
                 }) {
-                    pairs.push((oi, ni, c));
+                    pairs.push((oi, ni, c, false));
                 }
             }
         }
@@ -809,7 +1063,7 @@ fn rename_pairs(
             let old = occ.iter().find(|(_, s, _)| *s >= c + 2 && *s < c + 5);
             if let (Some(&(ni, _, _)), Some(&(oi, _, _))) = (new, old) {
                 if ni != oi {
-                    pairs.push((oi, ni, c));
+                    pairs.push((oi, ni, c, false));
                 }
             }
         }
@@ -832,15 +1086,20 @@ fn rename_pairs(
                     .filter(|(ci, _, _)| *ci != oi)
                     .min_by_key(|(_, s, _)| s.abs_diff(os));
                 if let Some(&(ni, _, _)) = new {
-                    pairs.push((oi, ni, i));
+                    pairs.push((oi, ni, i, false));
                 }
             }
         }
-        for (oi, ni, cue) in pairs {
+        for (oi, ni, cue, bare_now) in pairs {
             if oi == ni || (oi, ni) == (ni, oi) {
                 continue;
             }
-            if rename_blocked(&words, cue) {
+            let clause_end = if aligned {
+                clause_end_raw(cue, &surf_folded, &gaps)
+            } else {
+                clause_end_words(&words, cue)
+            };
+            if rename_blocked(&words[..clause_end.min(words.len())], cue) {
                 continue;
             }
             let key = (text::norm_name(&names[oi]), text::norm_name(&names[ni]));
@@ -851,7 +1110,7 @@ fn rename_pairs(
             if seen.contains(&(key.1.clone(), key.0.clone())) {
                 continue;
             }
-            out.push((names[oi].clone(), names[ni].clone()));
+            out.push((names[oi].clone(), names[ni].clone(), bare_now));
         }
     }
     // Relations with a rename predicate state the pair directly.
@@ -887,7 +1146,10 @@ fn rename_pairs(
                 .iter()
                 .position(|w| w == cue_words.first().unwrap_or(&""))
         };
-        let blocked = cue_pos.is_some_and(|c| rename_blocked(&content_words, c));
+        let blocked = cue_pos.is_some_and(|c| {
+            let end = clause_end_words(&content_words, c);
+            rename_blocked(&content_words[..end.min(content_words.len())], c)
+        });
         if blocked {
             continue;
         }
@@ -898,7 +1160,7 @@ fn rename_pairs(
         if seen.contains(&(key.1.clone(), key.0.clone())) {
             continue;
         }
-        out.push((old, new));
+        out.push((old, new, false));
     }
     out
 }
@@ -920,6 +1182,7 @@ fn apply_rename(
     now: i64,
     hints: &mut Vec<String>,
     invalidated: &mut Vec<i64>,
+    bare_now: bool,
 ) -> Result<()> {
     let norm_old = text::norm_name(old_name);
     let norm_new = text::norm_name(new_name);
@@ -962,7 +1225,8 @@ fn apply_rename(
         return Ok(());
     }
     // A common-noun phrase or file name never joins two proper names
-    // ("the branch", "the meeting", "README.md" merge nothing).
+    // ("the branch", "the meeting", "README.md" merge nothing). The closed
+    // list is a safety net only; the written-form check below is the guard.
     if rename_is_generic(&old_display, &norm_old) || rename_is_generic(&new_display, &norm_new) {
         let which = if rename_is_generic(&old_display, &norm_old) {
             &old_display
@@ -973,6 +1237,55 @@ fn apply_rename(
             "rename skipped: \"{which}\" is a generic noun or file name, not a proper name"
         ));
         return Ok(());
+    }
+    // Written-form guard (main guard): a side written all-lowercase in this
+    // text (not at the sentence start, not hyphen-joined) is a common noun
+    // ("the repo", "is now deprecated"), even off the list. This blocks
+    // "The repo was renamed to Helios" and "is now deprecated" while keeping
+    // "The Zürich Hub project..." (capitalised/uncased) merging.
+    let written_old = name_written_generic(content, old_name);
+    let written_new = name_written_generic(content, new_name);
+    if written_old || written_new {
+        let which = if written_old {
+            &old_display
+        } else {
+            &new_display
+        };
+        hints.push(format!(
+            "rename skipped: \"{which}\" is written as a common noun, not a proper name"
+        ));
+        return Ok(());
+    }
+    // Bare "is now X" is the weakest cue: it merges only when the new name
+    // is capitalised/uncased in the text (a lowercase new name is already
+    // caught above) and is typed the same as the old name. A state word
+    // ("is now Deprecated") arrives untyped and returns candidates.
+    if bare_now {
+        let types_match = !old_type.is_empty()
+            && !new_type.is_empty()
+            && old_type.eq_ignore_ascii_case(&new_type);
+        if !types_match {
+            let positions: Vec<usize> = resolutions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| text::norm_name(&r.name) == norm_new)
+                .map(|(i, _)| i)
+                .collect();
+            for pos in positions {
+                resolutions[pos].candidates = vec![crate::engine::EntityCandidate {
+                    id: old_id,
+                    name: old_display.clone(),
+                    kind: old_type.clone(),
+                    description: String::new(),
+                    score: None,
+                }];
+                resolutions[pos].status = "ambiguous".into();
+            }
+            hints.push(format!(
+                "rename not applied: bare \"is now\" target \"{new_display}\" needs the same type as \"{old_display}\" (got \"{new_type}\" vs \"{old_type}\"); use a strong cue or merge it explicitly with neocortex merge"
+            ));
+            return Ok(());
+        }
     }
     // Several entities under the old name: merge nothing, offer candidates.
     let named: Vec<i64> = {
@@ -3218,7 +3531,7 @@ fn write_prepared(
     // the survivor, so exclusive slots end the stale values by valid_from.
     let mut rename_hints: Vec<String> = Vec::new();
     if duplicate_of.is_none() {
-        for (old_name, new_name) in rename_pairs(&content, &entities, &relations) {
+        for (old_name, new_name, bare_now) in rename_pairs(&content, &entities, &relations) {
             let norm_old = text::norm_name(&old_name);
             let seen_entity = entities
                 .iter()
@@ -3244,6 +3557,7 @@ fn write_prepared(
                 now,
                 &mut rename_hints,
                 &mut invalidated,
+                bare_now,
             )?;
         }
     }

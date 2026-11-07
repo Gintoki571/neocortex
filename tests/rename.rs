@@ -1090,3 +1090,541 @@ fn merge_command_moves_subj_and_ends_stale_exclusive_fact() {
     // first stays referenced for id readability.
     assert!(first.id > 0);
 }
+
+fn untyped(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        ..Default::default()
+    }
+}
+
+// --- Fix round 2: written-form generic guard (verifier G/S/X) ---
+
+/// Run one seed + one rename candidate and return the engine.
+fn seed_rename(
+    seed_subject: &str,
+    seed_kind: &str,
+    seed_pred: &str,
+    seed_object: &str,
+    seed_okind: &str,
+    cand_content: &str,
+    cand_entities: Vec<EntityIn>,
+) -> Engine {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        &format!("{seed_subject} {seed_pred} {seed_object}."),
+        vec![
+            typed(seed_subject, seed_kind),
+            typed(seed_object, seed_okind),
+        ],
+        vec![rel(seed_subject, seed_pred, seed_object, false)],
+        "2026-01-05",
+    );
+    remember_at(&engine, cand_content, cand_entities, vec![], "2026-06-01");
+    engine
+}
+
+fn assert_no_merge(engine: &Engine, a: &str, b: &str) {
+    assert_ne!(
+        card_id(engine, a),
+        card_id(engine, b),
+        "{a} and {b} must not have merged"
+    );
+}
+
+fn assert_merged(engine: &Engine, a: &str, b: &str) {
+    assert_eq!(
+        card_id(engine, a),
+        card_id(engine, b),
+        "{a} and {b} should be one entity"
+    );
+}
+
+#[test]
+fn g01_repo_to_helios_merges_nothing() {
+    let e = seed_rename(
+        "Repo",
+        "repo",
+        "tracks",
+        "Commits",
+        "list",
+        "The repo was renamed to Helios.",
+        vec![typed("Repo", "repo"), untyped("Helios")],
+    );
+    assert_no_merge(&e, "Repo", "Helios");
+}
+
+#[test]
+fn g02_channel_now_called_general_merges_nothing() {
+    let e = seed_rename(
+        "Channel",
+        "channel",
+        "carries",
+        "Alerts",
+        "list",
+        "The channel is now called General.",
+        vec![typed("Channel", "channel"), untyped("General")],
+    );
+    assert_no_merge(&e, "Channel", "General");
+}
+
+#[test]
+fn g03_doc_to_playbook_merges_nothing() {
+    let e = seed_rename(
+        "Doc",
+        "document",
+        "lists",
+        "Steps",
+        "list",
+        "The doc was renamed to Playbook.",
+        vec![typed("Doc", "document"), untyped("Playbook")],
+    );
+    assert_no_merge(&e, "Doc", "Playbook");
+}
+
+#[test]
+fn g04_ticket_to_aurora_merges_nothing() {
+    let e = seed_rename(
+        "Ticket",
+        "issue",
+        "tracks",
+        "Bug 42",
+        "issue",
+        "The ticket was renamed to Aurora.",
+        vec![typed("Ticket", "issue"), untyped("Aurora")],
+    );
+    assert_no_merge(&e, "Ticket", "Aurora");
+}
+
+#[test]
+fn g05_sprint_to_cycle7_merges_nothing() {
+    let e = seed_rename(
+        "Sprint",
+        "period",
+        "ends",
+        "May",
+        "date",
+        "The sprint was renamed to Cycle 7.",
+        vec![typed("Sprint", "period"), untyped("Cycle 7")],
+    );
+    assert_no_merge(&e, "Sprint", "Cycle 7");
+}
+
+#[test]
+fn g06_board_to_roadmap_merges_nothing() {
+    let e = seed_rename(
+        "Board",
+        "doc",
+        "lists",
+        "Cards",
+        "list",
+        "The board was renamed to Roadmap.",
+        vec![typed("Board", "doc"), untyped("Roadmap")],
+    );
+    assert_no_merge(&e, "Board", "Roadmap");
+}
+
+#[test]
+fn g07_server_to_atlas_merges_nothing() {
+    let e = seed_rename(
+        "Server",
+        "machine",
+        "runs",
+        "Debian",
+        "os",
+        "The server was renamed to Atlas.",
+        vec![typed("Server", "machine"), untyped("Atlas")],
+    );
+    assert_no_merge(&e, "Server", "Atlas");
+}
+
+#[test]
+fn g08_cluster_to_vega_merges_nothing() {
+    let e = seed_rename(
+        "Cluster",
+        "infra",
+        "runs",
+        "Kubernetes",
+        "tool",
+        "The cluster was renamed to Vega.",
+        vec![typed("Cluster", "infra"), untyped("Vega")],
+    );
+    assert_no_merge(&e, "Cluster", "Vega");
+}
+
+#[test]
+fn g09_app_to_aurora_merges_nothing() {
+    let e = seed_rename(
+        "App",
+        "tool",
+        "uses",
+        "React",
+        "tool",
+        "The app was renamed to Aurora.",
+        vec![typed("App", "tool"), untyped("Aurora")],
+    );
+    assert_no_merge(&e, "App", "Aurora");
+}
+
+#[test]
+fn g10_bucket_to_archive_merges_nothing() {
+    let e = seed_rename(
+        "Bucket",
+        "storage",
+        "holds",
+        "Backups",
+        "list",
+        "The bucket was renamed to Archive.",
+        vec![typed("Bucket", "storage"), untyped("Archive")],
+    );
+    assert_no_merge(&e, "Bucket", "Archive");
+}
+
+#[test]
+fn g11_repo_to_main_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Repo tracks Commits.",
+        vec![typed("Repo", "repo"), typed("Commits", "list")],
+        vec![rel("Repo", "tracks", "Commits", false)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "main tracks Release.",
+        vec![typed("main", "branch"), typed("Release", "branch")],
+        vec![rel("main", "tracks", "Release", false)],
+        "2026-01-06",
+    );
+    remember_at(
+        &engine,
+        "The repo was renamed to main.",
+        vec![untyped("Repo"), untyped("main")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_no_merge(&engine, "Repo", "main");
+}
+
+#[test]
+fn g12_channel_now_general_merges_nothing() {
+    let e = seed_rename(
+        "Channel",
+        "channel",
+        "carries",
+        "Alerts",
+        "list",
+        "The channel is now general.",
+        vec![untyped("Channel"), untyped("general")],
+    );
+    assert_no_merge(&e, "Channel", "general");
+}
+
+#[test]
+fn s01_stable_merges_nothing() {
+    let e = seed_rename(
+        "Harbor",
+        "project",
+        "runs on",
+        "Python 3.11",
+        "language",
+        "Harbor is now stable.",
+        vec![project("Harbor"), untyped("Stable")],
+    );
+    assert_no_merge(&e, "Harbor", "Stable");
+}
+
+#[test]
+fn s02_deprecated_merges_nothing() {
+    let e = seed_rename(
+        "Harbor",
+        "project",
+        "runs on",
+        "Python 3.11",
+        "language",
+        "Harbor is now deprecated.",
+        vec![project("Harbor"), untyped("Deprecated")],
+    );
+    assert_no_merge(&e, "Harbor", "Deprecated");
+}
+
+#[test]
+fn s03_busy_merges_nothing() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Ana Silva works at Acme.",
+        vec![person("Ana Silva"), typed("Acme", "org")],
+        vec![rel("Ana Silva", "works at", "Acme", false)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Ana Silva is now busy.",
+        vec![person("Ana Silva"), untyped("Busy")],
+        vec![],
+        "2026-06-01",
+    );
+    assert_no_merge(&engine, "Ana Silva", "Busy");
+}
+
+#[test]
+fn s04_public_merges_nothing() {
+    let e = seed_rename(
+        "Atlas",
+        "project",
+        "uses",
+        "npm",
+        "tool",
+        "Atlas is now public.",
+        vec![project("Atlas"), untyped("Public")],
+    );
+    assert_no_merge(&e, "Atlas", "Public");
+}
+
+#[test]
+fn s05_archived_merges_nothing() {
+    let e = seed_rename(
+        "Lantern",
+        "project",
+        "runs on",
+        "Python 3.11",
+        "language",
+        "Lantern is now archived.",
+        vec![project("Lantern"), untyped("Archived")],
+    );
+    assert_no_merge(&e, "Lantern", "Archived");
+}
+
+#[test]
+fn s06_in_berlin_merges_nothing() {
+    let e = seed_rename(
+        "Harbor",
+        "project",
+        "runs on",
+        "Python 3.11",
+        "language",
+        "Harbor is now in Berlin.",
+        vec![project("Harbor"), typed("Berlin", "city")],
+    );
+    assert_no_merge(&e, "Harbor", "Berlin");
+}
+
+#[test]
+fn s07_now_based_merges_nothing() {
+    let e = seed_rename(
+        "Atlas",
+        "project",
+        "uses",
+        "npm",
+        "tool",
+        "Atlas (now based in Berlin) runs the pipeline.",
+        vec![project("Atlas"), typed("Berlin", "city")],
+    );
+    assert_no_merge(&e, "Atlas", "Berlin");
+}
+
+#[test]
+fn x01_state_word_does_not_end_exclusive_fact() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Channel carries Alerts.",
+        vec![typed("Channel", "channel"), typed("Alerts", "list")],
+        vec![rel("Channel", "carries", "Alerts", true)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "The channel is now general.",
+        vec![untyped("Channel"), untyped("general")],
+        vec![],
+        "2026-06-01",
+    );
+    remember_at(
+        &engine,
+        "General carries Pages.",
+        vec![untyped("General"), typed("Pages", "list")],
+        vec![rel("General", "carries", "Pages", true)],
+        "2026-07-01",
+    );
+    assert_no_merge(&engine, "Channel", "General");
+    let ch = engine.entity("Channel", 20).unwrap();
+    assert!(
+        ch.current_facts.iter().any(|f| f.fact.contains("Alerts")),
+        "Channel Alerts should stay live, got {:?}",
+        ch.current_facts
+    );
+    let gen = engine.entity("General", 20).unwrap();
+    assert!(
+        gen.current_facts.iter().any(|f| f.fact.contains("Pages")),
+        "General Pages should be live, got {:?}",
+        gen.current_facts
+    );
+}
+
+#[test]
+fn l01_true_plus_generic_second_cue() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Harbor runs on Python 3.11.",
+        vec![project("Harbor"), typed("Python 3.11", "language")],
+        vec![rel("Harbor", "runs", "Python 3.11", true)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Team owns Backlog.",
+        vec![typed("Team", "team"), typed("Backlog", "list")],
+        vec![rel("Team", "owns", "Backlog", false)],
+        "2026-01-06",
+    );
+    remember_at(
+        &engine,
+        "Harbor was renamed to Lantern and the team is now called Platform.",
+        vec![
+            project("Harbor"),
+            project("Lantern"),
+            typed("Team", "team"),
+            typed("Platform", "team"),
+        ],
+        vec![],
+        "2026-06-01",
+    );
+    assert_merged(&engine, "Harbor", "Lantern");
+    assert_no_merge(&engine, "Team", "Platform");
+}
+
+#[test]
+fn l02_two_true_renames_both_merge() {
+    let engine = new_engine();
+    remember_at(
+        &engine,
+        "Harbor runs on Python 3.11.",
+        vec![project("Harbor"), typed("Python 3.11", "language")],
+        vec![rel("Harbor", "runs", "Python 3.11", true)],
+        "2026-01-05",
+    );
+    remember_at(
+        &engine,
+        "Atlas uses npm.",
+        vec![project("Atlas"), typed("npm", "tool")],
+        vec![rel("Atlas", "uses", "npm", true)],
+        "2026-01-06",
+    );
+    remember_at(
+        &engine,
+        "Harbor was renamed to Lantern after Atlas was renamed to Beacon.",
+        vec![
+            project("Harbor"),
+            project("Lantern"),
+            project("Atlas"),
+            project("Beacon"),
+        ],
+        vec![],
+        "2026-06-01",
+    );
+    assert_merged(&engine, "Harbor", "Lantern");
+    assert_merged(&engine, "Atlas", "Beacon");
+}
+
+#[test]
+fn l03_deep_clause_merges() {
+    let e = seed_rename(
+        "Harbor",
+        "project",
+        "runs on",
+        "Python 3.11",
+        "language",
+        "After the long migration the Harbor ingest project was renamed to Lantern.",
+        vec![project("Harbor"), project("Lantern")],
+    );
+    assert_merged(&e, "Harbor", "Lantern");
+}
+
+#[test]
+fn n01_zurich_hub_merges() {
+    let e = seed_rename(
+        "Zürich Hub",
+        "project",
+        "runs on",
+        "Python 3.11",
+        "language",
+        "The Zürich Hub project was renamed to Helvetia.",
+        vec![typed("Zürich Hub", "project"), typed("Helvetia", "project")],
+    );
+    assert_merged(&e, "Zürich Hub", "Helvetia");
+}
+
+#[test]
+fn n02_sao_paulo_merges() {
+    let e = seed_rename(
+        "São Paulo Team",
+        "team",
+        "owns",
+        "Backlog",
+        "list",
+        "The São Paulo Team was renamed to Latam Team.",
+        vec![typed("São Paulo Team", "team"), typed("Latam Team", "team")],
+    );
+    assert_merged(&e, "São Paulo Team", "Latam Team");
+}
+
+#[test]
+fn n03_cjk_merges() {
+    let e = seed_rename(
+        "東京",
+        "project",
+        "uses",
+        "npm",
+        "tool",
+        "東京 is now Tokyo.",
+        vec![typed("東京", "project"), typed("Tokyo", "project")],
+    );
+    assert_merged(&e, "東京", "Tokyo");
+}
+
+#[test]
+fn m01_lower_old_upper_new_merges() {
+    let e = seed_rename(
+        "harbor",
+        "project",
+        "runs on",
+        "Python 3.11",
+        "language",
+        "harbor is now LANTERN.",
+        vec![typed("harbor", "project"), typed("LANTERN", "project")],
+    );
+    assert_merged(&e, "harbor", "LANTERN");
+}
+
+#[test]
+fn m02_upper_sentence_merges() {
+    let e = seed_rename(
+        "Harbor",
+        "project",
+        "runs on",
+        "Python 3.11",
+        "language",
+        "HARBOR WAS RENAMED TO LANTERN.",
+        vec![project("Harbor"), typed("lantern", "project")],
+    );
+    assert_merged(&e, "Harbor", "lantern");
+}
+
+#[test]
+fn and_hedge_does_not_block_true_rename() {
+    let e = seed_rename(
+        "Harbor",
+        "project",
+        "runs on",
+        "Python 3.11",
+        "language",
+        "Harbor was renamed to Lantern and we may expand it later.",
+        vec![project("Harbor"), project("Lantern")],
+    );
+    assert_merged(&e, "Harbor", "Lantern");
+}

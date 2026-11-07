@@ -110,10 +110,13 @@ Store something when it will still matter next week:
   and a "Lantern formerly called Harbor" fact keeps the old name answerable.
   A hedged ("might rename", "plan to rename", "planned for Q3"), negated
   ("did not rename"), questioned ("Was X renamed?"), reverted ("then back
-  to Harbor"), passive ("called by the team"), generic ("the branch", "the
-  meeting", a file name), bare-first-name, or undated both-facts rename
-  merges nothing, so write it as a plan instead and merge by hand when it
-  happens. "X is now Y", "Y (now Z)" and "Y (renamed from X)" also merge.
+  to Harbor"), passive ("called by the team"), written-generic (a side
+  written all-lowercase — "the repo", "is now deprecated" — or the word-list
+  nouns "the branch", "the meeting", a file name), bare-first-name, or
+  undated both-facts rename merges nothing, so write it as a plan instead and
+  merge by hand when it happens. "X is now Y", "Y (now Z)" and "Y (renamed
+  from X)" also merge; a bare "is now Y" additionally needs Y capitalised in
+  the text and typed like X.
 - **Text-only retraction**: a sentence with no relation ("Ivan left Acme; he no
   longer works there") ends the one live fact it names, at `valid_from`, and
   reports it as `invalidated`. It also runs on a write that supplies its own
