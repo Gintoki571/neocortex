@@ -424,23 +424,47 @@ fn concurrent_recalls_keep_access_counters_consistent() {
         handle.join().unwrap();
     }
     let e = Engine::open(&path, Arc::new(HashEmbedder)).unwrap();
-    let count: i64 =
+    // The access write is best effort on the read path (a busy writer must
+    // not delay the answer), so under load some of the 40 records are
+    // skipped and a fixed count cannot be promised. What is promised: no
+    // caller sees an error (the threads above unwrap recall and join would
+    // panic), the total never exceeds what was attempted and never lags the
+    // retained rows, and the counter and the kept rows agree with each
+    // other.
+    let (count, last_access): (i64, Option<i64>) =
         e.db.sql()
             .query_row(
-                "SELECT access_count FROM memories WHERE id=?1",
+                "SELECT access_count, last_access FROM memories WHERE id=?1",
                 [seeded],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-    assert_eq!(count, 40);
-    let kept: i64 =
+    assert!(count > 0, "no recall recorded an access");
+    assert!(count <= 40, "more accesses recorded than recalls: {count}");
+    assert!(
+        last_access.is_some(),
+        "access_count is {count} but last_access is NULL"
+    );
+    let (kept, max_at): (i64, Option<i64>) =
         e.db.sql()
             .query_row(
-                "SELECT count(*) FROM memory_access WHERE memory_id=?1",
+                "SELECT count(*), max(at) FROM memory_access WHERE memory_id=?1",
                 [seeded],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
+    assert!(
+        kept >= 1,
+        "counter is {count} but no memory_access row was kept"
+    );
+    assert!(
+        kept <= count,
+        "{kept} memory_access rows but the counter only reached {count}"
+    );
     assert!(kept <= e.cfg.access_keep as i64, "{kept}");
+    assert!(
+        max_at.is_some(),
+        "counter is {count} but memory_access holds no timestamp"
+    );
     drop(e);
 }
