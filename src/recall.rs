@@ -282,6 +282,68 @@ fn fetch_vectors(db: &Db, ids: &[i64]) -> Result<HashMap<i64, Vec<f32>>> {
     Ok(out)
 }
 
+/// How many memories may carry a tag for the tag to name a category. A tag on
+/// thousands of memories is a hub: every member shares it, so it separates
+/// nothing (a team every memory mentions carries no cause either).
+const TAG_CATEGORY_MAX: i64 = 200;
+/// Most query tokens probed against the tag column.
+const TAG_TERMS: usize = 8;
+/// Most tag members one recall ranks by cosine.
+const TAG_MAX_IDS: usize = 128;
+
+/// A query token names the tag when the two differ only by the plural `s`
+/// ("vacations" names `vacation`, "lessons" names `lesson`). A prefix match is
+/// too loose: "care" would name `career`, "out" `outdoors`, "back" `backup`,
+/// so an ordinary question would collect an unrelated category's memories.
+fn tag_named_by(token: &str, tag: &str) -> bool {
+    let short = |s: &str| s.len() >= 3;
+    short(token) && (token == tag || text::singularize(token) == tag)
+}
+
+/// The memories carrying a rare tag the query names ("vacations", "equipment",
+/// "lessons"). A tag on thousands of memories is a hub and names no category.
+fn rare_tag_ids(db: &Db, query: &str) -> Result<Vec<i64>> {
+    let mut terms: Vec<String> = Vec::new();
+    for token in text::tokens(query) {
+        if token.chars().count() >= 3
+            && !text::is_stopword(&token)
+            && !terms.contains(&token)
+            && terms.len() < TAG_TERMS
+        {
+            terms.push(token);
+        }
+    }
+    let sql = format!(
+        "SELECT m.id, m.tags FROM memories m JOIN memories_fts f ON f.rowid = m.id
+         WHERE memories_fts MATCH ?1 LIMIT {}",
+        TAG_CATEGORY_MAX + 1
+    );
+    let mut st = db.sql().prepare_cached(&sql)?;
+    let mut out: Vec<i64> = Vec::new();
+    for term in &terms {
+        let rows: Vec<(i64, String)> = st
+            .query_map(params![format!("tags:\"{term}\"*")], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        if rows.len() as i64 > TAG_CATEGORY_MAX {
+            continue;
+        }
+        for (id, tags) in rows {
+            if tags.split_whitespace().any(|tag| tag_named_by(term, tag)) {
+                out.push(id);
+            }
+        }
+        if out.len() >= TAG_MAX_IDS {
+            break;
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(TAG_MAX_IDS);
+    Ok(out)
+}
+
 /// The `keep` memory ids closest to the query, read in bounded chunks so an
 /// exclusion question over a whole type never holds that type's vectors in RAM
 /// (low-resource target). Ties break on id, like a stable sort by cosine.
@@ -1662,6 +1724,14 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     fetch_kept(&engine.db, &mut rows, &mut graph_ids, &keep)?;
     graph_ids.truncate(depth);
 
+    // Store size drives every scale gate below (anchor channel, wide
+    // selection), so it is probed once.
+    let store_n: i64 = engine
+        .db
+        .sql()
+        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+        .unwrap_or(0);
+
     // ---------------------------------------------------------- anchor
     // The memories of the exact anchors (the entities the question names),
     // ranked by query cosine. At 108k distractors, even a graph#1 hit loses
@@ -1676,14 +1746,8 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // re-orders them for the worse (measured: 0.953 -> 0.929 on the small
     // fixture set at full weight).
     let mut anchor_ids: Vec<i64> = Vec::new();
-    let anchor_on = engine.cfg.w_anchor > 0.0 && !anchors.strong.is_empty() && {
-        let n: i64 = engine
-            .db
-            .sql()
-            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
-            .unwrap_or(0);
-        n >= ANCHOR_MIN_MEMORIES
-    };
+    let anchor_on =
+        engine.cfg.w_anchor > 0.0 && !anchors.strong.is_empty() && store_n >= ANCHOR_MIN_MEMORIES;
     if anchor_on {
         let strong: Vec<i64> = anchors.strong.clone();
         let mut cand: Vec<i64> = Vec::new();
@@ -1842,6 +1906,29 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     };
     status_ids.retain(|id| rows.get(id).is_some_and(keep));
 
+    // ------------------------------------------------------------- tag
+    // A query word that names a small tag set names a category: the members
+    // of "the equipment" or "my vacations" are the memories carrying that
+    // tag, not whichever memories happen to sit nearest in the embedding
+    // space. A tag on thousands of memories ("travel", "management") is a
+    // hub every member shares, so it separates nothing and is skipped. The
+    // members are ranked by query cosine like the anchor channel. A tag is
+    // agent-supplied category metadata, so the world's generic tags are hubs
+    // and only the caller's own categories survive the rarity gate.
+    let mut tag_ids = if store_n >= ANCHOR_MIN_MEMORIES
+        && engine.cfg.w_tag > 0.0
+        && paths::aggregate_intent(&input.query)
+    {
+        rare_tag_ids(&engine.db, &input.query)?
+    } else {
+        Vec::new()
+    };
+    if !tag_ids.is_empty() {
+        tag_ids = top_by_cosine(&engine.db, &tag_ids, &query_vec, depth)?;
+        fetch_kept(&engine.db, &mut rows, &mut tag_ids, &keep)?;
+        tag_ids.truncate(depth);
+    }
+
     let mut channels = vec![
         rank::Channel {
             name: "bm25",
@@ -1897,6 +1984,11 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             name: "status",
             weight: STATUS_WEIGHT,
             ids: &status_ids,
+        },
+        rank::Channel {
+            name: "tag",
+            weight: engine.cfg.w_tag,
+            ids: &tag_ids,
         },
     ];
     // H2-16: a why-question asks for the cause of what answered the first

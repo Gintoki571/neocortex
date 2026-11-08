@@ -886,6 +886,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "correction_hints",
     "rel_prefilter",
     "w_anchor",
+    "w_tag",
 ];
 
 fn boolean(key: &str, value: &str) -> Result<bool> {
@@ -960,6 +961,7 @@ pub fn set_config(cfg: &mut Config, key: &str, value: &str) -> Result<()> {
         "correction_hints" => cfg.correction_hints = boolean(key, value)?,
         "rel_prefilter" => cfg.rel_prefilter = boolean(key, value)?,
         "w_anchor" => cfg.w_anchor = number(key, value)?,
+        "w_tag" => cfg.w_tag = number(key, value)?,
         other => {
             return Err(crate::err!(
                 "unknown config key '{other}'; valid: {}",

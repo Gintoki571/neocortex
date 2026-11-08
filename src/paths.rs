@@ -479,6 +479,37 @@ fn memory_verb_negation(words: &[&str], i: usize) -> bool {
     matches!(words[i + 1], "remember" | "recall" | "recollect")
 }
 
+/// True when the question asks for a whole category rather than one member
+/// ("all personal vacations", "grants and funding sources", "who works in the
+/// Solberg Lab"). The `tag` channel (`recall.rs`) names a category by the tags
+/// the caller stored, which answers a list question and floods a single-answer
+/// one ("does she prefer rowing or kayaking now" names the `rowing` tag but
+/// wants one of the two), so it runs only on this shape.
+pub fn aggregate_intent(query: &str) -> bool {
+    const CUES: [&str; 6] = ["all", "every", "each", "everything", "everyone", "list"];
+    let tokens: Vec<String> = text::tokens(query)
+        .into_iter()
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.iter().any(|t| CUES.contains(&t.as_str())) {
+        return true;
+    }
+    let plural =
+        |t: &str| t.chars().count() >= 3 && !text::is_stopword(t) && text::singularize(t) != t;
+    let partitive =
+        tokens.first().is_some_and(|t| plural(t)) && tokens.get(1).is_some_and(|t| t == "of");
+    let coordinated = tokens.iter().filter(|t| plural(t)).count() >= 2
+        && tokens.iter().any(|t| t == "and" || t.ends_with(','));
+    // "who works in the lab" asks for the members of one group.
+    let membership = tokens.first().is_some_and(|t| t == "who")
+        && tokens.iter().take(5).any(|t| t == "work" || t == "works")
+        && tokens
+            .iter()
+            .take(5)
+            .any(|t| t == "in" || t == "at" || t == "for");
+    partitive || coordinated || membership
+}
+
 /// True when the question asks for a cause ("why did X happen", "what caused
 /// X", "reason for X"). E4b uses this to surface causal evidence first.
 pub fn causal_intent(query: &str) -> bool {
@@ -2723,6 +2754,39 @@ mod tests {
             }],
             coverage: 1,
             score,
+        }
+    }
+
+    #[test]
+    fn aggregate_intent_names_the_list_questions() {
+        for q in [
+            "all personal vacations and recreational trips taken",
+            "members of Alex's immediate and extended family",
+            "friends and running partners in Alex's social circle",
+            "technical outages, incidents, and engineering mistakes",
+            "all computing hardware and mobile tech devices owned",
+            "database engines used or managed across all projects",
+            "running milestones, race completions, and athletic gear purchases",
+            "who works in the Solberg Lab",
+            "external collaborators and partner groups",
+            "grants and funding sources",
+            "papers and written outputs",
+            "lab mishaps and lessons",
+            "list the employers Carla Bischand has had",
+        ] {
+            assert!(aggregate_intent(q), "{q:?}");
+        }
+        // A single member is not a category: the tag channel would flood it.
+        for q in [
+            "does she prefer rowing or kayaking now",
+            "which conferences did Ingrid attend this year",
+            "what database does my sister's team use",
+            "which microscope came before the Krios",
+            "father's teaching career",
+            "who is Alex's employer",
+            "what is the home ground of the club where Rui's son plays",
+        ] {
+            assert!(!aggregate_intent(q), "{q:?}");
         }
     }
 
