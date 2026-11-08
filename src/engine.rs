@@ -72,6 +72,10 @@ pub struct Config {
     pub w_graph: f64,
     pub w_temporal: f64,
     /// RRF weight of semantic multi-hop paths (`paths::search_semantic`).
+    /// Below 50k memories this weight stands (0.25, tuned on the small sets);
+    /// at 100k-store scale a positive weight is floored at 2.5 (`recall.rs`:
+    /// a hop-2 answer is normally visible only to this beam, and 0.25 cannot
+    /// lift it past anchor-boosted hop-1 memories; nc-hay2).
     pub w_sempath: f64,
     /// Hop weight of B5 containment links in the semantic beam, and whether
     /// `name_part` edges enter the PPR snapshot. 0 (or non-finite) ignores

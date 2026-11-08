@@ -13,9 +13,13 @@
 //! entity is merged with haystack mentions (collision check: mentions by
 //! memories outside the set's key map).
 //!
-//! Query selection: only queries that answer (acc pass and recall==1) in the
-//! alone DB but miss in this DB, when given `<db>`/keys for the haystack file
-//! plus `--alone <db> <keys>`; without `--alone` it prints every query.
+//! Query selection: every query whose hit fraction (fraction of `expect`
+//! memories in the top-k) drops alone -> haystack, or whose rendered answer
+//! (the `answers` strings in the top-10 context) is lost, when given
+//! `<db>`/keys for the haystack file plus `--alone <db> <keys>`; without
+//! `--alone` it prints every query. Per-gold lines (`PERGOLD`) give each
+//! expected memory's BM25 / vector / PPR / returned ranks, so a partial loss
+//! (an aggregation query losing 2 of 6 golds) is visible per memory.
 
 use neocortex::anchor::query_anchors;
 use neocortex::embed::{Embedder, Mode};
@@ -62,6 +66,7 @@ type Keys = HashMap<String, i64>;
 struct QResult {
     answered: bool,
     recall_hit: bool,
+    hit_frac: f64,
     bm25_rank: Option<usize>,
     vec_rank: Option<usize>,
     vec_cosine: f64,
@@ -73,6 +78,7 @@ struct QResult {
     fact_in: bool,
     ctx_answer: bool,
     detail: String,
+    per_gold: String,
 }
 
 fn context_text(out: &neocortex::engine::RecallOutput, k: usize) -> String {
@@ -100,33 +106,36 @@ fn context_text(out: &neocortex::engine::RecallOutput, k: usize) -> String {
     t.to_lowercase()
 }
 
-/// Raw BM25 rank of `gold` under the recall FTS query (top-2000 scan).
-fn bm25_rank(engine: &Engine, query: &str, gold: &[i64]) -> Option<usize> {
-    let q = text::fts_query_with(query, &[], engine.cfg.fts_prefix_min)?;
-    let mut st = engine
-        .db
-        .sql()
-        .prepare(
-            "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1
+/// Raw BM25 ranks of every `gold` under the recall FTS query (top-2000 scan).
+fn bm25_ranks(engine: &Engine, query: &str, gold: &[i64]) -> Vec<Option<usize>> {
+    let Some(q) = text::fts_query_with(query, &[], engine.cfg.fts_prefix_min) else {
+        return vec![None; gold.len()];
+    };
+    let Ok(mut st) = engine.db.sql().prepare(
+        "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1
          ORDER BY bm25(memories_fts,1.0,2.0) LIMIT 2000",
-        )
-        .ok()?;
-    let ids: Vec<i64> = st
-        .query_map(params![q], |r| r.get(0))
-        .ok()?
-        .collect::<Result<_, _>>()
-        .ok()?;
-    ids.iter().position(|id| gold.contains(id)).map(|p| p + 1)
+    ) else {
+        return vec![None; gold.len()];
+    };
+    let Ok(ids) = st
+        .query_map(params![q], |r| r.get::<_, i64>(0))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    else {
+        return vec![None; gold.len()];
+    };
+    gold.iter()
+        .map(|g| ids.iter().position(|id| id == g).map(|p| p + 1))
+        .collect()
 }
 
-/// Raw vector rank of `gold` (memories_vec KNN, top-2000 scan).
-fn vec_rank(engine: &Engine, qvec: &[f32], gold: &[i64]) -> (Option<usize>, f64) {
+/// Raw vector ranks of every `gold` (memories_vec KNN, top-2000 scan).
+fn vec_ranks(engine: &Engine, qvec: &[f32], gold: &[i64]) -> Vec<(Option<usize>, f64)> {
     let sql = format!(
         "SELECT rowid,1-distance FROM memories_vec WHERE embedding MATCH {} AND k=2000 AND live=1 ORDER BY distance",
         engine.db.vec_sql("?1")
     );
     let Ok(mut st) = engine.db.sql().prepare(&sql) else {
-        return (None, 0.0);
+        return vec![(None, 0.0); gold.len()];
     };
     let hits: Vec<(i64, f32)> = st
         .query_map(params![engine.db.vec_blob(qvec)], |r| {
@@ -135,16 +144,17 @@ fn vec_rank(engine: &Engine, qvec: &[f32], gold: &[i64]) -> (Option<usize>, f64)
         .ok()
         .and_then(|rows| rows.collect::<Result<_, _>>().ok())
         .unwrap_or_default();
-    let pos = hits
-        .iter()
-        .position(|(id, _)| gold.contains(id))
-        .map(|p| p + 1);
-    let cos = hits
-        .iter()
-        .find(|(id, _)| gold.contains(id))
-        .map(|(_, c)| *c as f64)
-        .unwrap_or(0.0);
-    (pos, cos)
+    gold.iter()
+        .map(|g| {
+            let pos = hits.iter().position(|(id, _)| id == g).map(|p| p + 1);
+            let cos = hits
+                .iter()
+                .find(|(id, _)| id == g)
+                .map(|(_, c)| *c as f64)
+                .unwrap_or(0.0);
+            (pos, cos)
+        })
+        .collect()
 }
 
 /// Gold memory -> its entity ids; gold memory -> its live relation ids.
@@ -410,17 +420,46 @@ fn diagnose(engine: &Engine, q: &Query, ids: &Keys, set_ids: &HashSet<i64>) -> Q
         .expect("recall");
     let found: Vec<i64> = out.memories.iter().take(k).map(|m| m.id).collect();
     let recall_hit = !gold.is_empty() && gold.iter().all(|id| found.contains(id));
+    let hit_n = gold.iter().filter(|id| found.contains(id)).count();
+    let hit_frac = hit_n as f64 / gold.len().max(1) as f64;
     let ctx = context_text(&out, 10);
     let ctx_answer =
         q.answers.is_empty() || q.answers.iter().all(|a| ctx.contains(&a.to_lowercase()));
     let _answered = recall_hit && ctx_answer;
-    // channel ranks
+    // channel ranks (best over golds; per-gold detail below)
     let qvec = engine.emb.embed(&[&q.q], Mode::Query).unwrap().remove(0);
-    let b = bm25_rank(engine, &q.q, &gold);
-    let (v, vc) = vec_rank(engine, &qvec, &gold);
+    let b_all = bm25_ranks(engine, &q.q, &gold);
+    let v_all = vec_ranks(engine, &qvec, &gold);
+    let b = b_all.iter().copied().flatten().min();
+    let (v, vc) = v_all
+        .iter()
+        .min_by_key(|(r, _)| r.unwrap_or(usize::MAX))
+        .copied()
+        .unwrap_or((None, 0.0));
     let history = q.include_history || q.as_of.is_some();
     let gr = graph_ranks(engine, &q.q, &qvec, history);
     let best_g = gold.iter().filter_map(|id| gr.get(id).copied()).min();
+    let per_gold: String = gold
+        .iter()
+        .zip(b_all.iter().zip(v_all.iter()))
+        .map(|(id, (bm, (vr, cos)))| {
+            let mem = out
+                .memories
+                .iter()
+                .position(|m| m.id == *id)
+                .map(|p| (p + 1).to_string())
+                .unwrap_or_else(|| ">k".to_string());
+            format!(
+                "m{id}:bm{} vec{}({:.3}) gr{} mem{}",
+                fmt_rank(*bm),
+                fmt_rank(*vr),
+                cos,
+                fmt_rank(gr.get(id).copied()),
+                mem
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
     // anchors + entities of gold
     let now = engine.clock().now;
     let mut names: Vec<String> = neocortex::extract::ngrams(&q.q, 4)
@@ -585,6 +624,7 @@ fn diagnose(engine: &Engine, q: &Query, ids: &Keys, set_ids: &HashSet<i64>) -> Q
     QResult {
         answered: acc_ok,
         recall_hit,
+        hit_frac,
         bm25_rank: b,
         vec_rank: v,
         vec_cosine: vc,
@@ -596,6 +636,7 @@ fn diagnose(engine: &Engine, q: &Query, ids: &Keys, set_ids: &HashSet<i64>) -> Q
         fact_in,
         ctx_answer,
         detail,
+        per_gold,
     }
 }
 
@@ -645,7 +686,7 @@ fn main() -> neocortex::Result<()> {
         Some((d, k)) => Some(open(d, k)?),
         None => None,
     };
-    println!("query\tcat\talone_ok\thay_ok\tbm25\thay_bm25\tvec\thay_vec\tgraph\thay_graph\tanchor\thay_anchor\tcollision\tmem_rank\tfact_in\tctx");
+    println!("query\tcat\talone_hit\thay_hit\talone_ok\thay_ok\tbm25\thay_bm25\tvec\thay_vec\tgraph\thay_graph\tanchor\thay_anchor\tcollision\tmem_rank\tfact_in\tctx");
     for q in &data.queries {
         if !only_cat.is_empty() && q.category != only_cat {
             continue;
@@ -660,6 +701,7 @@ fn main() -> neocortex::Result<()> {
                 let a = QResult {
                     answered: hay.answered,
                     recall_hit: hay.recall_hit,
+                    hit_frac: hay.hit_frac,
                     bm25_rank: hay.bm25_rank,
                     vec_rank: hay.vec_rank,
                     vec_cosine: hay.vec_cosine,
@@ -671,19 +713,25 @@ fn main() -> neocortex::Result<()> {
                     fact_in: hay.fact_in,
                     ctx_answer: hay.ctx_answer,
                     detail: String::new(),
+                    per_gold: String::new(),
                 };
                 (None, a, hay)
             }
         };
         let alone_ok = ao.unwrap_or(h.answered);
-        // print only queries answered alone but not in the haystack, or when alone info missing all misses
-        if alone.is_some() && !(alone_ok && !h.answered) {
+        // print queries whose hit fraction drops alone -> haystack, or whose
+        // rendered answer (ctx) is lost; without --alone print all.
+        let hit_loss = a.hit_frac > h.hit_frac + 1e-9;
+        let acc_loss = a.ctx_answer && !h.ctx_answer;
+        if alone.is_some() && !(hit_loss || acc_loss) {
             continue;
         }
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             q.q.replace(['\t', '\n'], " "),
             q.category,
+            a.hit_frac,
+            h.hit_frac,
             alone_ok,
             h.answered,
             fmt_rank(a.bm25_rank),
@@ -700,10 +748,8 @@ fn main() -> neocortex::Result<()> {
             h.ctx_answer,
         );
         println!("   REASONS hay: {} | detail: {}", h.reasons, h.detail);
-        println!(
-            "   REASONS alone: {} | bm25 alone detail: anchors/detail from hay row above",
-            a.reasons
-        );
+        println!("   PERGOLD alone: {}", a.per_gold);
+        println!("   PERGOLD hay: {}", h.per_gold);
         println!(
             "   alone vec cosine {:.3} vs hay vec cosine {:.3}",
             a.vec_cosine, h.vec_cosine
