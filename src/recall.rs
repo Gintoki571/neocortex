@@ -2528,19 +2528,20 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // The reverse hop reads the answer frame and walks back from the returned
     // bridges, so its facts lead: the terminal relation it finds is the one
     // the forward channels could not rank.
-    let (rev_pulled, rev_evidence) = if engine.cfg.rev_hop && !negated {
-        rev_hop_facts(
-            engine,
-            &query_text,
-            &top_chains,
-            &memories,
-            &query_alias_entities,
-            cutoff,
-            &existing_facts,
-        )?
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let (rev_pulled, rev_evidence) =
+        if engine.cfg.rev_hop && store_n >= SCALE_MIN_MEMORIES && !negated {
+            rev_hop_facts(
+                engine,
+                &query_text,
+                &top_chains,
+                &memories,
+                &query_alias_entities,
+                cutoff,
+                &existing_facts,
+            )?
+        } else {
+            (Vec::new(), Vec::new())
+        };
     // The evidence memory of a pulled fact is a candidate in its own right
     // (same rule as `bridge_pull`): the fact line carries the answer, the
     // memory carries the context around it.
@@ -2626,7 +2627,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             }
             // `prose_wide` lines do not displace anything: they are appended
             // after every other fact channel below, in their own slots.
-            if engine.cfg.prose_wide {
+            if engine.cfg.prose_wide && store_n >= SCALE_MIN_MEMORIES {
                 let rendered: HashSet<i64> = memories.iter().map(|m| m.id).collect();
                 wide_prose = paths::prose_wide_facts(&engine.db, &sem_hits, &rendered, cutoff)?
                     .into_iter()

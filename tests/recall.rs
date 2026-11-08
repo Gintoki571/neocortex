@@ -1134,6 +1134,9 @@ fn prose_wide_reaches_a_middle_hop_without_moving_memories() {
     ] {
         remember(&e, filler, |_| {});
     }
+    // prose_wide is scale-gated; fill to scale so the knob engages.
+    at_scale(&e);
+    e.cfg.prose_wide = false;
     let ask = |e: &Engine| {
         e.recall(&RecallInput {
             query: "Which array is hosted at the observatory where Rui Carvalho's mentor trained?"
@@ -2931,6 +2934,8 @@ fn rev_hop_fixture() -> Engine {
     for n in 0..6 {
         remember(&e, &format!("Routine note {n} about scheduling."), |_| {});
     }
+    // rev_hop is scale-gated (>=50k memories); bulk-fill so the hop engages.
+    at_scale(&e);
     e
 }
 
@@ -2945,7 +2950,10 @@ fn rev_hop_query() -> RecallInput {
 #[test]
 fn rev_hop_default_is_off() {
     let e = engine(Arc::new(HashEmbedder));
-    assert!(!e.cfg.rev_hop, "Config::default().rev_hop should be off");
+    assert!(
+        e.cfg.rev_hop,
+        "Config::default().rev_hop should be on at scale"
+    );
     let mut cfg = Config::default();
     neocortex::eval::set_config(&mut cfg, "rev_hop", "on").unwrap();
     assert!(cfg.rev_hop);
@@ -3038,6 +3046,8 @@ fn rev_hop_caps_facts_and_never_floods_from_a_hub() {
         k: Some(5),
         ..Default::default()
     };
+    // rev_hop is scale-gated; fill to scale so the hub cap path engages.
+    at_scale(&e);
     e.cfg.rev_hop = false;
     let off: Vec<i64> = e
         .recall(&query)

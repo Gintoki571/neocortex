@@ -686,6 +686,24 @@ the semantic gain) and semantic-beam widening (SEM_FACTS 250 / SEM_EDGES 12 /
 Keep thresholds (fixtures >= 0.90 or holdout >= 0.87) were not met by any
 combination, hence KILL (see `loop/reports/nc-hay2.md`).
 
+## After nc-hay3: scale-gated rev_hop + prose_wide (2026-11-08, KEEP)
+
+Two parked knobs (`rev_hop`, `prose_wide`) join the sempath floor, all three
+scale-gated at >= 50k memories (`SCALE_MIN_MEMORIES` in `src/recall.rs`; both
+default on at scale, `false` forces off; small stores byte-identical to main
+by `eval --failures` diff on fixtures/holdout/mh1/world-300). Inside the
+108k haystack (`--load-db`, real UltraBERT, int8), together: fixtures recall
+0.869 -> 0.883 (MRR 0.842 -> 0.855), holdout 0.834 -> 0.833 (MRR 0.703 ->
+0.655, the sempath floor's cost as in nc-hay2), mh1 acc@10 0.900 -> 0.925
+(recall 0.621 -> 0.648), blind mh2 0.650 -> 0.700 (recall 0.618 -> 0.658).
+Ablation on the same copies: Fix A alone gives fixtures 0.883 / mh1 0.900 /
+mh2 0.680; rev_hop adds the mh1 +2 (three-hop 0.760 -> 0.800, two-hop 0.950
+-> 0.975 per hayknobs), prose_wide adds mh2 the last +1 to 0.700 and nothing
+on mh1. Context +1.5% fixtures / +4.2% holdout / +10.9% mh1 / +5.7% mh2 (cap
++12%); haystack p50 interleaved pairs avg +7.5% (individual +17/+6/-0%,
+noisy shared disk). Keep bar met on mh1 (0.925); alone gates per common.md
+pass. See `loop/reports/nc-hay3.md`.
+
 ## Reproduce
 
 ```bash

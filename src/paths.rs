@@ -2211,8 +2211,9 @@ pub(crate) fn prose_facts(
     Ok(out)
 }
 
-/// `prose_wide` (knob, default off): the prose steps of the top three semantic
-/// chains, at any hop position, render as fact lines (`memory` = true). A prose
+/// `prose_wide` (knob, on at scale, see `engine::Config`): the prose steps of
+/// the top three semantic chains, at any hop position, render as fact lines
+/// (`memory` = true). A prose
 /// hop is skipped when its memory is already one of `rendered` (it is in the
 /// context already), and at most `PROSE_WIDE_FACTS` lines are returned,
 /// destination hop first.
@@ -3294,11 +3295,12 @@ mod prose_wide_tests {
         assert_eq!(ids(&facts), vec![memories[0], memories[1], memories[2]]);
     }
 
-    /// The knob's default is off, and the eval/config surface names it.
+    /// The knob's default is on (scale-gated in `recall`), and the
+    /// eval/config surface names it.
     #[test]
     fn the_knob_defaults_off() {
         let cfg = crate::engine::Config::default();
-        assert!(!cfg.prose_wide);
+        assert!(cfg.prose_wide);
         let mut cfg = cfg;
         crate::eval::set_config(&mut cfg, "prose_wide", "on").unwrap();
         assert!(cfg.prose_wide);
