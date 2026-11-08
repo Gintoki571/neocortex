@@ -668,6 +668,55 @@ Three product changes (two scale-activated at 50k stored memories, one shelf-wid
 Reproduce: `./target/release/neocortex eval <set>.json --haystack <w10k-int8.db>` (or
 `--load-db <saved haystack copy>` for re-scoring without re-ingesting).
 
+## After nc-agg: the category-tag channel for list questions (2026-11-08)
+
+Same 108,667-memory world-10000 store. An aggregation question needs ALL its gold
+memories in the top k, and inside the crowd it kept only part of them: fixtures
+aggregation recall 0.450, holdout 0.347 (`--load-db` on saved copies,
+`--failures`). The diagnosis table (`examples/hay_diag.rs`, now with per-gold
+BM25/vector/PPR/k50/k8 ranks, logs `tmp/nc-agg/diag-hay-{fixtures,holdout}-base.log`)
+classifies every aggregation loss as a **pool loss**: the golds sit at BM25/vec/graph
+ranks 50-2000 (e.g. fixtures "all personal vacations": m026 and m080 outside every
+channel's top 2000, m028 at vec#21, 3/5 in k50 and 2/5 in k8) while the world's
+near-identical distractor sentences ("Vivek Barrao spent a week in Naples for
+work") fill the top of the fused list. Holdout "family members and their news"
+loses 6/6 even at k=50. Widening the pools or the beam made other categories worse
+(nc-hay2), so the fix had to add a channel, not a wider scan.
+
+`tag` channel (`Config.w_tag` 4.0, the same `ANCHOR_MIN_MEMORIES` 50k gate): a list
+question (`paths::aggregate_intent`: an all/every/each/list cue, a partitive plural
+head, two coordinated plural heads, or "who works in/at/for") names a category, and
+the tags the caller stored are that category. `rare_tag_ids` looks up the question's
+content words in `memories_fts` (tags column) and keeps the memories whose tags
+match exactly or through `text::singularize` ("vacations" -> `vacation`), never by
+prefix ("care" must not name `career`, "back" not `backup` - the earlier prefix
+build cost holdout preference MRR 1.0 -> 0.797 for exactly that reason). A tag on
+more than `TAG_CATEGORY_MAX` 200 memories is a hub every member shares and names no
+category, so the world's generic tags are skipped. The members (at most 128) are
+ranked by query cosine like the anchor channel.
+
+| inside the 108k store (`--load-db`, real model) | main | nc-agg |
+|---|---|---|
+| fixtures aggregation recall / MRR | 0.4497 / 0.8776 | **0.6497 / 1.000** |
+| fixtures overall recall / MRR | 0.869 / 0.842 | 0.885 / 0.852 |
+| holdout aggregation recall / MRR | 0.3469 / 0.4286 | **0.5020 / 0.5833** |
+| holdout overall recall / MRR | 0.834 / 0.703 | 0.847 / 0.715 |
+| mh1 acc@10 | 0.900 | 0.900 (per category identical) |
+| mh2 (blind) acc@10 | 0.650 | 0.650 (per category identical) |
+| fixtures p50, tag off / on, interleaved 3x (`--set w_tag=0`) | 299.6 / 290.9 / 299.7 ms | 300.3 / 287.7 / 300.2 ms |
+
+Every other category (as-of, current-vs-superseded, history, keyword, multi-hop,
+paraphrase, preference, procedure/lesson, synonym, temporal-window) is byte-identical
+between the two runs in both haystack sets; only `aggregation` moves. Alone (below the
+50k gate) the channel never runs, so the gate sets are unchanged: fixtures 0.953 /
+0.901, holdout 0.914 / 0.793, mh1 0.912, blind 0.820, world-300 acc@10 0.998
+(recall 0.969, MRR 0.883), and `--failures` output is identical to main at every
+small store (only the pre-existing nondeterministic `context tokens/query` wobbles,
+351.6/351.9 with the same binary).
+
+Reproduce: `neocortex eval eval/fixtures.json --load-db <haystack copy> --failures`,
+then the same with `--set w_tag=0` for the A/B.
+
 ## Reproduce
 
 ```bash
