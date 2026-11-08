@@ -694,37 +694,46 @@ pub fn resolve_entity(
     }
     let mut exact = exact_match(db, &norms, &kind, &exclude)?;
     // H4-01: a person exact-norm hit can be a different surname hidden by
-    // singularisation ("Parks"/"Park", "Jones" variants) because the stored key
-    // stays singularised for DB compatibility. Without ER-08 corroboration that
-    // is a different person, not a match: treat as no exact merge and report it
-    // ambiguous with the collided entity as candidate.
+    // singularisation ("Parks"/"Park") because the stored key stays singularised
+    // for DB compatibility. Only block when the collision is on the candidate's
+    // primary name (its stored norm == the mention norm): an alias match (e.g. a
+    // merged former name) is a legitimate resolution, not a surname collapse.
+    // Without ER-08 corroboration the collapsed form is a different person:
+    // create a new entity reported ambiguous with the collided candidate.
     if !exact.is_empty() && PERSON_TYPES.contains(&kind.as_str()) {
-        let meta = entity_meta(db, &exact)?;
+        let placeholders = vec!["?"; exact.len()].join(",");
+        let sql = format!("SELECT id,norm,name FROM entities WHERE id IN ({placeholders})");
+        let mut st = db.sql().prepare(&sql)?;
+        let rows = st.query_map(params_from_iter(exact.iter()), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
         let mut keep = Vec::with_capacity(exact.len());
         let mut collided: Vec<i64> = Vec::new();
-        for id in exact {
-            let stored = meta.get(&id).map(|m| m.name.as_str()).unwrap_or("");
-            let same_surname = folded_surname(&item.name) == folded_surname(stored);
-            let corroborated = if same_surname {
-                true
-            } else {
-                // Use identity norms (unsingularised last token) so a
-                // collapsed singular form never triggers the translit-key
-                // shortcut as false corroboration.
-                person_corroborated(
+        for row in rows {
+            let (id, cand_norm, cand_name) = row?;
+            let primary_collision = cand_norm == norm;
+            let same_surname = folded_surname(&item.name) == folded_surname(&cand_name);
+            let blocked = primary_collision
+                && !same_surname
+                && !person_corroborated(
                     db,
                     &text::identity_norm(&item.name),
-                    &text::identity_norm(stored),
+                    &text::identity_norm(&cand_name),
                     id,
                     write_names,
-                )?
-            };
-            if same_surname || corroborated {
-                keep.push(id);
-            } else {
+                )?;
+            if blocked {
                 collided.push(id);
+            } else {
+                keep.push(id);
             }
         }
+        // keep ids that weren't in the entities table (shouldn't happen) out of
+        // collided handling; preserve original order where possible.
         if keep.is_empty() && !collided.is_empty() {
             let id = insert_entity(db, item, &norm, &kind, embedding, now)?;
             let meta = entity_meta(db, &collided)?;
@@ -736,7 +745,14 @@ pub fn resolve_entity(
                 candidates: candidates_with_scores(&collided, &meta, &scores),
             });
         }
-        exact = keep;
+        // If some kept, some collided: drop collided (different collapsed person),
+        // keep legitimate matches. If a collision was dropped but others kept,
+        // we still resolve to the kept one(s).
+        if !collided.is_empty() {
+            exact.retain(|id| !collided.contains(id));
+        } else {
+            exact = keep;
+        }
     }
     if !exact.is_empty() {
         let (chosen, ambiguous, mut candidates) =
