@@ -281,9 +281,7 @@ memories: an exact-anchor channel (the memories of the entities the question
 names, ranked against the question — an anchored answer needs a channel no
 common word crowds out), and the semantic beam's admission of a small-degree
 bridge's own facts, since at 108k distractors a hop's relation can rank below
-the bottom of the top-100 relevance KNN, and a semantic channel whose RRF
-weight is floored at 2.5 once the store passes fifty thousand memories (a
-hop-2 answer is often visible only to the semantic beam). The relation-fact seed retriever
+the bottom of the top-100 relevance KNN. The relation-fact seed retriever
 is also a knob: `eval --set rel_prefilter=on` reads only the relations incident
 to the first 20 query anchors instead of scanning the global relation-vector
 index; it is off by default (see `docs/research/scale.md` for the 108k
