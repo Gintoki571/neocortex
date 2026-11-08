@@ -55,6 +55,34 @@ const ABSTAIN_COSINE: f64 = 0.18;
 /// hundred memories the same top memories already follow from the PPR seeds
 /// and the sibling boost re-orders them for the worse.
 const ANCHOR_MIN_MEMORIES: i64 = 50_000;
+/// Store size at which scale crowding starts (nc-hay2; the same gate the
+/// anchor channel and the semantic beam widening use). Below it the small-store
+/// calibration stands; at or above it the scale-gated channel weights apply
+/// (`sempath_weight`).
+const SCALE_MIN_MEMORIES: i64 = 50_000;
+/// RRF weight of the semantic multi-hop channel at scale (nc-hay2). Below the
+/// scale gate `Config.w_sempath` (0.25, tuned on the small sets) stands; at
+/// 100k stores a hop-2 answer is normally visible only to the semantic beam
+/// (it shares neither the anchor nor distinctive query words), and 0.25 cannot
+/// lift it past anchor-boosted hop-1 memories. Measured on the saved haystack
+/// copies (`--load-db` + `--set w_sempath=`): fixtures haystack recall
+/// 0.869 -> 0.883 at 2.5 (w=1.0 is a no-op), mh1 haystack recall 0.621 ->
+/// 0.648 at acc@10 0.900 held, holdout haystack recall 0.834 -> 0.833 (one
+/// multi-hop query gained, one current-vs-superseded query lost). A zero
+/// weight stays zero (the channel can still be disabled), so only positive
+/// configured weights are floored.
+const SEMPATH_SCALE_MIN: f64 = 2.5;
+
+/// The semantic multi-hop channel weight in effect for a store of `store_n`
+/// memories (see `SEMPATH_SCALE_MIN`).
+fn sempath_weight(cfg_w: f64, store_n: i64) -> f64 {
+    if cfg_w != 0.0 && store_n >= SCALE_MIN_MEMORIES {
+        cfg_w.max(SEMPATH_SCALE_MIN)
+    } else {
+        cfg_w
+    }
+}
+
 /// Most `next` hints one recall may carry.
 const HINT_MAX: usize = 2;
 /// Most live incident relations a `next` hint target may have. Beyond this
@@ -1400,6 +1428,15 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         .collect::<Vec<_>>()
         .join(" ");
     let query_vec = engine.emb.embed(&[&query_text], Mode::Query)?.remove(0);
+    // One store-size probe drives every scale gate in this recall (anchor
+    // channel, semantic-beam widening lives in `paths`, and the semantic
+    // channel weight below), instead of each gate paying its own
+    // `SELECT count(*)`.
+    let store_n: i64 = engine
+        .db
+        .sql()
+        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+        .unwrap_or(0);
     let depth = (5 * k).max(50);
     // Filtered channels need headroom: the KNN/BM25 depth is applied before
     // eligibility, so oversample when structured filters are present.
@@ -1676,14 +1713,8 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // re-orders them for the worse (measured: 0.953 -> 0.929 on the small
     // fixture set at full weight).
     let mut anchor_ids: Vec<i64> = Vec::new();
-    let anchor_on = engine.cfg.w_anchor > 0.0 && !anchors.strong.is_empty() && {
-        let n: i64 = engine
-            .db
-            .sql()
-            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
-            .unwrap_or(0);
-        n >= ANCHOR_MIN_MEMORIES
-    };
+    let anchor_on =
+        engine.cfg.w_anchor > 0.0 && !anchors.strong.is_empty() && store_n >= ANCHOR_MIN_MEMORIES;
     if anchor_on {
         let strong: Vec<i64> = anchors.strong.clone();
         let mut cand: Vec<i64> = Vec::new();
@@ -1875,7 +1906,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         },
         rank::Channel {
             name: "sem",
-            weight: engine.cfg.w_sempath,
+            weight: sempath_weight(engine.cfg.w_sempath, store_n),
             ids: &sem_ids,
         },
         rank::Channel {
@@ -4535,5 +4566,17 @@ mod tests {
             "the lookup reads more than the FTS index: {plan:?}"
         );
         assert!(sources[0].contains("memories_fts"), "{plan:?}");
+    }
+
+    /// nc-hay2: the semantic channel weight is floored at scale, untouched
+    /// below the gate, and a disabled channel stays disabled.
+    #[test]
+    fn sempath_weight_is_floored_at_scale() {
+        assert_eq!(sempath_weight(0.25, 0), 0.25);
+        assert_eq!(sempath_weight(0.25, SCALE_MIN_MEMORIES - 1), 0.25);
+        assert_eq!(sempath_weight(0.25, SCALE_MIN_MEMORIES), SEMPATH_SCALE_MIN);
+        assert_eq!(sempath_weight(0.25, 108_000), SEMPATH_SCALE_MIN);
+        assert_eq!(sempath_weight(0.0, 108_000), 0.0);
+        assert_eq!(sempath_weight(3.0, 108_000), 3.0);
     }
 }

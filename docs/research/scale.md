@@ -668,6 +668,24 @@ Three product changes (two scale-activated at 50k stored memories, one shelf-wid
 Reproduce: `./target/release/neocortex eval <set>.json --haystack <w10k-int8.db>` (or
 `--load-db <saved haystack copy>` for re-scoring without re-ingesting).
 
+## After nc-hay2: semantic weight floor (2026-11-08, KILL — thresholds unmet)
+
+One scale-activated change: `w_sempath` floored at 2.5 at >= 50k memories
+(`SEMPATH_SCALE_MIN`, `sempath_weight` in `src/recall.rs`; zero stays zero,
+so the channel can still be disabled). Inside the 108k haystack
+(`lanes/tmp/nc-scale2/w10k-int8.db`, `--load-db` re-scoring, real UltraBERT,
+`NEOCORTEX_VEC=int8`): fixtures recall 0.869 -> 0.883 (multi-hop 0.444 ->
+0.555, aggregation 0.449 -> 0.473), holdout 0.834 -> 0.833 (multi-hop 0.777
+-> 0.888 but current 1.000 -> 0.875, MRR 0.703 -> 0.655), mh1 recall 0.621
+-> 0.648 at acc@10 0.900 held, blind mh2 acc 0.650 -> 0.680 (three-hop
+0.400 -> 0.500). Alone sets are byte-identical below the gate (fixtures
+0.953, holdout 0.914, mh1 0.912, world-300 0.998). Two rejected widenings:
+pool depth + MMR window at scale (fixtures 0.867, holdout 0.823 — depth negates
+the semantic gain) and semantic-beam widening (SEM_FACTS 250 / SEM_EDGES 12 /
+8 starts: fixtures 0.861, holdout 0.857 — trades fixtures for holdout).
+Keep thresholds (fixtures >= 0.90 or holdout >= 0.87) were not met by any
+combination, hence KILL (see `loop/reports/nc-hay2.md`).
+
 ## Reproduce
 
 ```bash
