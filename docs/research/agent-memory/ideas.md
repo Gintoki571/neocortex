@@ -86,7 +86,7 @@ Sources: LightRAG weighted-polling quota (`repos/lightrag.md` steal #1), HippoRA
 - **Kill.** < +2 on mh2, or holdout/fixtures regress, or context tokens grow > 10%.
 
 ### B5. Name-containment edges and connector-aware proper-noun spans
-Sources: Graphify's prefix-extension rule (a *veto* there, `repos/graphify.md` steal #2), HippoRAG synonym edges (`papers/hipporag2.md`), neocortex `similar` soft edges (`remember.rs:1084`), open item EX-01 (`lanes/briefs/open_items.md`).
+Sources: Graphify's prefix-extension rule (a *veto* there, `repos/graphify.md` steal #2), HippoRAG synonym edges (`papers/hipporag2.md`), neocortex `similar` soft edges (`remember.rs:1084`), EX-01 (closed by nc-ex01; `lanes/briefs/open_items.md`).
 - **Hypothesis.** "Hackerspace Aveiro" contains "Aveiro", "Cascais marina" contains "Cascais"; a soft containment edge supplies the missing last hop (G, 2 mh2). Separately, the heuristic extractor splits "Rua do Instituto Bacteriológico" into "Rua" + "Instituto Bacteriológico" and "Universidade da Beira Interior" into "Universidade" + ..., creating generic hub entities that the beam walks through (seen in 6/18 mh2 dumps).
 - **Mechanism.** (1) `extract.rs` proper-noun spans keep lower-case connectors between capitalised words (`do, da, dos, das, de, del, della, di, du, van, von, der, la, le`) and drop a single generic head noun when it is part of a longer span. (2) On entity insert, look up `entity_name_tokens` (B1) for entities whose token set strictly contains, or is contained in, the new name with at least one place/org type, and write a `contains(a, b, 0.6)` row into `similar` with a kind column (or a new `name_part` table). (3) `search_semantic` treats `name_part` as a hop scored like a prose hop; PPR uses it as a weak edge.
 - **Attacks.** G (2), hub noise in D. Expected +1 to +2 mh2 (both chains end in prose, so B4 is needed to render them; inference). Entity F1 on Romance names should rise.
@@ -222,7 +222,7 @@ Gain is in answer-bearing queries on mh2 (100) and mh1 (80), plus holdout effect
 
 Rough ceiling if the quick wins and M1 stack without overlap: mh2 82 + 2 (Q1) + 2 (Q2) + 2 (Q3) + 4 (M1) = 92; mh1 66 + 7 (Q4) + 2 (M1) = 75/80 = 0.94 (inference: overlaps between classes will eat some of this; single-shot > 0.90 on both multi-hop sets looks reachable without a trained model).
 
-### Top 5 to build next (lane-ready briefs)
+### Top 5 briefs (2026-10-25; status in lane-results.md)
 
 **1. Lane `nc-anchor`: tiered query anchors + generic-alias demotion (B1 T0-T2, B2).**
 - Goal: resolve first names, role nouns and generic aliases correctly at query time; attacks class A (22/64).

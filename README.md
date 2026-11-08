@@ -396,11 +396,11 @@ also render the interval with a computed duration ("3 years 2 months",
 
 ## Quality
 
-On 84 queries, recall is **0.953** and MRR is **0.895**; on the independent
-holdout set (88 queries) **0.913 / 0.798** (measured 2026-10-25; the ablation
+On 84 queries, recall is **0.953** and MRR is **0.901**; on the independent
+holdout set (88 queries) **0.914 / 0.793** (measured 2026-11-08; the ablation
 numbers live in `neocortex eval <fixtures> --ablation`). Multi-hop acc@10 is
-**0.825** on `eval/multihop-holdout.json` and **0.830** on the blind
-`eval/multihop-holdout2.json` (2026-10-26). Recall p50 with
+**0.912** on `eval/multihop-holdout.json` and **0.820** on the blind
+`eval/multihop-holdout2.json` (2026-11-08). Recall p50 with
 UltraBERT on a 12-core laptop CPU is about **160 ms**; the 10k-memory
 hash-embedder benchmark reports **~100 ms p50 / ~220-360 ms p95** including
 embedding.
