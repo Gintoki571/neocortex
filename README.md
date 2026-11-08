@@ -279,7 +279,10 @@ causal evidence; `--set causal_extract=1` also extracts one conservative
 silent in small stores and only engage once the database passes fifty thousand
 memories: an exact-anchor channel (the memories of the entities the question
 names, ranked against the question — an anchored answer needs a channel no
-common word crowds out), and the semantic beam's admission of a small-degree
+common word crowds out), a category-tag channel on a list question (the members
+of a rare tag the question names by word — "my vacations" -> `vacation` — so the
+whole category answers instead of whichever members happen to rank), and the
+semantic beam's admission of a small-degree
 bridge's own facts, since at 108k distractors a hop's relation can rank below
 the bottom of the top-100 relevance KNN. The relation-fact seed retriever
 is also a knob: `eval --set rel_prefilter=on` reads only the relations incident
