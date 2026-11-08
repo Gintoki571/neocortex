@@ -270,6 +270,13 @@ fn object_tail(
     }
 }
 
+/// A whole token that is a time after in/on/after: a 4-digit year or an ISO
+/// date/year-month. "after 3 incidents" and "on 2 projects" are not times.
+fn year_or_iso_date(n: &str) -> bool {
+    (n.len() == 4 && n.parse::<u32>().is_ok_and(|y| (1900..=2100).contains(&y)))
+        || temporal::is_iso_date_token(n)
+}
+
 /// True when the word at `i` starts a time expression. `at` needs a clock
 /// time, so "at the station" stays a noun phrase.
 fn time_tail(words: &[(usize, usize, &str)], i: usize) -> bool {
@@ -278,14 +285,16 @@ fn time_tail(words: &[(usize, usize, &str)], i: usize) -> bool {
     match word {
         "yesterday" | "today" | "tomorrow" | "tonight" | "ago" => true,
         "last" | "this" | "next" => next.is_some_and(|n| TIME_WORDS.contains(&n)),
-        "in" | "on" => next.is_some_and(|n| {
+        "in" | "on" | "after" => next.is_some_and(|n| {
             TIME_WORDS.contains(&n)
-                || n.chars().all(|c| c.is_ascii_digit())
-                || temporal::is_iso_date_token(n)
+                || year_or_iso_date(n)
+                // "in 3 days": a count is a time only before a time unit.
+                || (n.chars().all(|c| c.is_ascii_digit())
+                    && words.get(i + 2).is_some_and(|w| TIME_WORDS.contains(&w.2)))
         }),
         "as" => next == Some("of"),
         // "no longer reviews X since August 2026": a date opens a time tail.
-        "since" | "until" | "from" | "after" => {
+        "since" | "until" | "from" => {
             next.is_some_and(|n| TIME_WORDS.contains(&n) || n.chars().any(|c| c.is_ascii_digit()))
         }
         "at" => next.is_some_and(|n| {

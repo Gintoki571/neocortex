@@ -1512,3 +1512,36 @@ fn h4_02_non_date_on_tail_still_ends_nothing() {
         "Ivy Moss no longer uses Figma on weekends."
     ));
 }
+
+#[test]
+fn h4_02_after_a_count_noun_ends_nothing() {
+    assert!(!figma_ended_by(
+        "Ivy Moss no longer uses Figma after 3 incidents."
+    ));
+}
+
+#[test]
+fn h4_02_on_a_count_noun_ends_nothing() {
+    assert!(!figma_ended_by(
+        "Ivy Moss no longer uses Figma on 2 projects."
+    ));
+}
+
+#[test]
+fn h4_02_year_and_date_tails_still_end_the_fact() {
+    assert!(figma_ended_by("Ivy Moss no longer uses Figma in 2025."));
+    assert!(figma_ended_by(
+        "Ivy Moss no longer uses Figma on 2025-05-01."
+    ));
+    assert!(figma_ended_by(
+        "Ivy Moss no longer uses Figma after 2025-05-01."
+    ));
+    assert!(figma_ended_by(
+        "Ivy Moss no longer uses Figma after May 2025."
+    ));
+}
+
+#[test]
+fn h4_02_count_before_a_time_unit_still_ends_the_fact() {
+    assert!(figma_ended_by("Ivy Moss no longer uses Figma in 3 days."));
+}
