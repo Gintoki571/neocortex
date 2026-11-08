@@ -183,6 +183,9 @@ pub fn project_name_parts(db: &Db, entity: i64) -> Result<()> {
 }
 
 pub fn project_relation(db: &Db, id: i64, src: i64, dst: i64, predicate: &str) -> Result<()> {
+    if src == dst {
+        return Ok(());
+    }
     ensure_entity_node(db, src)?;
     ensure_entity_node(db, dst)?;
     run(db, "MERGE (a:Entity {id:$a})-[r:REL {rid:$rid}]->(b:Entity {id:$b}) SET r.predicate=$predicate", &[
@@ -309,7 +312,7 @@ pub fn rebuild_all(db: &Db) -> Result<()> {
         }
     }
     {
-        let mut st = db.sql().prepare("SELECT r.id,r.src,r.dst,p.canonical FROM relations r JOIN predicates p ON p.id=r.predicate_id")?;
+        let mut st = db.sql().prepare("SELECT r.id,r.src,r.dst,p.canonical FROM relations r JOIN predicates p ON p.id=r.predicate_id WHERE r.src != r.dst")?;
         let rows: Vec<(i64, i64, i64, String)> = st
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -408,8 +411,10 @@ fn build_snapshot(
         let mut rows = st.query(params![at])?;
         while let Some(r) = rows.next()? {
             let (s, d, c): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
-            if let (Some(&a), Some(&b)) = (ent_node.get(&s), ent_node.get(&d)) {
-                edges.push((a, b, (1.0 + c as f64).ln().max(0.5) as f32));
+            if s != d {
+                if let (Some(&a), Some(&b)) = (ent_node.get(&s), ent_node.get(&d)) {
+                    edges.push((a, b, (1.0 + c as f64).ln().max(0.5) as f32));
+                }
             }
         }
     } else if include_ended {
@@ -419,8 +424,10 @@ fn build_snapshot(
         let mut rows = st.query([])?;
         while let Some(r) = rows.next()? {
             let (s, d, c): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
-            if let (Some(&a), Some(&b)) = (ent_node.get(&s), ent_node.get(&d)) {
-                edges.push((a, b, (1.0 + c as f64).ln().max(0.5) as f32));
+            if s != d {
+                if let (Some(&a), Some(&b)) = (ent_node.get(&s), ent_node.get(&d)) {
+                    edges.push((a, b, (1.0 + c as f64).ln().max(0.5) as f32));
+                }
             }
         }
     } else {
@@ -432,8 +439,10 @@ fn build_snapshot(
         let mut rows = st.query([])?;
         while let Some(r) = rows.next()? {
             let (s, d, c): (i64, i64, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
-            if let (Some(&a), Some(&b)) = (ent_node.get(&s), ent_node.get(&d)) {
-                edges.push((a, b, (1.0 + c as f64).ln().max(0.5) as f32));
+            if s != d {
+                if let (Some(&a), Some(&b)) = (ent_node.get(&s), ent_node.get(&d)) {
+                    edges.push((a, b, (1.0 + c as f64).ln().max(0.5) as f32));
+                }
             }
         }
     }
