@@ -319,6 +319,9 @@ When to use each:
   (`NEOCORTEX_RERANK_MODEL`). Without the model, recall is unchanged.
 - Prose fact lines (a relation-less memory rendered as a fact in `facts:`) are
   off: `prose_margin` is infinity, and only `eval --set prose_margin=0` enables it.
+  `prose_wide` (same idea over the top three chains, at any hop position, three
+  lines) is off too: `eval --set prose_wide=on`. Both only add lines; the memory
+  list never changes.
 - The relation-fact seed prefilter is off: `eval --set rel_prefilter=on` reads
   only the relations incident to the first query anchors instead of the global
   relation-vector KNN. Keep it off unless a large database needs the latency.

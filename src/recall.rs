@@ -2606,6 +2606,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             });
         }
     }
+    let mut wide_prose: Vec<FactHit> = Vec::new();
     let mut facts = if negated {
         facts
             .into_iter()
@@ -2622,6 +2623,19 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                 if !merged.iter().any(|existing| existing.id == fact.id) {
                     merged.push(fact);
                 }
+            }
+            // `prose_wide` lines do not displace anything: they are appended
+            // after every other fact channel below, in their own slots.
+            if engine.cfg.prose_wide {
+                let rendered: HashSet<i64> = memories.iter().map(|m| m.id).collect();
+                wide_prose = paths::prose_wide_facts(&engine.db, &sem_hits, &rendered, cutoff)?
+                    .into_iter()
+                    .filter(|fact| {
+                        rows.get(&fact.id).is_some_and(|row| {
+                            eligible(row, as_of, history, input, since, until, now, planned_ok)
+                        })
+                    })
+                    .collect();
             }
         }
         for fact in facts {
@@ -2828,6 +2842,14 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     if ordering || (predecessor_frame && !predecessor_hit) {
         memories.sort_by_key(|m| (m.valid_from, m.id));
         facts.sort_by_key(|f| (f.valid_from, f.id));
+    }
+    // `prose_wide`: a prose-hop memory the question's chain passed through is
+    // in the context as a line of its own, after the relation facts, so the
+    // eight relation/entity facts keep their slots.
+    for fact in wide_prose {
+        if !facts.iter().any(|f| f.memory && f.id == fact.id) {
+            facts.push(fact);
+        }
     }
     let entities = top_entities
         .iter()
