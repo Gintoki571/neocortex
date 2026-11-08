@@ -65,6 +65,11 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y + i64::from(m <= 2), m as u32, d as u32)
 }
 
+/// True when one token is a whole ISO date or year-month ("2025-05-01", "2025-05").
+pub fn is_iso_date_token(s: &str) -> bool {
+    parse_iso_date(s).is_some() || parse_year_month(s).is_some()
+}
+
 /// One instant from a whole input string: unix seconds, ISO date/datetime
 /// (local offset unless Z/offset given), or a relative phrase ("today",
 /// "yesterday", "3 days ago", "last month" -> start of that period).

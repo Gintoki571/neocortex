@@ -1454,3 +1454,94 @@ fn h3_12r_supplies_parts_to_ends_simple_supplies() {
     );
     assert_eq!(relation_end(&e, rid), Some(NOW));
 }
+
+/// Ingest "Ivy Moss uses Figma." with its relation and return the relation id.
+fn ivy_uses_figma(e: &Engine) -> i64 {
+    let out = e
+        .remember(RememberInput {
+            content: "Ivy Moss uses Figma.".into(),
+            valid_from: Some("2025-01-10".into()),
+            entities: vec![person("Ivy Moss"), tool("Figma")],
+            relations: vec![rel("Ivy Moss", "uses", "Figma", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    out.relations[0].id
+}
+
+/// Retract "Ivy Moss uses Figma" with `content` and return whether it ended.
+fn figma_ended_by(content: &str) -> bool {
+    let e = engine();
+    let rid = ivy_uses_figma(&e);
+    let out = e
+        .remember(RememberInput {
+            content: content.into(),
+            entities: vec![person("Ivy Moss"), tool("Figma")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        out.invalidated_relations.contains(&rid),
+        relation_end(&e, rid).is_some()
+    );
+    relation_end(&e, rid).is_some()
+}
+
+#[test]
+fn h4_02_iso_day_tail_ends_the_fact() {
+    assert!(figma_ended_by(
+        "Ivy Moss no longer uses Figma on 2025-05-01."
+    ));
+}
+
+#[test]
+fn h4_02_iso_month_tail_ends_the_fact() {
+    assert!(figma_ended_by("Ivy Moss no longer uses Figma in 2025-05."));
+}
+
+#[test]
+fn h4_02_after_iso_day_tail_ends_the_fact() {
+    assert!(figma_ended_by(
+        "Ivy Moss no longer uses Figma after 2025-05-01."
+    ));
+}
+
+#[test]
+fn h4_02_non_date_on_tail_still_ends_nothing() {
+    assert!(!figma_ended_by(
+        "Ivy Moss no longer uses Figma on weekends."
+    ));
+}
+
+#[test]
+fn h4_02_after_a_count_noun_ends_nothing() {
+    assert!(!figma_ended_by(
+        "Ivy Moss no longer uses Figma after 3 incidents."
+    ));
+}
+
+#[test]
+fn h4_02_on_a_count_noun_ends_nothing() {
+    assert!(!figma_ended_by(
+        "Ivy Moss no longer uses Figma on 2 projects."
+    ));
+}
+
+#[test]
+fn h4_02_year_and_date_tails_still_end_the_fact() {
+    assert!(figma_ended_by("Ivy Moss no longer uses Figma in 2025."));
+    assert!(figma_ended_by(
+        "Ivy Moss no longer uses Figma on 2025-05-01."
+    ));
+    assert!(figma_ended_by(
+        "Ivy Moss no longer uses Figma after 2025-05-01."
+    ));
+    assert!(figma_ended_by(
+        "Ivy Moss no longer uses Figma after May 2025."
+    ));
+}
+
+#[test]
+fn h4_02_count_before_a_time_unit_still_ends_the_fact() {
+    assert!(figma_ended_by("Ivy Moss no longer uses Figma in 3 days."));
+}
