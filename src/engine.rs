@@ -1037,7 +1037,7 @@ impl Engine {
         let entities = count("SELECT count(*) FROM entities")?;
         let mentions = count("SELECT count(*) FROM mentions")?;
         let similar = count("SELECT count(*) FROM similar")?;
-        let relations = count("SELECT count(*) FROM relations")?;
+        let relations = count("SELECT count(*) FROM relations WHERE src != dst")?;
         let name_parts = count("SELECT count(*) FROM name_part")?;
         if nodes != memories + entities {
             out.push(format!(
@@ -1046,6 +1046,7 @@ impl Engine {
             ));
         }
         // A B5 containment link is a projection edge like a mention or a relation.
+        // Self-loop relations (merge artifacts) are never projected.
         if edges != mentions + similar + relations + name_parts {
             out.push(format!(
                 "projection edges: {edges}, relational: {}",
