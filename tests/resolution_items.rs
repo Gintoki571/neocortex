@@ -231,3 +231,98 @@ fn ex06_controls_caps_names_and_compound_names_still_extract() {
         assert!(got.iter().any(|(n, _)| n == name), "{name}: {got:?}");
     }
 }
+
+// nc-ex03 / EX-03: a real recurring compound (capitalised again in the same
+// text) is still created, even when its head is a known alias.
+#[test]
+fn ex03_recurring_compound_in_same_text_is_created() {
+    let e = engine();
+    let cypher = EntityIn {
+        name: "Cypher".into(),
+        kind: Some("tool".into()),
+        ..Default::default()
+    };
+    remember(&e, "Cypher is the query language.", vec![cypher]);
+    let out = remember(
+        &e,
+        "Cypher Memory nodes are stored. Cypher Memory is useful.",
+        vec![],
+    );
+    let n = names(&out);
+    assert!(
+        n.contains(&"Cypher Memory"),
+        "recurring compound must be created: {n:?}"
+    );
+}
+
+// nc-ex03 / EX-03: a non-recurring compound with a known head still splits to
+// the head (control for the recurrence rule).
+#[test]
+fn ex03_non_recurring_compound_with_known_head_stays_split() {
+    let e = engine();
+    let cypher = EntityIn {
+        name: "Cypher".into(),
+        kind: Some("tool".into()),
+        ..Default::default()
+    };
+    remember(&e, "Cypher is the query language.", vec![cypher]);
+    let out = remember(&e, "Cypher Memory nodes are stored.", vec![]);
+    let n = names(&out);
+    assert!(n.contains(&"Cypher"), "{n:?}");
+    assert!(!n.contains(&"Cypher Memory"), "{n:?}");
+}
+
+// nc-ex03 / EX-05: a sentence-initial word is kept when it is already a stored
+// alias (one indexed lookup via the known callback).
+#[test]
+fn ex05_sentence_initial_known_alias_is_kept() {
+    let e = engine();
+    let cypher = EntityIn {
+        name: "Cypher".into(),
+        kind: Some("tool".into()),
+        ..Default::default()
+    };
+    remember(&e, "We use Cypher here.", vec![cypher]);
+    let out = remember(&e, "Cypher is the query language.", vec![]);
+    let n = names(&out);
+    assert!(
+        n.contains(&"Cypher"),
+        "known sentence-initial alias must be kept: {n:?}"
+    );
+}
+
+// nc-ex03 / EX-05: unknown sentence-initial openers/status words and
+// non-name labels stay dropped (cases main 4a14f81 also drops). "Repo was
+// renamed..." is not included: a rename in prose never merges (nc-rename), so
+// the verb-cue rescue keeping "Repo" is harmless and restores the Paris recall.
+#[test]
+fn ex05_unknown_sentence_initial_words_still_dropped() {
+    let e = engine();
+    for (text, bad) in [
+        ("Update: Ana joined Acme.", "Update"),
+        ("The system runs fast.", "The"),
+        ("Starting was slow.", "Starting"),
+    ] {
+        let out = remember(&e, text, vec![]);
+        let n = names(&out);
+        assert!(
+            !n.contains(&bad),
+            "{bad:?} must not be extracted from {text:?}: {n:?}"
+        );
+    }
+}
+
+// nc-ex03 / EX-05: two unknown capitalised words at sentence start are not
+// created as a compound ("Release Notes:").
+#[test]
+fn ex05_release_notes_not_created_as_unknown_compound() {
+    let e = engine();
+    let out = remember(&e, "Release Notes: version 1.0 is ready.", vec![]);
+    let n = names(&out);
+    assert!(
+        !n.contains(&"Release Notes"),
+        "unknown compound must not be created: {n:?}"
+    );
+    assert!(!n.contains(&"Release"), "{n:?}");
+    assert!(!n.contains(&"Notes"), "{n:?}");
+}

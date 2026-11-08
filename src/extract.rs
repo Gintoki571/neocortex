@@ -605,7 +605,10 @@ fn word_candidates(
             if unit_label_follows(&words, text, k) {
                 break;
             }
-            if is_proper_word(w) && !is_unit_after_number(&words, text, k) {
+            if is_proper_word(w)
+                && !is_unit_after_number(&words, text, k)
+                && (!excluded_word(w) || is_status_word(w))
+            {
                 last = k;
                 k += 1;
             } else if is_connector(w)
@@ -910,7 +913,8 @@ fn unit_label_candidates(text: &str, words: &[Word<'_>]) -> Vec<Candidate> {
 
 /// EX-03: "Cypher Memory nodes" is a known first word plus a noun when the
 /// first word is already an entity or alias, the compound is not, and the
-/// next word is in `SPAN_NOUNS`. Two-word spans only.
+/// next word is in `SPAN_NOUNS`. Two-word spans only. A compound that recurs
+/// capitalised elsewhere in the same text is kept (nc-ex03).
 fn is_known_head_span(
     text: &str,
     words: &[Word<'_>],
@@ -924,10 +928,12 @@ fn is_known_head_span(
     let Some(next) = words.get(e_idx + 1) else {
         return false;
     };
+    let compound = &text[words[s_idx].start..words[e_idx].end];
     SPAN_NOUNS.contains(&next.text)
         && gap_is_space(text, &words[e_idx], next)
         && known(words[s_idx].text)
-        && !known(&text[words[s_idx].start..words[e_idx].end])
+        && !known(compound)
+        && text.matches(compound).count() <= 1
 }
 
 fn word_hint(text: &str) -> Option<&'static str> {
@@ -1033,6 +1039,9 @@ fn excluded_word(word: &str) -> bool {
         || is_stopword(&norm)
         || is_weekday_or_month(&norm)
         || OPENERS.contains(&norm.as_str())
+        || norm
+            .strip_suffix('s')
+            .is_some_and(|base| OPENERS.contains(&base))
 }
 
 fn is_weekday_or_month(word: &str) -> bool {
