@@ -27,6 +27,14 @@ fn type_key(kind: Option<&str>) -> String {
     kind.map(|k| k.trim().to_lowercase()).unwrap_or_default()
 }
 
+fn norm_for(s: &str, kind: &str) -> String {
+    if PERSON_TYPES.contains(&kind) {
+        text::norm_name_person(s)
+    } else {
+        text::norm_name(s)
+    }
+}
+
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -632,16 +640,16 @@ pub fn resolve_entity(
     semantic: bool,
     write_names: &[String],
 ) -> Result<Resolved> {
-    let norm = text::norm_name(&item.name);
+    let kind = type_key(item.kind.as_deref());
+    let norm = norm_for(&item.name, &kind);
     if norm.is_empty() {
         return Err(crate::err!("entity name cannot be empty"));
     }
-    let kind = type_key(item.kind.as_deref());
     let exclude = resolve_distinct_from(db, &item.distinct_from)?;
 
     if let Some(forced) = item.same_as.as_deref() {
         let id = resolve_same_as(db, forced)?;
-        add_aliases(db, id, item, "agent")?;
+        add_aliases(db, id, item, &kind, "agent")?;
         enrich(db, id, item, now)?;
         return Ok(Resolved {
             id,
@@ -653,7 +661,7 @@ pub fn resolve_entity(
 
     let mut norms = vec![norm.clone()];
     for alias in &item.aliases {
-        let alias_norm = text::norm_name(alias);
+        let alias_norm = norm_for(alias, &kind);
         if !alias_norm.is_empty() && !norms.contains(&alias_norm) {
             norms.push(alias_norm);
         }
@@ -679,7 +687,7 @@ pub fn resolve_entity(
                     r.get(0)
                 })?;
         let name_matched = canonical == norm;
-        add_aliases(db, chosen, item, "agent")?;
+        add_aliases(db, chosen, item, &kind, "agent")?;
         let conflict = description_conflict(db, chosen, item, embedding, cfg, semantic)?;
         if ambiguous || conflict {
             if conflict && candidates.is_empty() {
@@ -706,7 +714,7 @@ pub fn resolve_entity(
 
     // EX-04: a unique alias prefix resolves on write as it does on read.
     if let Some(id) = unique_prefix(db, &norm, &item.name, &kind, &exclude)? {
-        add_aliases(db, id, item, "prefix")?;
+        add_aliases(db, id, item, &kind, "prefix")?;
         enrich(db, id, item, now)?;
         return Ok(Resolved {
             id,
@@ -769,17 +777,30 @@ pub fn resolve_entity(
             acronym = Some((*id, *score));
         }
     }
-    if let Some((id, _)) = lexical.or(acronym) {
-        let status = if lexical.is_some() {
-            "lexical"
+    if let Some((id, _)) = lexical {
+        let entity_norm = norms.get(&id).cloned().unwrap_or_default();
+        if PERSON_TYPES.contains(&kind.as_str())
+            && !near_corroborated(db, &norm, &entity_norm, id, write_names)?
+        {
+            // A typo-sized near-name of a person merges only with ER-08
+            // corroboration; fall through to ER-07/ambiguous.
         } else {
-            "acronym"
-        };
-        add_aliases(db, id, item, status)?;
+            add_aliases(db, id, item, &kind, "lexical")?;
+            enrich(db, id, item, now)?;
+            return Ok(Resolved {
+                id,
+                status: "lexical".into(),
+                similar: Vec::new(),
+                candidates: Vec::new(),
+            });
+        }
+    }
+    if let Some((id, _)) = acronym {
+        add_aliases(db, id, item, &kind, "acronym")?;
         enrich(db, id, item, now)?;
         return Ok(Resolved {
             id,
-            status: status.into(),
+            status: "acronym".into(),
             similar: Vec::new(),
             candidates: Vec::new(),
         });
@@ -825,7 +846,7 @@ pub fn resolve_entity(
         }
     }
     if let Some((id, _)) = merged {
-        add_aliases(db, id, item, "near")?;
+        add_aliases(db, id, item, &kind, "near")?;
         enrich(db, id, item, now)?;
         return Ok(Resolved {
             id,
@@ -1000,7 +1021,7 @@ fn insert_entity(
         params![norm, id],
     )?;
     for alias in &item.aliases {
-        let alias_norm = text::norm_name(alias);
+        let alias_norm = norm_for(alias, kind);
         if alias_norm.is_empty() {
             continue;
         }
@@ -1332,7 +1353,11 @@ fn unique_prefix(
 /// Record one more name for an entity, e.g. the nickname a relation would
 /// otherwise store as a self-loop (H2-18).
 pub(crate) fn add_alias(db: &Db, id: i64, alias: &str, origin: &str) -> Result<()> {
-    let norm = text::norm_name(alias);
+    let kind: String = db
+        .sql()
+        .query_row("SELECT type FROM entities WHERE id=?1", [id], |r| r.get(0))
+        .unwrap_or_default();
+    let norm = norm_for(alias, &kind);
     if norm.is_empty() {
         return Ok(());
     }
@@ -1348,10 +1373,10 @@ pub(crate) fn add_alias(db: &Db, id: i64, alias: &str, origin: &str) -> Result<(
 
 /// Add the mention's name and aliases to an entity. Never touches
 /// `mention_count` (the caller counts mention rows).
-fn add_aliases(db: &Db, id: i64, item: &EntityIn, origin: &str) -> Result<()> {
+fn add_aliases(db: &Db, id: i64, item: &EntityIn, kind: &str, origin: &str) -> Result<()> {
     let mut changed = false;
     for alias in std::iter::once(&item.name).chain(item.aliases.iter()) {
-        let norm = text::norm_name(alias);
+        let norm = norm_for(alias, kind);
         if norm.is_empty() {
             continue;
         }

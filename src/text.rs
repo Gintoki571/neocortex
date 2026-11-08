@@ -93,13 +93,27 @@ fn drop_caps_plurals(s: &str) -> String {
 /// "c plus plus" (see `expand_symbols`), so a tool named "C#" never shares a
 /// card with "C", "C++" or "F#".
 pub fn norm_name(s: &str) -> String {
+    norm_name_inner(s, true)
+}
+
+/// Like `norm_name` but keeps the last token's plural form. Person surnames
+/// ("Parks", "Leeds", "Jones") are names, not plural nouns; singularising them
+/// collapses distinct people. EX-06b caps-abbreviation folding (DBs -> DB)
+/// still applies.
+pub fn norm_name_person(s: &str) -> String {
+    norm_name_inner(s, false)
+}
+
+fn norm_name_inner(s: &str, singular_last: bool) -> String {
     let folded = fold(&expand_symbols(&drop_caps_plurals(strip_possessive(s))));
     let mut words = name_words(&folded);
     if words.is_empty() {
         return folded;
     }
-    if let Some(last) = words.last_mut() {
-        *last = singularize(last);
+    if singular_last {
+        if let Some(last) = words.last_mut() {
+            *last = singularize(last);
+        }
     }
     canon_versions(&words.join(" "))
 }
