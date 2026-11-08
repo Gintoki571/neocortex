@@ -134,13 +134,6 @@ pub fn parse_span(s: &str, clock: &Clock) -> Option<(i64, i64)> {
     resolve_range(&expr, clock)
 }
 
-/// The single explicit date in free text ("March 5, 2025", "in 2019", "2027-06-15",
-/// "yesterday", "3 days ago") to use as a memory's start. None when the text has
-/// no such date, several windows, or only relative phrases like "next month".
-pub fn text_date(text: &str, clock: &Clock) -> Option<Window> {
-    text_dates(text, clock).and_then(|d| d.start)
-}
-
 /// The dates a memory's text states. `start` is the day (or month/year) the
 /// memory became true; `end` is the exclusive end of a written range, which is
 /// the day after the written last day ("from July 6 to August 14" ends on the

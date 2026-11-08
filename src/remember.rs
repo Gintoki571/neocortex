@@ -4539,24 +4539,17 @@ fn write_temporal_links(db: &Db, memory: i64, valid_from: i64, cfg: &Config) -> 
         limit = entity_ids.len() + 5,
     );
     let mut st = db.sql().prepare(&sql)?;
-    let mut p: Vec<Box<dyn rusqlite::ToSql>> = entity_ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
-        .collect();
-    for value in [
+    let p = entity_ids.iter().copied().chain([
         memory,
         valid_from - window,
         valid_from + window,
         valid_from,
         cap as i64,
-    ] {
-        p.push(Box::new(value));
-    }
+    ]);
     let candidates: Vec<(i64, i64)> = st
-        .query_map(
-            rusqlite::params_from_iter(p.iter().map(|x| x.as_ref())),
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?
+        .query_map(rusqlite::params_from_iter(p), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     for (other, other_from) in candidates {
         let gap = (valid_from - other_from).abs() as f64;

@@ -1201,6 +1201,22 @@ pub(crate) fn search(db: &Db, query: &str, seeds: &[i64], vis: Visibility) -> Re
 /// Facts recognised as relevant to the question: one KNN over relation fact
 /// vectors bounds the semantic beam below.
 pub(crate) const SEM_FACTS: usize = 100;
+
+/// The `SEM_FACTS` relations nearest the question, best first, with cosine.
+pub(crate) fn relation_knn(db: &Db, query_vec: &[f32]) -> Result<Vec<(i64, f32)>> {
+    Ok(db
+        .sql()
+        .prepare_cached(&format!(
+            "SELECT rowid,1-distance FROM relations_vec
+             WHERE embedding MATCH {} AND k=?2 ORDER BY distance",
+            db.vec_sql("?1")
+        ))?
+        .query_map(params![db.vec_blob(query_vec), SEM_FACTS as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 /// Edges taken from one entity in the semantic beam.
 const SEM_EDGES: usize = 6;
 /// Most relations an entity may carry before the semantic beam stops
@@ -1298,6 +1314,7 @@ pub(crate) fn search_semantic(
     anchors: &[i64],
     prose_hops: bool,
     nearest_memories: &[i64],
+    relation_knn: &[(i64, f32)],
     vis: Visibility,
     use_scorer: bool,
     name_hop: f64,
@@ -1309,18 +1326,10 @@ pub(crate) fn search_semantic(
     for t in text::tokens(query) {
         query_forms.extend(token_forms(&t));
     }
-    // Facts the question recognises; their vectors are read lazily, only for
-    // the edges the beam reaches (a vec0 vector read costs ~0.3 ms).
-    let relevant: HashSet<i64> = db
-        .sql()
-        .prepare_cached(&format!(
-            "SELECT rowid FROM relations_vec WHERE embedding MATCH {} AND k=?2",
-            db.vec_sql("?1")
-        ))?
-        .query_map(params![db.vec_blob(query_vec), SEM_FACTS as i64], |r| {
-            r.get::<_, i64>(0)
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    // Facts the question recognises (`relation_knn`); their vectors are read
+    // lazily, only for the edges the beam reaches (a vec0 vector read costs
+    // ~0.3 ms).
+    let relevant: HashSet<i64> = relation_knn.iter().map(|(id, _)| *id).collect();
     let mut relation_vector_st = db
         .sql()
         .prepare_cached("SELECT embedding FROM relations_vec WHERE rowid=?1")?;
@@ -1804,9 +1813,7 @@ fn specific_entities(db: &Db, ids: &HashSet<i64>) -> Result<HashSet<i64>> {
     let total: i64 = db
         .sql()
         .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
-    let marks = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; ids.len()].join(",");
     let mut st = db.sql().prepare(&format!(
         "SELECT entity_id,COUNT(DISTINCT memory_id) FROM mentions
          WHERE entity_id IN ({marks}) GROUP BY entity_id"
@@ -1830,7 +1837,7 @@ fn related_memories(db: &Db, seeds: &[i64], specific: &HashSet<i64>) -> Result<H
     if specific.is_empty() {
         return Ok(HashSet::new());
     }
-    let marks = |n: usize| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
+    let marks = |n: usize| vec!["?"; n].join(",");
     let mut st = db.sql().prepare(&format!(
         "SELECT DISTINCT a.memory_id FROM mentions a
          JOIN mentions b ON b.entity_id=a.entity_id
@@ -1839,16 +1846,9 @@ fn related_memories(db: &Db, seeds: &[i64], specific: &HashSet<i64>) -> Result<H
         marks(seeds.len()),
         marks(specific.len())
     ))?;
-    let p: Vec<Box<dyn rusqlite::ToSql>> = seeds
-        .iter()
-        .chain(seeds.iter())
-        .chain(specific.iter())
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
-        .collect();
     let mut out = HashSet::new();
-    for id in st.query_map(params_from_iter(p.iter().map(|x| x.as_ref())), |r| {
-        r.get::<_, i64>(0)
-    })? {
+    let p = seeds.iter().chain(seeds).chain(specific);
+    for id in st.query_map(params_from_iter(p), |r| r.get::<_, i64>(0))? {
         out.insert(id?);
     }
     Ok(out)
@@ -1858,40 +1858,24 @@ fn related_memories(db: &Db, seeds: &[i64], specific: &HashSet<i64>) -> Result<H
 /// one of `candidates`, plus those that end at a question anchor. The endpoint
 /// lists are literal placeholders so the plan is driven by `idx_relev_memory`
 /// and `idx_rel_src`/`idx_rel_dst` instead of a scan of every stored relation.
-fn cause_relation_query(
-    group: i64,
-    candidates: &[i64],
-    anchors: &[i64],
-) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
-    let marks = |n: usize| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
+fn cause_relation_query(group: i64, candidates: &[i64], anchors: &[i64]) -> (String, Vec<i64>) {
+    let marks = |n: usize| vec!["?"; n].join(",");
     let mut branches = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(group)];
+    let mut params = vec![group];
     if !candidates.is_empty() {
         branches.push(format!(
             "SELECT relation_id FROM relation_evidence WHERE memory_id IN ({})",
             marks(candidates.len())
         ));
-        params.extend(
-            candidates
-                .iter()
-                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-        );
+        params.extend(candidates);
     }
     if !anchors.is_empty() {
         branches.push(format!(
             "SELECT id FROM relations WHERE src IN ({0}) OR dst IN ({0})",
             marks(anchors.len())
         ));
-        params.extend(
-            anchors
-                .iter()
-                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-        );
-        params.extend(
-            anchors
-                .iter()
-                .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
-        );
+        params.extend(anchors);
+        params.extend(anchors);
     }
     let sql = format!(
         "SELECT r.id,r.valid_from,r.valid_to,r.expired_at,e.memory_id,r.src,r.dst
@@ -1935,9 +1919,7 @@ pub(crate) fn cause_follow(
     let Some(group) = group else {
         return Ok((Vec::new(), Vec::new()));
     };
-    let marks = std::iter::repeat_n("?", seeds.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; seeds.len()].join(",");
     let mut seed_entities: HashSet<i64> = HashSet::new();
     let mut st = db.sql().prepare(&format!(
         "SELECT entity_id FROM mentions WHERE memory_id IN ({marks})"
@@ -1964,7 +1946,7 @@ pub(crate) fn cause_follow(
     let mut st = db.sql().prepare(&sql)?;
     let mut pairs: Vec<(i64, i64)> = Vec::new();
     let mut anchored: HashSet<i64> = HashSet::new();
-    for row in st.query_map(params_from_iter(params.iter().map(|x| x.as_ref())), |r| {
+    for row in st.query_map(params_from_iter(&params), |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
@@ -2598,6 +2580,49 @@ pub fn aggregate(engine: &Engine, input: &AggregateInput) -> Result<AggregateOut
 }
 
 #[cfg(test)]
+mod relation_knn_tests {
+    use crate::db::Db;
+    use rusqlite::params;
+
+    /// recall's relation-fact seeds are the first 10 hits of the shared
+    /// SEM_FACTS scan; that equals a k=10 query only while vec0's top-k is
+    /// prefix-stable, exact distance ties included.
+    #[test]
+    fn the_first_ten_shared_hits_are_a_k10_query() {
+        let db = Db::open_in_memory().unwrap();
+        for id in 1..=300i64 {
+            let mut v = vec![0.0f32; 768];
+            v[0] = 1.0;
+            v[1 + (id % 7) as usize] = (id % 5) as f32 * 0.1;
+            db.sql()
+                .execute(
+                    "INSERT INTO relations_vec(rowid,embedding) VALUES (?1,?2)",
+                    params![id, db.vec_blob(&v)],
+                )
+                .unwrap();
+        }
+        let mut query = vec![0.0f32; 768];
+        query[0] = 1.0;
+        query[2] = 0.3;
+        let shared = super::relation_knn(&db, &query).unwrap();
+        let k10: Vec<(i64, f32)> = db
+            .sql()
+            .prepare(&format!(
+                "SELECT rowid,1-distance FROM relations_vec
+                 WHERE embedding MATCH {} AND k=10 ORDER BY distance",
+                db.vec_sql("?1")
+            ))
+            .unwrap()
+            .query_map([db.vec_blob(&query)], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(shared.len(), super::SEM_FACTS);
+        assert_eq!(shared[..10], k10[..]);
+    }
+}
+
+#[cfg(test)]
 mod hop_scorer_tests {
     use super::{hop_value, HOP_BIAS, HOP_WEIGHTS};
 
@@ -2770,9 +2795,7 @@ mod tests {
             .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .unwrap();
         let plan: Vec<String> = st
-            .query_map(params_from_iter(params.iter().map(|x| x.as_ref())), |r| {
-                r.get::<_, String>(3)
-            })
+            .query_map(params_from_iter(&params), |r| r.get::<_, String>(3))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
@@ -2917,6 +2940,7 @@ mod name_part_tests {
             &[seed],
             true,
             &[1],
+            &super::relation_knn(db, &query).unwrap(),
             vis,
             false,
             NAME_PART_HOP,
@@ -3089,6 +3113,7 @@ mod widen_tests {
             &[noor],
             false,
             &[],
+            &super::relation_knn(&db, &query).unwrap(),
             vis,
             false,
             super::NAME_PART_HOP,
