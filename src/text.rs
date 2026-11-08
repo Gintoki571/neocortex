@@ -96,11 +96,11 @@ pub fn norm_name(s: &str) -> String {
     norm_name_inner(s, true)
 }
 
-/// Like `norm_name` but keeps the last token's plural form. Person surnames
-/// ("Parks", "Leeds", "Jones") are names, not plural nouns; singularising them
-/// collapses distinct people. EX-06b caps-abbreviation folding (DBs -> DB)
-/// still applies.
-pub fn norm_name_person(s: &str) -> String {
+/// Comparison-only key that keeps the last token's surface form (no singular).
+/// Person surnames ("Parks", "Leeds") are names; singularising them collapses
+/// distinct people (H4-01). The stored/lookup key remains `norm_name` for DB
+/// compatibility; resolution uses this only to detect a collapsed surname.
+pub(crate) fn identity_norm(s: &str) -> String {
     norm_name_inner(s, false)
 }
 

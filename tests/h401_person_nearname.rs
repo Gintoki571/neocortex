@@ -206,3 +206,142 @@ fn same_person_with_shared_org_still_merges() {
     );
     assert!(r.id > 0);
 }
+
+#[test]
+fn old_db_singularized_person_key_keeps_one_entity() {
+    // Round 2: old DBs stored person norms singularized ("ana jone"). A later
+    // write of the same person must resolve to that entity, not create a
+    // duplicate (the repro the orchestrator reported against round 1).
+    let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    let dir = std::path::PathBuf::from(base).join(format!("nc-h401-old-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("old.db");
+    let now = 1_792_756_800i64;
+    // Simulate the old/main row: singularized norm + alias, as main wrote it.
+    {
+        let db = neocortex::db::Db::open(&path).unwrap();
+        db.sql()
+            .execute(
+                "INSERT INTO entities(name,norm,type,homonym,description,created_at,updated_at) \
+                 VALUES ('Ana Jones','ana jone','person',0,'',?1,?1)",
+                [now],
+            )
+            .unwrap();
+        let id = db.sql().last_insert_rowid();
+        db.sql()
+            .execute(
+                "INSERT INTO entity_aliases(alias_norm,entity_id,origin) VALUES ('ana jone',?1,'name')",
+                [id],
+            )
+            .unwrap();
+        db.sql()
+            .execute(
+                "INSERT INTO entities_fts(rowid,name,aliases,description) VALUES (?1,'Ana Jones','ana jone','')",
+                [id],
+            )
+            .unwrap();
+        let mut emb: Vec<f32> = vec![0.0; 768];
+        emb[0] = 1.0;
+        db.sql()
+            .execute(
+                &format!(
+                    "INSERT INTO entities_vec(rowid,embedding) VALUES (?1,{})",
+                    db.vec_sql("?2")
+                ),
+                rusqlite::params![id, db.vec_blob(&emb)],
+            )
+            .unwrap();
+    }
+    let e = Engine::open(&path, Arc::new(HashEmbedder))
+        .unwrap()
+        .with_clock(Clock {
+            now: NOW,
+            tz_offset_secs: 0,
+        });
+    let out = remember(
+        &e,
+        "Ana Jones moved to Lisbon.",
+        vec![person("Ana Jones")],
+        vec![rel("Ana Jones", "lives in", "Lisbon")],
+    );
+    let r = resolution(&out, "Ana Jones");
+    assert_ne!(
+        r.status, "ambiguous",
+        "same person must not duplicate: {r:#?}"
+    );
+    assert_eq!(
+        r.id, 1,
+        "must resolve to the pre-existing Ana Jones (e1), got {r:#?}"
+    );
+    let n: i64 = e
+        .validate()
+        .ok()
+        .map(|_| {
+            // count directly via a fresh read by reopening not needed; use entity lookup
+            0i64
+        })
+        .unwrap_or(0);
+    let ana = e.entity("Ana Jones", 50).unwrap();
+    assert_eq!(ana.card.id, 1, "Ana Jones must be e1, got e{}", ana.card.id);
+    let issues = e.validate().unwrap();
+    assert!(issues.is_empty(), "validate must be clean: {issues:#?}");
+    let _ = n;
+    drop(e);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn person_name_lookups_resolve_correctly() {
+    let e = engine();
+    remember(
+        &e,
+        "Sam Leeds owns the billing dashboard.",
+        vec![person("Sam Leeds")],
+        vec![rel("Sam Leeds", "owns", "billing dashboard")],
+    );
+    remember(
+        &e,
+        "Ana Jones works at Acme.",
+        vec![person("Ana Jones")],
+        vec![rel("Ana Jones", "works at", "Acme")],
+    );
+    let sam = e.entity("Sam Leeds", 50).unwrap();
+    assert!(sam.card.id > 0, "Sam Leeds lookup failed: {sam:#?}");
+    assert!(
+        sam.current_facts
+            .iter()
+            .any(|f| f.fact.to_lowercase().contains("billing")),
+        "Sam Leeds card missing fact: {:#?}",
+        sam.current_facts
+    );
+    let ana = e.entity("Ana Jones", 50).unwrap();
+    assert!(ana.card.id > 0, "Ana Jones lookup failed: {ana:#?}");
+    assert!(
+        ana.current_facts
+            .iter()
+            .any(|f| f.fact.to_lowercase().contains("acme")),
+        "Ana Jones card missing fact: {:#?}",
+        ana.current_facts
+    );
+    // follow by name
+    let f = neocortex::paths::follow(
+        &e,
+        &neocortex::paths::FollowInput {
+            from: "Sam Leeds".into(),
+            to: None,
+            predicate: None,
+            depth: Some(2),
+            k: Some(50),
+            as_of: None,
+            include_history: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        f.facts
+            .iter()
+            .any(|x| x.fact.to_lowercase().contains("billing")),
+        "follow Sam Leeds missing fact: {f:#?}"
+    );
+}

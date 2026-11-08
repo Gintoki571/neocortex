@@ -27,12 +27,11 @@ fn type_key(kind: Option<&str>) -> String {
     kind.map(|k| k.trim().to_lowercase()).unwrap_or_default()
 }
 
-fn norm_for(s: &str, kind: &str) -> String {
-    if PERSON_TYPES.contains(&kind) {
-        text::norm_name_person(s)
-    } else {
-        text::norm_name(s)
-    }
+/// Stored identity key: always the canonical singularized norm so read-side
+/// lookups, alias storage and existing databases stay consistent. Person
+/// surname-collapse merges are blocked in resolution, not by changing keys.
+fn norm_for(s: &str, _kind: &str) -> String {
+    text::norm_name(s)
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -509,6 +508,33 @@ pub(crate) fn near_name(
     }
 }
 
+fn folded_surname(name: &str) -> String {
+    text::fold(text::strip_possessive(name))
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// H4-01: ER-08 evidence for a person surname-collapsed exact match, judged on
+/// identity norms (unsingularised last token). The translit-key shortcut is
+/// skipped when the collapsed singularised norms would falsely match; only a
+/// shared person/org neighbour in the same write corroborates.
+fn person_corroborated(
+    db: &Db,
+    a_id: &str,
+    b_id: &str,
+    entity_id: i64,
+    write_names: &[String],
+) -> Result<bool> {
+    // If the identity norms are translit-equal, it is the same spelling in
+    // different scripts/orthography - not a surname collapse.
+    if text::translit_norm(a_id) == text::translit_norm(b_id) {
+        return Ok(true);
+    }
+    shared_neighbour(db, a_id, entity_id, write_names)
+}
+
 /// True when the two names differ only in version or number tokens: "Postgres
 /// 14"/"Postgres 16", "Python 3.12"/"3.13", "API v1"/"v2". A letter label
 /// ("Apt 3B"/"Apt 3C") is not a version token and stays a digit blocker.
@@ -666,7 +692,52 @@ pub fn resolve_entity(
             norms.push(alias_norm);
         }
     }
-    let exact = exact_match(db, &norms, &kind, &exclude)?;
+    let mut exact = exact_match(db, &norms, &kind, &exclude)?;
+    // H4-01: a person exact-norm hit can be a different surname hidden by
+    // singularisation ("Parks"/"Park", "Jones" variants) because the stored key
+    // stays singularised for DB compatibility. Without ER-08 corroboration that
+    // is a different person, not a match: treat as no exact merge and report it
+    // ambiguous with the collided entity as candidate.
+    if !exact.is_empty() && PERSON_TYPES.contains(&kind.as_str()) {
+        let meta = entity_meta(db, &exact)?;
+        let mut keep = Vec::with_capacity(exact.len());
+        let mut collided: Vec<i64> = Vec::new();
+        for id in exact {
+            let stored = meta.get(&id).map(|m| m.name.as_str()).unwrap_or("");
+            let same_surname = folded_surname(&item.name) == folded_surname(stored);
+            let corroborated = if same_surname {
+                true
+            } else {
+                // Use identity norms (unsingularised last token) so a
+                // collapsed singular form never triggers the translit-key
+                // shortcut as false corroboration.
+                person_corroborated(
+                    db,
+                    &text::identity_norm(&item.name),
+                    &text::identity_norm(stored),
+                    id,
+                    write_names,
+                )?
+            };
+            if same_surname || corroborated {
+                keep.push(id);
+            } else {
+                collided.push(id);
+            }
+        }
+        if keep.is_empty() && !collided.is_empty() {
+            let id = insert_entity(db, item, &norm, &kind, embedding, now)?;
+            let meta = entity_meta(db, &collided)?;
+            let scores = score_against(db, &collided, embedding)?;
+            return Ok(Resolved {
+                id,
+                status: "ambiguous".into(),
+                similar: Vec::new(),
+                candidates: candidates_with_scores(&collided, &meta, &scores),
+            });
+        }
+        exact = keep;
+    }
     if !exact.is_empty() {
         let (chosen, ambiguous, mut candidates) =
             choose_exact(db, &exact, &kind, embedding, context)?;
