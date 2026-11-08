@@ -668,6 +668,109 @@ Three product changes (two scale-activated at 50k stored memories, one shelf-wid
 Reproduce: `./target/release/neocortex eval <set>.json --haystack <w10k-int8.db>` (or
 `--load-db <saved haystack copy>` for re-scoring without re-ingesting).
 
+## After nc-scale3: 108,667 real-model memories on main 92adf50 (2026-11-08)
+
+Measurement lane, no code. The other real-model 108k store (nc-scale2) was ingested on fdcad90, before ~25 merges
+(ER-08 follow-ups, nc-ended, nc-h313, nc-hay1 anchor channel + beam admission, nc-nexthop, nc-rename, nc-h203,
+nc-opt, nc-evidence). This run re-ingests world-10000 (seed 10001, read-only at `lanes/tmp/nc-scale100k/world-10000.json`)
+on main 92adf50 (code d00a0ba) with `NEOCORTEX_VEC=int8 neocortex eval <world> --save-db`. Binaries built from the
+worktree (`cargo build --release` + `--example agent_sim`, 4 m 01 s, log `lanes/tmp/nc-scale3/build.log`; copies at
+`lanes/tmp/nc-scale3/bin/`, everything run from the copies). DB kept at `lanes/tmp/nc-scale3/w10k-int8.db` (+ `.keys.json`).
+
+Ingest: 108,667 memories in 11,470,894 ms (3 h 11 min, 9.47/s average). Log `lanes/tmp/nc-scale3/ingest.log`.
+Rate per 10k block (memories/s):
+
+| 0-10k | 10-20k | 20-30k | 30-40k | 40-50k | 50-60k | 60-70k | 70-80k | 80-90k | 90-100k | 100k-108.7k |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 12.22 | 10.78 | 9.71 | 7.72 | 11.13 | 9.30 | 9.63 | 9.19 | 8.88 | 8.61 | 8.50 |
+
+No super-linear tail and no cliff; the slowest block (7.72/s, 30-40k) is in line with nc-scale2's 6.9-10.6/s steady
+state. `validate` on a copy: `ok: no problems`. `stats`: 108,667 (live 108,667) memories, 11,910 entities, 42,571
+relations (live), 1,394 similar, 27 predicates, cold 0; db 261.7 MiB; embedder ultrabert-150m. DB file
+274,272,256 B = 2,525 B per memory (int8; nc-scale2 store: 2,522 B, similar edges 1,388).
+
+Accuracy (`eval --load-db` on a copy, 600 queries; from the ingest run itself):
+
+| category | q | acc@10 | recall | MRR |
+|---|---|---|---|---|
+| aggregation | 60 | 1.000 | 1.000 | 0.964 |
+| as-of | 102 | 1.000 | 1.000 | 0.883 |
+| current | 102 | 1.000 | 0.990 | 0.892 |
+| history | 78 | 1.000 | 1.000 | 1.000 |
+| temporal-window | 60 | 1.000 | 1.000 | 1.000 |
+| three-hop | 78 | 0.949 | 0.654 | 0.639 |
+| two-hop | 120 | 1.000 | 0.867 | 0.762 |
+| overall | 600 | 0.993 | 0.927 | 0.863 |
+
+hints 18/600 queries (~1.0 tokens/query); expect_absent leaked 3/153; context 463.9 tokens/query;
+latency mean/p50/p95 440.80/423.86/538.76 ms.
+
+Versus the nc-scale2 store on the same world (fdcad90): overall acc@10 0.990 -> 0.993, MRR 0.859 -> 0.863,
+two-hop acc@10 0.950 -> 1.000 (the six "which language is used by <person>'s project" ranking misses are gone,
+consistent with nc-hay1's passive-phrasing and anchor work), as-of MRR 0.818 -> 0.883, current recall 0.980 -> 0.990,
+but three-hop acc@10 1.000 -> 0.949 (recall@10 0.812 -> 0.654; recall@50 = 1.000) and three-hop MRR 0.666 -> 0.639.
+
+agent_sim --hints (fresh copy, taskset -c 0): 596/600 answered (0.993); step 1 recall 0.993 | +follow 0.993 |
++recall-leaf 0.993; calls/query 1.01; recall p50 633 ms, follow p50 108 ms; the 4 misses are the three-hop acc misses
+and carry no next-hop hint (0/0 hint-bearing misses followed). nc-scale2: 600/600.
+
+Latency (`eval --load-db` on a copy, includes the query embedding; host shared with other lanes, load 21-103 during
+this lane, versus 3-10 for nc-scale2, so absolute p50s are inflated and the 1-core/2-core comparison is meaningless
+here; accuracy is load-independent and identical across both passes):
+
+| | 1 core (taskset -c 0) | 2 cores (taskset -c 0,1) |
+|---|---|---|
+| recall mean / p50 / p95 | 807.96 / 585.57 / 959.90 ms | 672.75 / 637.33 / 845.91 ms |
+
+nc-scale3 ingest-run p50 (all cores) was 423.86 ms, inside the nc-scale2 band (473.3 / 416.8 ms). Cold CLI recall
+(page cache warm, `taskset -c 0`, child RUSAGE): f32 model peak RSS 635.8 MiB, q8 model 237.6 MiB (nc-scale2:
+632.3 / 237.2) — RSS is model-bound at 108k, unchanged.
+
+Haystack, same binary, copies of both stores (`eval <set> --haystack <copy>`, NEOCORTEX_VEC=int8; NEW = this store,
+OLD = nc-scale2 store, the store's age is the only difference; logs `lanes/tmp/nc-scale3/step4-haystack.log`):
+
+| set | NEW acc@10 / recall / MRR | OLD acc@10 / recall / MRR | NEW p50 | OLD p50 |
+|---|---|---|---|---|
+| fixtures | - / 0.869 / 0.842 | - / 0.869 / 0.842 | 302.0 ms | 331.0 ms |
+| holdout | - / 0.834 / 0.703 | - / 0.834 / 0.703 | 316.5 ms | 333.5 ms |
+| multihop-holdout | 0.900 / 0.621 / 0.809 | 0.900 / 0.621 / 0.809 | 318.6 ms | 322.3 ms |
+| multihop-holdout2 (BLIND: summary lines only) | 0.650 / 0.618 / 0.804 | 0.650 / 0.618 / 0.804 | 393.2 ms | 318.7 ms |
+
+Every accuracy cell is identical between the two stores, and matches the merged nc-hay1 haystack measurements
+(mh1 0.900, mh2 0.650, holdout 0.834). The NEW store carries one more entity (11,910 vs 11,909; relations equal
+at 42,571). The mh2 p50 delta (393 vs 319 ms) is host load, not the store (its p95 was 917 ms; every other p50
+matches within 30 ms).
+
+### The four misses: all ranking class, hop 3
+
+Fresh copy, `--failures` at k=10, then a k=50 pass (`lanes/tmp/nc-scale3/step5-failures.log`; a k=50 copy of the
+world fixture was emitted by `lanes/tmp/nc-scale3/make_k50.py`):
+
+- recall@50 = 1.000 overall (three-hop recall 1.0): every expected memory is in the top 50, so there are no
+  retrieval misses. MRR/acc of the k=50 pass are unchanged (three-hop acc still 0.949, same 4 misses); one expected
+  memory, w034105, moved from outside the top 10 in the k=10 pass to rank 9 in the k=50 pass on the retention bump
+  the first pass recorded.
+- All four acc misses are three-hop "the manager of <person>'s sibling" chains whose answer is the city-move memory;
+  at k=50 the expected memories sit at:
+
+| query (missing answer) | hop memories: sibling / reports-to / city-move | class |
+|---|---|---|
+| where does the manager of Rakesh Davishen's sister live (Kanpur) | w047717@1 / w058808@12 / w093973@11 | ranking |
+| which city does the manager of Ryan Shipore's brother live in (Vienna) | w050427@2 / w046588@16 / w075770@14 | ranking |
+| which city does the manager of Umar Thamani's brother live in (Aurangabad) | w081083@1 / w046918@17 / w095665@14 | ranking |
+| what city is home to the manager of Yusuf Triraj's sister (Brussels) | w062718@3 / w034105@- (k=10) -> @9 (k=50) / w071607@12 | ranking |
+
+- Write path is clean: `entity` cards for all four managers show the live `lives in` facts (Graham Deshvari ->
+  Kanpur since 2026-07-16; Eamon Sodzada -> Vienna since 2026-05-08; Oliver Upamani -> Aurangabad since 2026-07-22;
+  Ibrahim Yadrao -> Brussels since 2026-04-23), the sibling -> manager `has manager` rows are live, and the
+  intervening values are correctly ended (e.g. Graham Deshvari ends "used to report to Maja Versingh"). No wrong
+  merge, no ended fact retired early. This is the nc-scale2 two-hop miss pattern one hop later: ranking, not
+  retrieval, not resolution. The hop-3 city-move memories rank 11-17 at k=50, i.e. just past the acc@10 cut.
+
+Caveats: the two `--load-db` latency passes re-record access on the copy, so pass 2 saw pass 1's retention history
+(accuracy identical); the step-3 copy itself was measured before any recall and is the pristine one for the acc
+figures above. The f32/q8 RSS numbers were taken warm-cache, as in nc-scale2.
+
 ## Reproduce
 
 ```bash
