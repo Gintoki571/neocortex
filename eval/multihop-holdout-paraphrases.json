@@ -1,0 +1,325 @@
+{
+  "comment": "Deterministic paraphrases of eval/multihop-holdout.json questions, written by hand by the lane worker (2026-11-08). Same intent and same answer as the source query; different wording and (mostly) different lexical choices. Used by examples/ledger_replay.rs for the open-question ledger replay: ask the original question with its gold terminal memory absent, remember the gold memory, then ask the paraphrase. Matched to queries by exact string.",
+  "paraphrases": [
+    {
+      "query": "Where did the engineer who guides Noor's early career get schooled?",
+      "paraphrase": "Which school did the person mentoring Noor at the start of her career attend?"
+    },
+    {
+      "query": "Which learned society does the person who guides Noor's career belong to?",
+      "paraphrase": "What professional body is Noor's mentor a member of?"
+    },
+    {
+      "query": "Where does the academic who oversaw Noor's master's thesis give lectures?",
+      "paraphrase": "At which academy does the professor who supervised Noor's master's thesis teach?"
+    },
+    {
+      "query": "Which clinic is the therapist treating Noor's shoulder affiliated with?",
+      "paraphrase": "Where is the physiotherapist looking after Noor's shoulder based?"
+    },
+    {
+      "query": "What medication did Noor's family doctor write a script for?",
+      "paraphrase": "Which drug did Noor's GP prescribe?"
+    },
+    {
+      "query": "Which practice is Noor's registered family doctor based at?",
+      "paraphrase": "At which medical centre does Noor's own family doctor work?"
+    },
+    {
+      "query": "Which city is the consultancy Noor works for headquartered in?",
+      "paraphrase": "In what city is the firm Noor is employed by based?"
+    },
+    {
+      "query": "Who started the firm where Noor is on the staff?",
+      "paraphrase": "Who founded the company Noor works for?"
+    },
+    {
+      "query": "Who is the spouse of principal Ravi Menon?",
+      "paraphrase": "Who is married to Ravi Menon, the principal?"
+    },
+    {
+      "query": "Which instrument does the man living next door to Noor play?",
+      "paraphrase": "What does the neighbour beside Noor play for an instrument?"
+    },
+    {
+      "query": "Which company employs the person who lives next door to Noor?",
+      "paraphrase": "Who is the company that employs Noor's next-door neighbour?"
+    },
+    {
+      "query": "Who chairs the housing cooperative behind Noor's rented flat?",
+      "paraphrase": "Who leads the housing cooperative that manages Noor's apartment?"
+    },
+    {
+      "query": "Which bank backs the rowing club Noor belongs to?",
+      "paraphrase": "What bank sponsors the rowing club Noor rows for?"
+    },
+    {
+      "query": "Who coaches the rowing club Noor belongs to?",
+      "paraphrase": "Who is the coach of Noor's rowing club?"
+    },
+    {
+      "query": "Who teaches the climbing course at the gym Noor belongs to?",
+      "paraphrase": "Who runs the climbing class at the gym Noor goes to?"
+    },
+    {
+      "query": "Who runs the steel company that buys services from Noor's employer?",
+      "paraphrase": "Who is in charge of the steel firm that purchases Noor's company's services?"
+    },
+    {
+      "query": "Which architecture studio shaped the look of the bridge Noor is leading?",
+      "paraphrase": "What studio designed the appearance of the bridge Noor heads?"
+    },
+    {
+      "query": "In which city is the studio that drew the footbridge's look based?",
+      "paraphrase": "Where is the architects' office behind the footbridge's design located?"
+    },
+    {
+      "query": "Who is the partner at the studio that drew the footbridge's look?",
+      "paraphrase": "Who is a partner at the studio that designed the footbridge's look?"
+    },
+    {
+      "query": "Where is the concrete supplier of the footbridge located?",
+      "paraphrase": "In what place is the company supplying concrete for the footbridge?"
+    },
+    {
+      "query": "Which venture firm backed the lab where Chloe Dubois is the top scientist?",
+      "paraphrase": "Which VC firm funded the laboratory where Chloe Dubois is the leading researcher?"
+    },
+    {
+      "query": "Where was the top scientist of Brightwell Labs born?",
+      "paraphrase": "Where does Brightwell Labs' head scientist come from?"
+    },
+    {
+      "query": "In which city is the start-up that Tidewater Ventures funded based?",
+      "paraphrase": "Where is the start-up Tidewater Ventures backed located?"
+    },
+    {
+      "query": "Who sits on the board of the lab Tidewater Ventures funded?",
+      "paraphrase": "Who is on the board of the laboratory funded by Tidewater Ventures?"
+    },
+    {
+      "query": "Where was Noor's classmate from the master's programme born?",
+      "paraphrase": "What is the birthplace of Noor's fellow master's student?"
+    },
+    {
+      "query": "Which design school did Noor's cousin attend?",
+      "paraphrase": "Where did Noor's cousin study design?"
+    },
+    {
+      "query": "Which instrument does Noor's cousin play?",
+      "paraphrase": "What does the cousin of Noor play as an instrument?"
+    },
+    {
+      "query": "What breed is the dog that Noor looks after?",
+      "paraphrase": "Which kind of dog does Noor take care of?"
+    },
+    {
+      "query": "Where does Noor's younger sibling make a home?",
+      "paraphrase": "In which city does Noor's younger sibling live?"
+    },
+    {
+      "query": "What kind of pet does Noor's sibling keep?",
+      "paraphrase": "What sort of pet does Noor's younger sibling keep?"
+    },
+    {
+      "query": "Which allergen should stay out of the office for the graduate Noor guides?",
+      "paraphrase": "What must be kept away from the workplace because of the allergy of Noor's mentee?"
+    },
+    {
+      "query": "Who founded the contractor building the Harbor Quay Retrofit?",
+      "paraphrase": "Who started the construction firm doing the Harbor Quay Retrofit?"
+    },
+    {
+      "query": "Who chairs the body that approved the Kralingen Footbridge?",
+      "paraphrase": "Who heads the committee that gave the Kralingen Footbridge the go-ahead?"
+    },
+    {
+      "query": "Which school did the engineer leading the footbridge graduate from?",
+      "paraphrase": "Where did the engineer in charge of the footbridge study?"
+    },
+    {
+      "query": "Which firm employs the graduate engineer Noor guides?",
+      "paraphrase": "What company does the grad engineer mentored by Noor work for?"
+    },
+    {
+      "query": "Where was the partner of Ravi Menon born?",
+      "paraphrase": "In which city was Ravi Menon's partner born?"
+    },
+    {
+      "query": "In which city is the steel company run by Greta Hoffmann based?",
+      "paraphrase": "Where is Greta Hoffmann's steel company located?"
+    },
+    {
+      "query": "In which town is the workshop that services the Volvo V60 based?",
+      "paraphrase": "Where is the garage that maintains the Volvo V60?"
+    },
+    {
+      "query": "Which employer does Ravi Menon's wife work for?",
+      "paraphrase": "What company employs the spouse of Ravi Menon?"
+    },
+    {
+      "query": "Which project did the chair of the planning committee approve?",
+      "paraphrase": "Which project got the approval of the planning committee's chair?"
+    },
+    {
+      "query": "In which city is the firm employing the graduate that Noor guides headquartered?",
+      "paraphrase": "Where is the company that employs Noor's mentee based?"
+    },
+    {
+      "query": "Who chairs the committee that approved the bridge Noor is leading?",
+      "paraphrase": "Who heads the committee that green-lit the bridge Noor leads?"
+    },
+    {
+      "query": "What species is the pet that Noor's younger sibling keeps?",
+      "paraphrase": "What kind of animal is Noor's younger sibling's pet?"
+    },
+    {
+      "query": "Which town is the garage servicing Noor's car located in?",
+      "paraphrase": "In which town is the workshop that services Noor's car?"
+    },
+    {
+      "query": "Where is the start-up that partner Leon Park's firm put money into headquartered?",
+      "paraphrase": "Where is the start-up backed by Leon Park's venture located?"
+    },
+    {
+      "query": "Where was the spouse of the principal at Noor's firm born?",
+      "paraphrase": "Where was the principal of Noor's firm's spouse born?"
+    },
+    {
+      "query": "Where was the chief executive of Noor's firm's steel client born?",
+      "paraphrase": "In which city was the CEO of the steel client of Noor's firm born?"
+    },
+    {
+      "query": "Who works with the partner who shaped the footbridge's architecture?",
+      "paraphrase": "Who is the colleague of the architect partner behind the footbridge?"
+    },
+    {
+      "query": "Who founded the company employing the graduate that Noor guides?",
+      "paraphrase": "Who set up the firm that employs the graduate Noor mentors?"
+    },
+    {
+      "query": "Which city is home to the school that Noor's cousin attended?",
+      "paraphrase": "In what city is Noor's cousin's school located?"
+    },
+    {
+      "query": "Who was a schoolmate of the engineer leading the footbridge at the same institute?",
+      "paraphrase": "Who attended the same institute as the engineer leading the footbridge?"
+    },
+    {
+      "query": "Where was the chief scientist of the lab that Tidewater Ventures backed born?",
+      "paraphrase": "Where does the chief scientist of the lab funded by Tidewater Ventures come from?"
+    },
+    {
+      "query": "Who is the partner at the investor that backed Chloe Dubois's lab?",
+      "paraphrase": "Who is a partner at the venture that funded Chloe Dubois's laboratory?"
+    },
+    {
+      "query": "Who founded the consultancy that serves the company led by Greta Hoffmann?",
+      "paraphrase": "Who started the consulting firm that serves the company Greta Hoffmann runs?"
+    },
+    {
+      "query": "In which city is the lab where Noor's next-door neighbour works headquartered?",
+      "paraphrase": "Where is the laboratory employing Noor's neighbour based?"
+    },
+    {
+      "query": "Where was the coach who teaches at the gym Noor belongs to born?",
+      "paraphrase": "In which city was the coach at Noor's gym born?"
+    },
+    {
+      "query": "Where was the coach of Noor's rowing club born?",
+      "paraphrase": "What is the birthplace of the coach of Noor's rowing club?"
+    },
+    {
+      "query": "In which city is the school where Noor's mentor trained located?",
+      "paraphrase": "Where is the school Noor's mentor attended?"
+    },
+    {
+      "query": "In which city is the studio that shaped the bridge Noor leads based?",
+      "paraphrase": "Where is the architecture office responsible for the bridge Noor leads located?"
+    },
+    {
+      "query": "Who teaches at the climbing gym frequented by the graduate Noor guides?",
+      "paraphrase": "Who instructs at the climbing gym Noor's mentee visits?"
+    },
+    {
+      "query": "Which firm employs the spouse of the principal at Noor's firm?",
+      "paraphrase": "What company does the partner of the principal at Noor's firm work for?"
+    },
+    {
+      "query": "Where is the concrete supplier of the bridge Noor is leading located?",
+      "paraphrase": "In what place is the company supplying the concrete for Noor's bridge?"
+    },
+    {
+      "query": "Where was the chairman of the housing cooperative behind Noor's flat born?",
+      "paraphrase": "In which city was the chairman of the housing cooperative of Noor's building born?"
+    },
+    {
+      "query": "Which city is the academy of Noor's thesis supervisor located in?",
+      "paraphrase": "Where is the academy where Noor's thesis supervisor is based?"
+    },
+    {
+      "query": "Which client commissioned the job run by Seun Adeyemi's firm?",
+      "paraphrase": "Who was the customer of the job handled by Seun Adeyemi's company?"
+    },
+    {
+      "query": "Which medicine must Noor avoid because of an allergy?",
+      "paraphrase": "What drug should Noor stay away from due to her allergy?"
+    },
+    {
+      "query": "Which bank does Noor keep savings with?",
+      "paraphrase": "Where does Noor bank her savings?"
+    },
+    {
+      "query": "What finite element software does Noor rely on?",
+      "paraphrase": "Which FEA software does Noor use?"
+    },
+    {
+      "query": "What is the name of Noor's dog?",
+      "paraphrase": "How is Noor's dog called?"
+    },
+    {
+      "query": "Which firm did Aisha Bello set up?",
+      "paraphrase": "What company did Aisha Bello create?"
+    },
+    {
+      "query": "Who is the chief executive of Harbor Steel Partners?",
+      "paraphrase": "Who runs Harbor Steel Partners as CEO?"
+    },
+    {
+      "query": "Which clinic is Nadia Sokolova connected to?",
+      "paraphrase": "What clinic is Nadia Sokolova affiliated with?"
+    },
+    {
+      "query": "Who set up Adeyemi & Sons Contracting?",
+      "paraphrase": "Who founded Adeyemi & Sons Contracting?"
+    },
+    {
+      "query": "Which venture firm put money into Brightwell Labs?",
+      "paraphrase": "Who invested in Brightwell Labs?"
+    },
+    {
+      "query": "Which rowing club does Noor train with?",
+      "paraphrase": "Which club does Noor row for?"
+    },
+    {
+      "query": "Who is Noor's younger sibling?",
+      "paraphrase": "What is the name of Noor's younger sibling?"
+    },
+    {
+      "query": "Which committee does Victor Lang chair?",
+      "paraphrase": "What committee is chaired by Victor Lang?"
+    },
+    {
+      "query": "What did the GP prescribe for Noor's asthma?",
+      "paraphrase": "Which medication did the family doctor give Noor for her asthma?"
+    },
+    {
+      "query": "Which firm is engineering the Kralingen Footbridge?",
+      "paraphrase": "Who is doing the engineering work on the Kralingen Footbridge?"
+    },
+    {
+      "query": "Which vehicle does Hollis Garage service?",
+      "paraphrase": "What car does Hollis Garage maintain?"
+    }
+  ]
+}
