@@ -1029,6 +1029,147 @@ fn a_prose_terminal_chain_renders_its_memory_as_a_fact() {
     assert!(ask(&e).facts.iter().all(|f| !f.memory));
 }
 
+/// Ingest an eval set the way `neocortex eval` does (same order, supersedes
+/// keys resolved to ids) and return the query texts.
+fn ingest_eval_set(path: &str) -> (Engine, Vec<String>) {
+    let raw = std::fs::read_to_string(path).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let e = engine(Arc::new(HashEmbedder));
+    let mut ids: HashMap<String, i64> = HashMap::new();
+    for memory in doc["memories"].as_array().unwrap() {
+        let mut input: RememberInput = serde_json::from_value(memory.clone()).unwrap();
+        input.supersedes = input
+            .supersedes
+            .iter()
+            .map(|key| format!("m{}", ids[key]))
+            .collect();
+        let out = e.remember(input).unwrap();
+        ids.insert(memory["key"].as_str().unwrap().to_string(), out.id);
+    }
+    let queries = doc["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|query| query["q"].as_str().unwrap().to_string())
+        .collect();
+    (e, queries)
+}
+
+/// `prose_wide` may only add fact lines: on fixtures and holdout the returned
+/// memories are the same ids in the same order with the knob on. Two identical
+/// engines keep the access history (the retention blend) in step.
+#[test]
+fn prose_wide_never_changes_the_memory_ranking() {
+    for path in ["eval/fixtures.json", "eval/holdout.json"] {
+        let (off_engine, queries) = ingest_eval_set(path);
+        let (mut on_engine, _) = ingest_eval_set(path);
+        on_engine.cfg.prose_wide = true;
+        for query in &queries {
+            let ask = |e: &Engine| {
+                e.recall(&RecallInput {
+                    query: query.clone(),
+                    ..Default::default()
+                })
+                .unwrap()
+            };
+            let off = ask(&off_engine);
+            let on = ask(&on_engine);
+            let ids = |out: &RecallOutput| -> Vec<i64> {
+                out.memories.iter().map(|memory| memory.id).collect()
+            };
+            assert_eq!(ids(&off), ids(&on), "{path}: '{query}'");
+        }
+    }
+}
+
+/// nc-prose2: a chain whose middle hop is prose only ("trained at the Braga
+/// observatory") reaches the context as a fact line when `prose_wide` is on,
+/// without moving the memory list.
+#[test]
+fn prose_wide_reaches_a_middle_hop_without_moving_memories() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    remember(&e, "Rui Carvalho is mentored by Marta Lobo.", |i| {
+        i.entities = vec![entity("Rui Carvalho"), entity("Marta Lobo")];
+        i.relations = vec![relation(
+            "Marta Lobo",
+            "mentors",
+            "Rui Carvalho",
+            "Marta Lobo mentors Rui Carvalho",
+        )];
+    });
+    let bridge = remember(&e, "Marta Lobo trained at the Braga observatory.", |i| {
+        i.entities = vec![entity("Marta Lobo"), entity("Braga observatory")];
+    });
+    // A plain memory that outranks the prose hop, so the bridge is reached
+    // through the chain and not as one of the rendered memories.
+    remember(&e, "The Lima array is hosted at the observatory.", |_| {});
+    remember(&e, "The Braga observatory hosts the Lima array.", |i| {
+        i.entities = vec![entity("Braga observatory"), entity("Lima array")];
+        i.relations = vec![relation(
+            "Braga observatory",
+            "hosts",
+            "Lima array",
+            "Braga observatory hosts Lima array",
+        )];
+    });
+    for filler in [
+        "Tomas Vidal plays the cello on Sundays.",
+        "Ines Barros keeps the greenhouse records.",
+        "Pavel Orlov repairs vintage radios.",
+        "Sofia Menezes paints the harbour at dawn.",
+        "Kwame Adjei coaches the youth chess club.",
+        "Lena Fischer audits the tenant ledgers.",
+        "Diego Salas maps the coastal trails.",
+        "Hana Okafor runs the neighbourhood food bank.",
+        "Marek Dudek restores wooden boats.",
+        "Priya Raghavan studies the migratory birds.",
+        "Eero Nieminen tunes the church organ.",
+        "Camila Duarte designs the festival posters.",
+        "Yusuf Demir maintains the water pumps.",
+        "Greta Lindqvist catalogues the seed library.",
+        "Omar Haddad organises the winter market.",
+        "Nadia Petrova teaches the folk dances.",
+        "Sean O'Connor brews the seasonal ale.",
+        "Mei Lin photographs the old quarter.",
+    ] {
+        remember(&e, filler, |_| {});
+    }
+    // prose_wide is scale-gated; fill to scale so the knob engages.
+    at_scale(&e);
+    e.cfg.prose_wide = false;
+    let ask = |e: &Engine| {
+        e.recall(&RecallInput {
+            query: "Which array is hosted at the observatory where Rui Carvalho's mentor trained?"
+                .into(),
+            k: Some(1),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let off = ask(&e);
+    assert!(
+        !off.memories.iter().any(|m| m.id == bridge),
+        "{:?}",
+        off.memories
+    );
+    assert!(
+        !off.facts.iter().any(|f| f.memory && f.id == bridge),
+        "{:?}",
+        off.facts
+    );
+    e.cfg.prose_wide = true;
+    let on = ask(&e);
+    assert_eq!(
+        off.memories.iter().map(|m| m.id).collect::<Vec<_>>(),
+        on.memories.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+    assert!(
+        on.facts.iter().any(|f| f.memory && f.id == bridge),
+        "{:?}",
+        on.facts
+    );
+}
+
 #[test]
 fn a_history_question_still_reaches_the_second_hop() {
     let e = engine(Arc::new(HashEmbedder));
@@ -2739,5 +2880,192 @@ fn anchor_knob_zero_is_byte_identical() {
     assert_eq!(
         off2, off,
         "knob off must give a deterministic, state-free output"
+    );
+}
+/// Reverse-hop fixture: the question's answer frame is `where` (a place), the
+/// bridge "Mira" is returned by the lexical channel, and the terminal
+/// relation "studied at" is paraphrase-free but ranked nowhere by the forward
+/// channels because the answer memory shares no word with the question.
+fn rev_hop_fixture() -> Engine {
+    let mut e = engine(Arc::new(HashEmbedder));
+    e.cfg.w_retention = 0.0;
+    e.cfg.w_sempath = 0.0;
+    remember(&e, "Noor Haddad mentors under Mira Lindqvist.", |i| {
+        i.entities = vec![
+            EntityIn {
+                name: "Noor Haddad".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Mira Lindqvist".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+        ];
+        i.relations = vec![relation(
+            "Mira Lindqvist",
+            "mentors",
+            "Noor Haddad",
+            "Mira Lindqvist mentors Noor Haddad",
+        )];
+    });
+    remember(&e, "Mira Lindqvist studied at Kestrel Polytechnic.", |i| {
+        i.entities = vec![
+            EntityIn {
+                name: "Mira Lindqvist".into(),
+                kind: Some("person".into()),
+                ..Default::default()
+            },
+            EntityIn {
+                name: "Kestrel Polytechnic".into(),
+                kind: Some("organization".into()),
+                ..Default::default()
+            },
+        ];
+        i.relations = vec![relation(
+            "Mira Lindqvist",
+            "studied at",
+            "Kestrel Polytechnic",
+            "Mira Lindqvist studied at Kestrel Polytechnic",
+        )];
+    });
+    // Unrelated padding so the terminal memory is not trivially first.
+    for n in 0..6 {
+        remember(&e, &format!("Routine note {n} about scheduling."), |_| {});
+    }
+    // rev_hop is scale-gated (>=50k memories); bulk-fill so the hop engages.
+    at_scale(&e);
+    e
+}
+
+fn rev_hop_query() -> RecallInput {
+    RecallInput {
+        query: "Where did the engineer who guides Noor's early career get schooled?".into(),
+        k: Some(3),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn rev_hop_default_is_off() {
+    let e = engine(Arc::new(HashEmbedder));
+    assert!(
+        e.cfg.rev_hop,
+        "Config::default().rev_hop should be on at scale"
+    );
+    let mut cfg = Config::default();
+    neocortex::eval::set_config(&mut cfg, "rev_hop", "on").unwrap();
+    assert!(cfg.rev_hop);
+    neocortex::eval::set_config(&mut cfg, "rev_hop", "off").unwrap();
+    assert!(!cfg.rev_hop);
+    assert!(neocortex::eval::set_config(&mut cfg, "rev_hop", "maybe").is_err());
+}
+
+#[test]
+fn rev_hop_reaches_a_terminal_fact_the_forward_channels_miss() {
+    let mut e = rev_hop_fixture();
+    e.cfg.rev_hop = false;
+    let off = e.recall(&rev_hop_query()).unwrap();
+    e.cfg.rev_hop = true;
+    let on = e.recall(&rev_hop_query()).unwrap();
+    let reached = |o: &RecallOutput| {
+        o.facts
+            .iter()
+            .any(|fact| fact.target == "Kestrel Polytechnic")
+            || o.memories
+                .iter()
+                .any(|m| m.content.contains("Kestrel Polytechnic"))
+    };
+    eprintln!(
+        "off facts={:?}",
+        off.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "on facts={:?}",
+        on.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+    assert!(
+        reached(&on),
+        "rev_hop should reach the terminal relation: {:?}",
+        on.facts.iter().map(|f| &f.fact).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn rev_hop_off_is_byte_identical() {
+    let mut e = rev_hop_fixture();
+    e.cfg.rev_hop = false;
+    let a = e.recall(&rev_hop_query()).unwrap();
+    let b = e.recall(&rev_hop_query()).unwrap();
+    assert_eq!(
+        serde_json::to_string(&a).unwrap(),
+        serde_json::to_string(&b).unwrap()
+    );
+}
+
+#[test]
+fn rev_hop_caps_facts_and_never_floods_from_a_hub() {
+    const REV_HUB: usize = 200;
+    let mut e = engine(Arc::new(HashEmbedder));
+    e.cfg.w_retention = 0.0;
+    e.cfg.w_sempath = 0.0;
+    // The anchor entity is a hub: 250 live relations to places.
+    remember(&e, "Noor Haddad is on the staff.", |i| {
+        i.entities = vec![EntityIn {
+            name: "Noor Haddad".into(),
+            kind: Some("person".into()),
+            ..Default::default()
+        }];
+    });
+    for n in 0..250 {
+        let place = format!("Town{n}");
+        remember(&e, &format!("Noor Haddad visited {place}."), |i| {
+            i.entities = vec![
+                EntityIn {
+                    name: "Noor Haddad".into(),
+                    kind: Some("person".into()),
+                    ..Default::default()
+                },
+                EntityIn {
+                    name: place.clone(),
+                    kind: Some("place".into()),
+                    ..Default::default()
+                },
+            ];
+            i.relations = vec![relation(
+                "Noor Haddad",
+                "visited",
+                &place,
+                &format!("Noor Haddad visited {place}"),
+            )];
+        });
+    }
+    let query = RecallInput {
+        query: "Where did Noor Haddad travel?".into(),
+        k: Some(5),
+        ..Default::default()
+    };
+    // rev_hop is scale-gated; fill to scale so the hub cap path engages.
+    at_scale(&e);
+    e.cfg.rev_hop = false;
+    let off: Vec<i64> = e
+        .recall(&query)
+        .unwrap()
+        .facts
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    e.cfg.rev_hop = true;
+    let out = e.recall(&query).unwrap();
+    assert!(
+        out.facts.len() <= 8,
+        "rev_hop must keep the fact list capped: {}",
+        out.facts.len()
+    );
+    let added = out.facts.iter().filter(|f| !off.contains(&f.id)).count();
+    assert!(
+        added == 0,
+        "a hub bridge (> {REV_HUB} relations) must not contribute candidates, {added} added"
     );
 }

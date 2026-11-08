@@ -771,6 +771,42 @@ Caveats: the two `--load-db` latency passes re-record access on the copy, so pas
 (accuracy identical); the step-3 copy itself was measured before any recall and is the pristine one for the acc
 figures above. The f32/q8 RSS numbers were taken warm-cache, as in nc-scale2.
 
+## After nc-hay2: semantic weight floor (2026-11-08, KILL — thresholds unmet)
+
+One scale-activated change: `w_sempath` floored at 2.5 at >= 50k memories
+(`SEMPATH_SCALE_MIN`, `sempath_weight` in `src/recall.rs`; zero stays zero,
+so the channel can still be disabled). Inside the 108k haystack
+(`lanes/tmp/nc-scale2/w10k-int8.db`, `--load-db` re-scoring, real UltraBERT,
+`NEOCORTEX_VEC=int8`): fixtures recall 0.869 -> 0.883 (multi-hop 0.444 ->
+0.555, aggregation 0.449 -> 0.473), holdout 0.834 -> 0.833 (multi-hop 0.777
+-> 0.888 but current 1.000 -> 0.875, MRR 0.703 -> 0.655), mh1 recall 0.621
+-> 0.648 at acc@10 0.900 held, blind mh2 acc 0.650 -> 0.680 (three-hop
+0.400 -> 0.500). Alone sets are byte-identical below the gate (fixtures
+0.953, holdout 0.914, mh1 0.912, world-300 0.998). Two rejected widenings:
+pool depth + MMR window at scale (fixtures 0.867, holdout 0.823 — depth negates
+the semantic gain) and semantic-beam widening (SEM_FACTS 250 / SEM_EDGES 12 /
+8 starts: fixtures 0.861, holdout 0.857 — trades fixtures for holdout).
+Keep thresholds (fixtures >= 0.90 or holdout >= 0.87) were not met by any
+combination, hence KILL (see `loop/reports/nc-hay2.md`).
+
+## After nc-hay3: scale-gated rev_hop + prose_wide (2026-11-08, KEEP)
+
+Two parked knobs (`rev_hop`, `prose_wide`) join the sempath floor, all three
+scale-gated at >= 50k memories (`SCALE_MIN_MEMORIES` in `src/recall.rs`; both
+default on at scale, `false` forces off; small stores byte-identical to main
+by `eval --failures` diff on fixtures/holdout/mh1/world-300). Inside the
+108k haystack (`--load-db`, real UltraBERT, int8), together: fixtures recall
+0.869 -> 0.883 (MRR 0.842 -> 0.855), holdout 0.834 -> 0.833 (MRR 0.703 ->
+0.655, the sempath floor's cost as in nc-hay2), mh1 acc@10 0.900 -> 0.925
+(recall 0.621 -> 0.648), blind mh2 0.650 -> 0.700 (recall 0.618 -> 0.658).
+Ablation on the same copies: Fix A alone gives fixtures 0.883 / mh1 0.900 /
+mh2 0.680; rev_hop adds the mh1 +2 (three-hop 0.760 -> 0.800, two-hop 0.950
+-> 0.975 per hayknobs), prose_wide adds mh2 the last +1 to 0.700 and nothing
+on mh1. Context +1.5% fixtures / +4.2% holdout / +10.9% mh1 / +5.7% mh2 (cap
++12%); haystack p50 interleaved pairs avg +7.5% (individual +17/+6/-0%,
+noisy shared disk). Keep bar met on mh1 (0.925); alone gates per common.md
+pass. See `loop/reports/nc-hay3.md`.
+
 ## Reproduce
 
 ```bash

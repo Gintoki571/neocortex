@@ -138,8 +138,22 @@ pub struct Config {
     /// it beats the best chain with another terminal by this score margin.
     /// Infinity (default) = off: measured +1 mh2 query at 0, no gain on a blind set.
     pub prose_margin: f64,
+    /// `prose_wide`: the prose steps of the top three semantic chains, at any
+    /// hop position, render as fact lines in their own slots (cap
+    /// `paths::PROSE_WIDE_FACTS`). The memory ranking is untouched; a memory
+    /// already in the rendered memories is skipped. On at >= 50k memories
+    /// (`recall.rs` gates on `SCALE_MIN_MEMORIES`); `false` forces it off at
+    /// every scale. Measured in `docs/research/prose.md`.
+    pub prose_wide: bool,
     /// Pull up to two answer-typed relations from returned bridge entities.
     pub bridge_pull: bool,
+    /// Reverse-hop answer-type pull: read only the answer frame (`where`,
+    /// `who`, `which company`), then walk back from the returned bridge
+    /// entities over live relations whose far end has the asked type, and
+    /// merge at most two of those facts. On at >= 50k memories
+    /// (`recall.rs` gates on `SCALE_MIN_MEMORIES`); `false` forces it off at
+    /// every scale.
+    pub rev_hop: bool,
     /// Rerank the top N fused memory candidates with the cross-encoder
     /// (0 = off). Without a model directory `recall` ignores it.
     pub rerank_top: usize,
@@ -222,7 +236,9 @@ impl Default for Config {
             update_candidate: 0.75,
             hop_scorer: "off".to_string(),
             prose_margin: f64::INFINITY,
+            prose_wide: true,
             bridge_pull: true,
+            rev_hop: true,
             rerank_top: 0,
             w_rerank: 0.5,
             hint_tau: 0.40,

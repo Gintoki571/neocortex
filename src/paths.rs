@@ -2123,8 +2123,63 @@ fn terminal(hit: &PathHit) -> Option<(bool, i64)> {
         .map(|s| (s.memory.is_some(), s.memory.unwrap_or(s.relation_id)))
 }
 
-/// Prose steps rendered per query at most.
+/// Prose steps rendered per query at most (B4, best chain only).
 const PROSE_FACTS: usize = 2;
+
+/// Semantic chains whose prose steps `prose_wide` renders.
+const PROSE_WIDE_CHAINS: usize = 3;
+/// Prose lines `prose_wide` renders per query. They take their own slots, so
+/// relation and entity facts are never truncated away for them.
+const PROSE_WIDE_FACTS: usize = 3;
+
+/// One prose step as a fact line (`memory` = true): a relation-less hop is
+/// never rendered by `facts`, so this is the only way it reaches the context.
+fn prose_fact(db: &Db, step: &Step, cutoff: i64) -> Result<Option<FactHit>> {
+    let name = |entity: i64| -> Result<String> {
+        Ok(db
+            .sql()
+            .query_row("SELECT name FROM entities WHERE id=?1", [entity], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .unwrap_or_default())
+    };
+    let id = step.memory.unwrap_or_default();
+    let Some((valid_from, valid_to, expired)) = db
+        .sql()
+        .query_row(
+            "SELECT valid_from,valid_to,expired_at FROM memories WHERE id=?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .filter(|(from, _, _)| *from <= cutoff)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(FactHit {
+        id,
+        source: name(step.src)?,
+        predicate: String::new(),
+        target: name(step.dst)?,
+        fact: step.fact.chars().take(200).collect(),
+        valid_from,
+        valid_to,
+        ended: expired.is_some() || valid_to.is_some_and(|v| v <= cutoff),
+        retracted: expired.is_some() && valid_to.is_none(),
+        polarity: 1,
+        memory: true,
+        current_values: None,
+        replaced_by: None,
+        duration: None,
+    }))
+}
 
 /// B4: when the best chain (`hits` sorted best first) uses prose memories and
 /// beats the best chain with another terminal by `margin`, those memories carry
@@ -2143,54 +2198,45 @@ pub(crate) fn prose_facts(
     if rival.is_some_and(|r| best.score - r.score < margin) {
         return Ok(Vec::new());
     }
-    let name = |entity: i64| -> Result<String> {
-        Ok(db
-            .sql()
-            .query_row("SELECT name FROM entities WHERE id=?1", [entity], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .unwrap_or_default())
-    };
     let mut out = Vec::new();
     for step in best.steps.iter().rev().filter(|s| s.memory.is_some()) {
-        let id = step.memory.unwrap_or_default();
-        let Some((valid_from, valid_to, expired)) = db
-            .sql()
-            .query_row(
-                "SELECT valid_from,valid_to,expired_at FROM memories WHERE id=?1",
-                [id],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, Option<i64>>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-            .filter(|(from, _, _)| *from <= cutoff)
-        else {
+        let Some(fact) = prose_fact(db, step, cutoff)? else {
             continue;
         };
-        out.push(FactHit {
-            id,
-            source: name(step.src)?,
-            predicate: String::new(),
-            target: name(step.dst)?,
-            fact: step.fact.chars().take(200).collect(),
-            valid_from,
-            valid_to,
-            ended: expired.is_some() || valid_to.is_some_and(|v| v <= cutoff),
-            retracted: expired.is_some() && valid_to.is_none(),
-            polarity: 1,
-            memory: true,
-            current_values: None,
-            replaced_by: None,
-            duration: None,
-        });
+        out.push(fact);
         if out.len() >= PROSE_FACTS {
             break;
+        }
+    }
+    Ok(out)
+}
+
+/// `prose_wide` (knob, on at scale, see `engine::Config`): the prose steps of
+/// the top three semantic chains, at any hop position, render as fact lines
+/// (`memory` = true). A prose
+/// hop is skipped when its memory is already one of `rendered` (it is in the
+/// context already), and at most `PROSE_WIDE_FACTS` lines are returned,
+/// destination hop first.
+pub(crate) fn prose_wide_facts(
+    db: &Db,
+    hits: &[PathHit],
+    rendered: &HashSet<i64>,
+    cutoff: i64,
+) -> Result<Vec<FactHit>> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    for hit in hits.iter().take(PROSE_WIDE_CHAINS) {
+        for step in hit.steps.iter().rev() {
+            let Some(id) = step.memory else { continue };
+            if rendered.contains(&id) || !seen.insert(id) {
+                continue;
+            }
+            if let Some(fact) = prose_fact(db, step, cutoff)? {
+                out.push(fact);
+            }
+            if out.len() >= PROSE_WIDE_FACTS {
+                return Ok(out);
+            }
         }
     }
     Ok(out)
@@ -3125,6 +3171,140 @@ mod widen_tests {
             .unwrap_or_else(|| panic!("no two-hop chain: {hits:?}"));
         assert_eq!(chain.steps[0].dst, delta, "hop one lands on the bridge");
         assert_eq!(chain.steps[1].dst, aisha, "hop two reaches the answer");
+    }
+}
+
+/// nc-prose2: `prose_wide` renders the prose steps of the top semantic chains
+/// as their own fact lines - any hop position, a memory already rendered is
+/// skipped, and the cap bounds the added context.
+#[cfg(test)]
+mod prose_wide_tests {
+    use super::{prose_wide_facts, PathHit, Step, PROSE_WIDE_FACTS};
+    use crate::db::Db;
+    use crate::engine::FactHit;
+    use rusqlite::params;
+    use std::collections::HashSet;
+
+    fn entity(db: &Db, name: &str) -> i64 {
+        db.sql()
+            .execute(
+                "INSERT INTO entities(name,norm,type,homonym,created_at,updated_at)
+                 VALUES (?1,?1,'',0,0,0)",
+                params![name],
+            )
+            .unwrap();
+        db.sql().last_insert_rowid()
+    }
+
+    fn memory(db: &Db, content: &str) -> i64 {
+        db.sql()
+            .execute(
+                "INSERT INTO memories(content,kind,tags,importance,created_at,valid_from,content_hash)
+                 VALUES (?1,'fact','',0.5,0,0,?1)",
+                params![content],
+            )
+            .unwrap();
+        db.sql().last_insert_rowid()
+    }
+
+    fn step(src: i64, dst: i64, memory: Option<i64>, fact: &str) -> Step {
+        Step {
+            relation_id: if memory.is_some() { 0 } else { src * 100 + dst },
+            src,
+            dst,
+            predicate: String::new(),
+            fact: fact.into(),
+            reverse: false,
+            matched: 0,
+            memory,
+        }
+    }
+
+    fn chain(steps: Vec<Step>) -> PathHit {
+        PathHit {
+            steps,
+            coverage: 1,
+            score: 1.0,
+        }
+    }
+
+    fn ids(facts: &[FactHit]) -> Vec<i64> {
+        facts.iter().map(|f| f.id).collect()
+    }
+
+    /// A prose hop between two relation hops is not the chain's terminal, so
+    /// `facts` never renders it; `prose_wide` does.
+    #[test]
+    fn a_middle_prose_hop_is_rendered() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, c) = (entity(&db, "a"), entity(&db, "b"), entity(&db, "c"));
+        let bridge = memory(&db, "b trained at c");
+        let hit = chain(vec![
+            step(a, b, None, "a knows b"),
+            step(b, c, Some(bridge), "b trained at c"),
+            step(c, a, None, "c hosts a"),
+        ]);
+        let facts = prose_wide_facts(&db, &[hit], &HashSet::new(), 100).unwrap();
+        assert_eq!(ids(&facts), vec![bridge]);
+        assert!(facts[0].memory);
+        assert_eq!(facts[0].source, "b");
+        assert_eq!(facts[0].target, "c");
+    }
+
+    /// A prose memory the caller already renders as a memory needs no line.
+    #[test]
+    fn a_memory_already_rendered_is_skipped() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b) = (entity(&db, "a"), entity(&db, "b"));
+        let seen = memory(&db, "a met b");
+        let fresh = memory(&db, "b trained at a");
+        let hit = chain(vec![
+            step(a, b, Some(seen), "a met b"),
+            step(b, a, Some(fresh), "b trained at a"),
+        ]);
+        let rendered: HashSet<i64> = [seen].into_iter().collect();
+        let facts = prose_wide_facts(&db, &[hit], &rendered, 100).unwrap();
+        assert_eq!(ids(&facts), vec![fresh]);
+    }
+
+    /// At most `PROSE_WIDE_FACTS` lines, destination hop first.
+    #[test]
+    fn the_line_cap_bounds_the_added_context() {
+        let db = Db::open_in_memory().unwrap();
+        let nodes: Vec<i64> = (0..5).map(|i| entity(&db, &format!("n{i}"))).collect();
+        let memories: Vec<i64> = (0..4).map(|i| memory(&db, &format!("m{i}"))).collect();
+        let steps: Vec<Step> = (0..4)
+            .map(|i| step(nodes[i], nodes[i + 1], Some(memories[i]), "prose"))
+            .collect();
+        let facts = prose_wide_facts(&db, &[chain(steps)], &HashSet::new(), 100).unwrap();
+        assert_eq!(facts.len(), PROSE_WIDE_FACTS);
+        assert_eq!(ids(&facts), vec![memories[3], memories[2], memories[1]]);
+    }
+
+    /// Only the top three semantic chains contribute prose steps.
+    #[test]
+    fn only_the_top_three_chains_contribute() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b) = (entity(&db, "a"), entity(&db, "b"));
+        let memories: Vec<i64> = (0..5).map(|i| memory(&db, &format!("m{i}"))).collect();
+        let chains: Vec<PathHit> = memories
+            .iter()
+            .map(|m| chain(vec![step(a, b, Some(*m), "prose")]))
+            .collect();
+        let facts = prose_wide_facts(&db, &chains, &HashSet::new(), 100).unwrap();
+        assert_eq!(ids(&facts), vec![memories[0], memories[1], memories[2]]);
+    }
+
+    /// The knob's default is on (scale-gated in `recall`), and the
+    /// eval/config surface names it.
+    #[test]
+    fn the_knob_defaults_off() {
+        let cfg = crate::engine::Config::default();
+        assert!(cfg.prose_wide);
+        let mut cfg = cfg;
+        crate::eval::set_config(&mut cfg, "prose_wide", "on").unwrap();
+        assert!(cfg.prose_wide);
+        assert!(crate::eval::set_config(&mut cfg, "prose_wide", "maybe").is_err());
     }
 }
 

@@ -55,6 +55,11 @@ const ABSTAIN_COSINE: f64 = 0.18;
 /// hundred memories the same top memories already follow from the PPR seeds
 /// and the sibling boost re-orders them for the worse.
 const ANCHOR_MIN_MEMORIES: i64 = 50_000;
+/// Store size at which scale crowding starts (nc-hay3; the same gate the
+/// anchor channel uses). Below it the small-store calibration stands; at or
+/// above it the scale-gated channels (`rev_hop`, `prose_wide`) engage.
+const SCALE_MIN_MEMORIES: i64 = 50_000;
+
 /// Most `next` hints one recall may carry.
 const HINT_MAX: usize = 2;
 /// Most live incident relations a `next` hint target may have. Beyond this
@@ -892,6 +897,227 @@ fn bridge_answer_type(query: &str) -> Option<&'static str> {
     None
 }
 
+/// Answer types a question's wh-frame asks for. Only the head noun decides
+/// the type: "which practice" asks for an organization, "what species" for an
+/// animal, "where" for a place (an organization is a valid place answer: "where
+/// did she get schooled" is answered by a school). A frame with no known head
+/// ("which one", "what happened") asks for no type, so the reverse hop stays
+/// off and an unreadable question costs one token scan.
+fn answer_frame_types(query: &str) -> Option<Vec<&'static str>> {
+    const PERSON: &[&str] = &["person"];
+    const PLACE: &[&str] = &["place", "organization"];
+    let words = text::tokens(query);
+    let at = words.iter().position(|w| WH_WORDS.contains(&w.as_str()))?;
+    match words[at].as_str() {
+        "who" | "whom" => return Some(PERSON.to_vec()),
+        "where" => return Some(PLACE.to_vec()),
+        _ => {}
+    }
+    let head = words.iter().skip(at + 1).find(|w| {
+        !text::is_stopword(w) && !matches!(w.as_str(), "do" | "did" | "does" | "is" | "was")
+    })?;
+    let types: &[&str] = match head.as_str() {
+        "company" | "firm" | "organization" | "org" | "studio" | "school" | "academy"
+        | "society" | "practice" | "investor" | "lab" | "laboratory" | "supplier"
+        | "consultancy" | "employer" | "client" | "university" | "institute" | "agency"
+        | "bank" | "club" | "gym" | "hospital" | "clinic" | "committee" | "council" | "charity"
+        | "startup" => &["organization"],
+        "city" | "town" | "village" | "country" | "place" | "location" | "region" => PLACE,
+        "instrument" | "breed" | "allergen" | "dish" | "colour" | "color" | "book" => &["object"],
+        "species" | "pet" | "animal" => &["animal", "object"],
+        "language" | "tool" | "framework" | "database" => &["tool"],
+        _ => return None,
+    };
+    Some(types.to_vec())
+}
+
+/// Most bridge entities the reverse hop starts from.
+const REV_HOP_BRIDGES: usize = 3;
+/// Most facts the reverse hop merges (the whole fact list is capped at 8).
+const REV_HOP_FACTS: usize = 2;
+/// A bridge with more live relations than this is a hub: its neighbourhood
+/// says nothing about the question and would flood the fact list.
+const REV_HOP_HUB: i64 = 200;
+
+/// Ordering key of one reverse-hop candidate: a predicate the question shares
+/// a word with first, then a seeded group, then the earlier (more grounded)
+/// bridge, then overlap size, recency and id.
+fn rank_key(
+    candidate: &(bool, bool, usize, usize, i64, i64),
+) -> (
+    bool,
+    bool,
+    std::cmp::Reverse<usize>,
+    usize,
+    i64,
+    std::cmp::Reverse<i64>,
+) {
+    (
+        candidate.0,
+        candidate.1,
+        std::cmp::Reverse(candidate.2),
+        candidate.3,
+        candidate.4,
+        std::cmp::Reverse(candidate.5),
+    )
+}
+
+/// Reverse-hop answer-type pull: the answer frame names a type, so look
+/// backward from the bridge entities retrieval already returned for a live
+/// relation whose far end has that type. The bridge is grounded by a returned
+/// memory, while the terminal relation may be paraphrased far below the
+/// relation-KNN cutoff, so this bypasses the relation seed set entirely.
+/// Bounded: <= 3 bridges, one relation per (bridge, predicate group), <= 2
+/// merged facts, hubs skipped.
+#[allow(clippy::too_many_arguments)]
+fn rev_hop_facts(
+    engine: &Engine,
+    query: &str,
+    chains: &[paths::PathHit],
+    memories: &[MemoryHit],
+    anchors: &HashSet<i64>,
+    cutoff: i64,
+    existing: &HashSet<i64>,
+) -> Result<(Vec<FactHit>, Vec<i64>)> {
+    let Some(types) = answer_frame_types(query) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut bridges: Vec<i64> = Vec::new();
+    for memory in memories.iter().take(5) {
+        let mut st = engine
+            .db
+            .sql()
+            .prepare("SELECT entity_id FROM mentions WHERE memory_id=?1")?;
+        for id in st.query_map([memory.id], |r| r.get::<_, i64>(0))? {
+            let id = id?;
+            if !anchors.contains(&id) && !bridges.contains(&id) {
+                bridges.push(id);
+            }
+        }
+    }
+    for chain in chains {
+        if let Some(step) = chain.steps.last() {
+            let id = step_end(step);
+            if id > 0 && !anchors.contains(&id) && !bridges.contains(&id) {
+                bridges.push(id);
+            }
+        }
+    }
+    bridges.truncate(REV_HOP_BRIDGES);
+    if bridges.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut degree = engine.db.sql().prepare_cached(
+        "SELECT COUNT(*) FROM relations
+         WHERE (src=?1 OR dst=?1) AND expired_at IS NULL
+           AND (valid_to IS NULL OR valid_to>?2)",
+    )?;
+    let marks = std::iter::repeat_n("?", types.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT r.id,r.src,r.dst,p.group_id,p.seeded,
+                COALESCE(NULLIF(r.predicate_text,''),NULLIF(p.display,''),p.canonical),
+                r.valid_from
+         FROM relations r
+         JOIN predicates p ON p.id=r.predicate_id
+         JOIN entities s ON s.id=r.src
+         JOIN entities d ON d.id=r.dst
+         WHERE r.polarity=1 AND r.expired_at IS NULL AND r.valid_from<=?2
+           AND (r.valid_to IS NULL OR r.valid_to>?2)
+           AND ((r.src=?1 AND d.type IN ({marks})) OR (r.dst=?1 AND s.type IN ({marks})))
+         ORDER BY r.valid_from DESC, r.id DESC LIMIT 40"
+    );
+    let mut rel_st = engine.db.sql().prepare(&sql)?;
+    let query_forms: HashSet<String> = text::tokens(query)
+        .iter()
+        .flat_map(|token| word_forms(token))
+        .collect();
+    let mut ranked: Vec<(bool, bool, usize, usize, i64, i64)> = Vec::new();
+    for (bridge_at, bridge) in bridges.iter().enumerate() {
+        let live: i64 = degree.query_row(params![bridge, cutoff], |r| r.get(0))?;
+        if live > REV_HOP_HUB {
+            continue;
+        }
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(*bridge), Box::new(cutoff)];
+        params.extend(
+            types
+                .iter()
+                .map(|t| Box::new(t.to_string()) as Box<dyn rusqlite::ToSql>),
+        );
+        params.extend(
+            types
+                .iter()
+                .map(|t| Box::new(t.to_string()) as Box<dyn rusqlite::ToSql>),
+        );
+        let mut rows = rel_st.query(params_from_iter(params.iter().map(|p| p.as_ref())))?;
+        let mut best: HashMap<i64, (bool, bool, usize, usize, i64, i64)> = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let src: i64 = row.get(1)?;
+            let dst: i64 = row.get(2)?;
+            let group: i64 = row.get(3)?;
+            let seeded: i64 = row.get(4)?;
+            let predicate: String = row.get(5)?;
+            let valid_from: i64 = row.get(6)?;
+            if existing.contains(&id) {
+                continue;
+            }
+            let far = if src == *bridge { dst } else { src };
+            if anchors.contains(&far) {
+                continue;
+            }
+            let overlap = text::tokens(&predicate)
+                .iter()
+                .filter(|token| !word_forms(token).is_disjoint(&query_forms))
+                .count();
+            let candidate = (overlap > 0, seeded == 1, bridge_at, overlap, valid_from, id);
+            let better = best
+                .get(&group)
+                .is_none_or(|old| rank_key(&candidate) > rank_key(old));
+            if better {
+                best.insert(group, candidate);
+            }
+        }
+        ranked.extend(best.into_values());
+    }
+    ranked.sort_by_key(|a| std::cmp::Reverse(rank_key(a)));
+    let ids: Vec<i64> = ranked
+        .into_iter()
+        .take(REV_HOP_FACTS)
+        .map(|row| row.5)
+        .collect();
+    if ids.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let facts = paths::facts_by_ids(&engine.db, &ids, cutoff, REV_HOP_FACTS)?;
+    let mut evidence = Vec::new();
+    for id in &ids {
+        if let Some(memory_id) = engine
+            .db
+            .sql()
+            .query_row(
+                "SELECT memory_id FROM relation_evidence WHERE relation_id=?1
+                 ORDER BY memory_id DESC LIMIT 1",
+                [id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            evidence.push(memory_id);
+        }
+    }
+    if std::env::var_os("NEOCORTEX_DEBUG_FACTS").is_some() {
+        eprintln!(
+            "rev_hop bridges={} pulled={} kept={}",
+            bridges.len(),
+            ids.len(),
+            facts.len()
+        );
+    }
+    Ok((facts, evidence))
+}
+
 /// Pull the answer-typed edge of a small set of returned bridge entities.
 /// This deliberately bypasses relation KNN: the bridge is already grounded
 /// by a returned memory, while the terminal predicate may be paraphrased.
@@ -1400,6 +1626,15 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
         .collect::<Vec<_>>()
         .join(" ");
     let query_vec = engine.emb.embed(&[&query_text], Mode::Query)?.remove(0);
+    // One store-size probe drives every scale gate in this recall (anchor
+    // channel, semantic-beam widening lives in `paths`, and the semantic
+    // channel weight below), instead of each gate paying its own
+    // `SELECT count(*)`.
+    let store_n: i64 = engine
+        .db
+        .sql()
+        .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+        .unwrap_or(0);
     let depth = (5 * k).max(50);
     // Filtered channels need headroom: the KNN/BM25 depth is applied before
     // eligibility, so oversample when structured filters are present.
@@ -1676,14 +1911,8 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     // re-orders them for the worse (measured: 0.953 -> 0.929 on the small
     // fixture set at full weight).
     let mut anchor_ids: Vec<i64> = Vec::new();
-    let anchor_on = engine.cfg.w_anchor > 0.0 && !anchors.strong.is_empty() && {
-        let n: i64 = engine
-            .db
-            .sql()
-            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
-            .unwrap_or(0);
-        n >= ANCHOR_MIN_MEMORIES
-    };
+    let anchor_on =
+        engine.cfg.w_anchor > 0.0 && !anchors.strong.is_empty() && store_n >= ANCHOR_MIN_MEMORIES;
     if anchor_on {
         let strong: Vec<i64> = anchors.strong.clone();
         let mut cand: Vec<i64> = Vec::new();
@@ -2273,6 +2502,57 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     } else {
         (Vec::new(), Vec::new())
     };
+    // The reverse hop reads the answer frame and walks back from the returned
+    // bridges, so its facts lead: the terminal relation it finds is the one
+    // the forward channels could not rank.
+    let (rev_pulled, rev_evidence) =
+        if engine.cfg.rev_hop && store_n >= SCALE_MIN_MEMORIES && !negated {
+            rev_hop_facts(
+                engine,
+                &query_text,
+                &top_chains,
+                &memories,
+                &query_alias_entities,
+                cutoff,
+                &existing_facts,
+            )?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+    // The evidence memory of a pulled fact is a candidate in its own right
+    // (same rule as `bridge_pull`): the fact line carries the answer, the
+    // memory carries the context around it.
+    if !rev_evidence.is_empty() {
+        let rows_to_add = fetch_rows(&engine.db, &rev_evidence)?;
+        for id in rev_evidence {
+            if let Some(memory) = memories.iter_mut().find(|memory| memory.id == id) {
+                if !memory.reasons.iter().any(|reason| reason == "revhop#1") {
+                    memory.reasons.push("revhop#1".into());
+                }
+                continue;
+            }
+            let Some(row) = rows_to_add.get(&id) else {
+                continue;
+            };
+            if !eligible(row, as_of, history, input, since, until, now, planned_ok) {
+                continue;
+            }
+            memories.push(MemoryHit {
+                id,
+                kind: row.2.clone(),
+                content: row.1.clone(),
+                valid_from: row.9,
+                valid_to: row.10,
+                ended: is_ended(row, cutoff),
+                superseded_by: row.12,
+                tags: row.3.split_whitespace().map(str::to_string).collect(),
+                score: 0.0,
+                reasons: vec!["revhop#1".into()],
+                duration: None,
+                maybe_superseded_by: None,
+            });
+        }
+    }
     if !evidence_ids.is_empty() {
         let rows_to_add = fetch_rows(&engine.db, &evidence_ids)?;
         for id in evidence_ids {
@@ -2304,6 +2584,7 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
             });
         }
     }
+    let mut wide_prose: Vec<FactHit> = Vec::new();
     let mut facts = if negated {
         facts
             .into_iter()
@@ -2321,13 +2602,36 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
                     merged.push(fact);
                 }
             }
+            // `prose_wide` lines do not displace anything: they are appended
+            // after every other fact channel below, in their own slots.
+            if engine.cfg.prose_wide && store_n >= SCALE_MIN_MEMORIES {
+                let rendered: HashSet<i64> = memories.iter().map(|m| m.id).collect();
+                wide_prose = paths::prose_wide_facts(&engine.db, &sem_hits, &rendered, cutoff)?
+                    .into_iter()
+                    .filter(|fact| {
+                        rows.get(&fact.id).is_some_and(|row| {
+                            eligible(row, as_of, history, input, since, until, now, planned_ok)
+                        })
+                    })
+                    .collect();
+            }
         }
         for fact in facts {
             if !merged.iter().any(|x| x.id == fact.id && !x.memory) {
                 merged.push(fact);
             }
         }
+        // The reverse hop is an addition, not a replacement: the forward list
+        // keeps its own 8-fact budget (a chain fact is grounded by a returned
+        // memory and a guess must never evict it), and the hop appends at most
+        // `REV_HOP_FACTS` lines after it.
         merged.truncate(8);
+        let fresh: Vec<FactHit> = rev_pulled
+            .into_iter()
+            .filter(|fact| !merged.iter().any(|existing| existing.id == fact.id))
+            .take(REV_HOP_FACTS)
+            .collect();
+        merged.extend(fresh);
         merged
     };
     // H2-16: the cause the first-pass answer points at leads the facts. A
@@ -2516,6 +2820,14 @@ pub fn recall(engine: &Engine, input: &RecallInput) -> Result<RecallOutput> {
     if ordering || (predecessor_frame && !predecessor_hit) {
         memories.sort_by_key(|m| (m.valid_from, m.id));
         facts.sort_by_key(|f| (f.valid_from, f.id));
+    }
+    // `prose_wide`: a prose-hop memory the question's chain passed through is
+    // in the context as a line of its own, after the relation facts, so the
+    // eight relation/entity facts keep their slots.
+    for fact in wide_prose {
+        if !facts.iter().any(|f| f.memory && f.id == fact.id) {
+            facts.push(fact);
+        }
     }
     let entities = top_entities
         .iter()
