@@ -186,6 +186,10 @@ satisfies it. Read acc@10 with recall/MRR, not instead of them.
 Two guard columns keep acc@10 honest: `context tokens/query` (rendered recall output, chars / 4) must not grow more than 10% for a change, and `expect_absent leaked` counts queries that still show an `expect_absent` memory in the top k or as a prose fact line (`[m<id>]`), even when it does not outrank the expected one.
 Prose fact lines (`Config.prose_margin`, `--set prose_margin=0`) are opt-in and off by default: measured +1 mh2 query, no gain on a blind set, +1.5% to +4.5% context tokens.
 Typed bridge pulls (`--set bridge_pull=off`) are opt-out and on by default. They reserve up to two fact slots for live relations from returned, non-anchor bridge entities when the other endpoint matches the question's answer type; `NEOCORTEX_DEBUG_FACTS=1` prints pulled, kept, and already-present counters.
+Reverse-hop answer-type pulls (`--set rev_hop=on`, off by default) read only the wh-frame's head noun, then walk
+back from up to three returned bridge entities over live relations whose far end has that type, keeping one row per
+(bridge, predicate group), skipping hubs (> 200 live relations) and appending at most two facts after the forward
+fact budget. Measured on multihop-holdout: acc@10 0.863 -> 0.912, nothing lost; world-300 unchanged.
 
 ### 6. Channel Ablation Protocol
 To measure the marginal contribution of each retrieval channel, the benchmark is executed across 5 configurations:
