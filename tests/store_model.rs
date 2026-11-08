@@ -32,10 +32,7 @@
 //!      survivor-alias, or was a live duplicate the merge consolidated, or
 //!      became a self-loop); no live relation with src == dst; the old name
 //!      resolves to the survivor.
-//!   5. `validate()` reports no unexpected problems. On merged main it still
-//!      reports one known contradiction: "relation rN is current but every
-//!      memory that states it has ended" (FINDING-2, still open); that exact
-//!      signature is tolerated, everything else fails.
+//!   5. `validate()` reports no problems.
 //!
 //! Names are chosen two+ tokens apart so the near-name layer (JW/blockers)
 //! returns Below for value pairs; with the hash embedder the name layer
@@ -378,7 +375,7 @@ fn sql_live_self_loops(e: &Engine) -> i64 {
 /// The per-op gate. `is_merge` relaxes rule 1 (merge consolidates exact live
 /// duplicates by design; rules 2/3/4/5 still apply). Rule 3's "at most one
 /// live value per (subject, exclusive predicate) at now" is asserted on merged
-/// main (FINDING-1 fixed); rule 5 keeps the FINDING-2 tolerance (still open).
+/// main (FINDING-1 fixed); rule 5 asserts `validate()` reports nothing.
 fn check_all(e: &mut Engine, m: &Model, ctx: &Ctx, rel_before: i64, is_merge: bool, op_no: u64) {
     if !is_merge {
         let after = relation_count(e);
@@ -520,22 +517,9 @@ fn check_all(e: &mut Engine, m: &Model, ctx: &Ctx, rel_before: i64, is_merge: bo
     let problems = e
         .validate()
         .unwrap_or_else(|err| vec![format!("validate failed: {err}")]);
-    // FINDING-2 (still open on merged main 4a14f81): a relation whose every
-    // evidence memory has `valid_to` set (e.g. written by two memories that
-    // were both invalidated with `invalidate m`) is reported here even though
-    // it is a legal store state — the ending rule counts only expired memories
-    // as lost evidence. This exact signature is tolerated; anything else that
-    // `validate()` reports is a real failure.
-    let unexpected: Vec<String> = problems
-        .into_iter()
-        .filter(|p| {
-            !(p.starts_with("relation r")
-                && p.ends_with("is current but every memory that states it has ended"))
-        })
-        .collect();
     ctx.expect(
-        unexpected.is_empty(),
-        format!("rule 5: validate reports: {unexpected:?}"),
+        problems.is_empty(),
+        format!("rule 5: validate reports: {problems:?}"),
     );
 }
 
@@ -770,9 +754,13 @@ fn mirror_remember(
     }
 }
 
-/// Relations whose only live (non-expired) evidence is in `ids` end at `at`
-/// (the engine's `end_relations_losing_evidence`; nothing happens for
-/// already-expired rows).
+/// Relations whose only live evidence is in `ids` end at the latest evidence
+/// `valid_to` (at least `at`; the engine's `end_relations_losing_evidence`;
+/// nothing happens for already-expired rows). `other_live` mirrors the engine's
+/// evidence rule (lane nc-evidence, one definition of "lost evidence"): for a
+/// current relation, a witness whose `valid_to` has passed no longer supports
+/// it; an already-ended relation keeps its history while any non-retired
+/// witness states it.
 fn end_last_evidence(m: &mut Model, ids: &[i64], at: i64) {
     for f in m.facts.iter_mut() {
         if f.expired {
@@ -781,15 +769,28 @@ fn end_last_evidence(m: &mut Model, ids: &[i64], at: i64) {
         if !f.evidence.iter().any(|e| ids.contains(e)) {
             continue;
         }
-        let other_live = f
-            .evidence
-            .iter()
-            .any(|e| !ids.contains(e) && m.memories.iter().any(|mm| mm.id == *e && !mm.expired));
+        let other_live = f.evidence.iter().any(|e| {
+            !ids.contains(e)
+                && m.memories.iter().any(|mm| {
+                    mm.id == *e && !mm.expired && (f.valid_to.is_some() || mm.valid_to.is_none())
+                })
+        });
         if other_live {
             continue;
         }
-        if f.valid_to.is_none_or(|v| v > at) {
-            f.valid_to = Some(at);
+        let max_vt = f
+            .evidence
+            .iter()
+            .filter_map(|e| {
+                m.memories
+                    .iter()
+                    .find(|mm| mm.id == *e)
+                    .and_then(|mm| mm.valid_to)
+            })
+            .max();
+        let end = max_vt.map_or(at, |v| v.max(at));
+        if f.valid_to.is_none_or(|v| v > end) {
+            f.valid_to = Some(end);
         }
     }
 }
@@ -978,7 +979,8 @@ fn op_invalidate_memory(
                 // Engine: "already ended", relations untouched.
             } else if let Some(mm) = m.memory_mut(id) {
                 mm.valid_to = Some(at);
-                // Relations whose only live evidence is this memory end at `at`.
+                // Relations whose only live evidence is this memory end at the
+                // latest evidence valid_to (at least `at`).
                 end_last_evidence(m, &[id], at);
             }
             check_all(e, m, ctx, rel_before, false, op_no);
@@ -1068,10 +1070,12 @@ fn retract_last_evidence(m: &mut Model, id: i64) {
         if !f.evidence.contains(&id) {
             continue;
         }
-        let other_live = f
-            .evidence
-            .iter()
-            .any(|e| *e != id && m.memories.iter().any(|mm| mm.id == *e && !mm.expired));
+        let other_live = f.evidence.iter().any(|e| {
+            *e != id
+                && m.memories.iter().any(|mm| {
+                    mm.id == *e && !mm.expired && (f.valid_to.is_some() || mm.valid_to.is_none())
+                })
+        });
         if !other_live {
             f.expired = true;
         }
