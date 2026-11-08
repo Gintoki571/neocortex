@@ -637,6 +637,196 @@ fn h2_10_window_keeps_event_whose_stated_range_reaches_into_it() {
     }
 }
 
+// VALIDATE-EVIDENCE: forget (soft) and supersedes share the same live-evidence
+// rule: forgetting the last open evidence when the other evidence is already
+// ended retracts the relation (expired_at, no invented end date).
+#[test]
+fn validate_evidence_forget_last_open_evidence_retracts() {
+    let e = engine();
+    let first = e
+        .remember(RememberInput {
+            content: "Alice lives in Austin.".into(),
+            valid_from: Some("2024-01-01".into()),
+            entities: vec![person("Alice"), org("Austin")],
+            relations: vec![rel("Alice", "lives in", "Austin", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = first.relations[0].id;
+    e.remember(RememberInput {
+        content: "Alice lives in Austin, confirmed.".into(),
+        valid_from: Some("2024-02-01".into()),
+        entities: vec![person("Alice"), org("Austin")],
+        relations: vec![rel("Alice", "lives in", "Austin", false)],
+        ..Default::default()
+    })
+    .unwrap();
+    e.invalidate("m1", Some("2025-01-01")).unwrap();
+    e.forget("m2", false).unwrap();
+    let row: (Option<i64>, Option<i64>) =
+        e.db.sql()
+            .query_row(
+                &format!("SELECT valid_to, expired_at FROM relations WHERE id={rid}"),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+    assert_eq!(row.0, None, "forget must not invent an end date");
+    assert!(
+        row.1.is_some(),
+        "forgetting the last live evidence must retract the relation"
+    );
+    assert!(e.validate().unwrap().is_empty());
+}
+
+// VALIDATE-EVIDENCE: superseding the last open evidence when the other
+// evidence is already ended ends the relation where the new memory starts.
+#[test]
+fn validate_evidence_supersede_last_open_evidence_ends() {
+    let e = engine();
+    let first = e
+        .remember(RememberInput {
+            content: "Alice lives in Austin.".into(),
+            valid_from: Some("2024-01-01".into()),
+            entities: vec![person("Alice"), org("Austin")],
+            relations: vec![rel("Alice", "lives in", "Austin", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = first.relations[0].id;
+    e.remember(RememberInput {
+        content: "Alice lives in Austin, confirmed.".into(),
+        valid_from: Some("2024-02-01".into()),
+        entities: vec![person("Alice"), org("Austin")],
+        relations: vec![rel("Alice", "lives in", "Austin", false)],
+        ..Default::default()
+    })
+    .unwrap();
+    e.invalidate("m1", Some("2025-01-01")).unwrap();
+    let out = e
+        .remember(RememberInput {
+            content: "Alice now lives elsewhere.".into(),
+            valid_from: Some("2025-03-01".into()),
+            entities: vec![person("Alice"), org("Austin")],
+            supersedes: vec!["m2".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.superseded_memories.contains(&2),
+        "supersede must retire m2: {out:?}"
+    );
+    assert_eq!(
+        sql_i64(
+            &e,
+            &format!("SELECT valid_to FROM relations WHERE id={rid}")
+        ),
+        Some(day(2025, 3, 1)),
+        "superseding the last live evidence must end the relation at the new start"
+    );
+    assert!(e.validate().unwrap().is_empty());
+}
+
+// VALIDATE-EVIDENCE: one definition of live evidence (finding from
+// nc-model): a memory ended by valid_to is lost evidence, so ending the last
+// live evidence memory ends the relation and validate stays silent.
+#[test]
+fn validate_evidence_both_memories_invalidated_ends_relation() {
+    let e = engine();
+    let first = e
+        .remember(RememberInput {
+            content: "Alice lives in Austin.".into(),
+            valid_from: Some("2024-01-01".into()),
+            entities: vec![person("Alice"), org("Austin")],
+            relations: vec![rel("Alice", "lives in", "Austin", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = first.relations[0].id;
+    let second = e
+        .remember(RememberInput {
+            content: "Alice lives in Austin, confirmed.".into(),
+            valid_from: Some("2024-02-01".into()),
+            entities: vec![person("Alice"), org("Austin")],
+            relations: vec![rel("Alice", "lives in", "Austin", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        second.relations[0].id, rid,
+        "second write must merge evidence"
+    );
+    assert!(e.validate().unwrap().is_empty());
+    e.invalidate("m1", Some("2025-01-01")).unwrap();
+    // One of two evidence memories ended: the relation stays live.
+    assert_eq!(
+        sql_i64(
+            &e,
+            &format!("SELECT valid_to FROM relations WHERE id={rid}")
+        ),
+        None,
+        "one of two evidence memories invalidated must not end the relation"
+    );
+    assert!(e.validate().unwrap().is_empty());
+    e.invalidate("m2", Some("2025-06-01")).unwrap();
+    assert_eq!(
+        sql_i64(
+            &e,
+            &format!("SELECT valid_to FROM relations WHERE id={rid}")
+        ),
+        Some(day(2025, 6, 1)),
+        "last live evidence ended must end the relation at the latest evidence valid_to"
+    );
+    let problems = e.validate().unwrap();
+    assert!(
+        problems.is_empty(),
+        "validate must agree that the relation ended: {problems:?}"
+    );
+}
+
+#[test]
+fn validate_evidence_invalidated_then_restated_revives() {
+    let e = engine();
+    let first = e
+        .remember(RememberInput {
+            content: "Alice lives in Austin.".into(),
+            valid_from: Some("2024-01-01".into()),
+            entities: vec![person("Alice"), org("Austin")],
+            relations: vec![rel("Alice", "lives in", "Austin", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = first.relations[0].id;
+    e.invalidate("m1", Some("2025-01-01")).unwrap();
+    assert_eq!(
+        sql_i64(
+            &e,
+            &format!("SELECT valid_to FROM relations WHERE id={rid}")
+        ),
+        Some(day(2025, 1, 1))
+    );
+    assert!(e.validate().unwrap().is_empty());
+    // A later remember restating the fact is live again with new evidence.
+    let again = e
+        .remember(RememberInput {
+            content: "Alice lives in Austin again.".into(),
+            entities: vec![person("Alice"), org("Austin")],
+            relations: vec![rel("Alice", "lives in", "Austin", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let live: i64 =
+        e.db.sql()
+            .query_row(
+                "SELECT count(*) FROM relations WHERE expired_at IS NULL AND valid_to IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert_eq!(live, 1, "restated relation must be live again: {again:?}");
+    assert!(e.validate().unwrap().is_empty());
+}
+
 // H2-10: a month with an explicit year that still modifies a noun ("the
 // December 2026 conference") dates the subject, not the search: the year does
 // not turn a bare-month modifier into a scoping window.

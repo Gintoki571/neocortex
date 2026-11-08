@@ -4697,28 +4697,42 @@ fn touch_memory(db: &Db, id: i64, now: i64) -> Result<()> {
 }
 
 /// Relations evidenced by `memory` for which no *other live* memory is evidence.
+/// A memory is evidence for a current relation only while it is itself current
+/// (neither retired nor ended, the same definition `Engine::validate` uses); an
+/// already-ended relation keeps its history while any non-retired memory states
+/// it, so forgetting one witness of a historical fact does not erase it.
 pub fn relations_losing_their_last_evidence(db: &Db, memory: i64) -> Result<Vec<i64>> {
     let mut st = db.sql().prepare(
         "SELECT DISTINCT e.relation_id FROM relation_evidence e
+          JOIN relations r ON r.id=e.relation_id
          WHERE e.memory_id=?1
            AND NOT EXISTS (
              SELECT 1 FROM relation_evidence e2 JOIN memories m ON m.id=e2.memory_id
              WHERE e2.relation_id=e.relation_id AND e2.memory_id<>?1
-               AND m.expired_at IS NULL)",
+               AND m.expired_at IS NULL
+               AND (r.valid_to IS NOT NULL OR m.valid_to IS NULL))",
     )?;
     let rows = st.query_map([memory], |r| r.get::<_, i64>(0))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Relations that `memory` alone keeps current end at `at` (never later than
-/// their current end). Callers pick `at`: the memory's own end, or the start of a
-/// memory that supersedes it.
+/// Relations that `memory` alone keeps current end at the latest evidence
+/// `valid_to` (never later than their current end). `at` is the pending end of
+/// `memory` itself: its own end, or the start of a memory that supersedes it
+/// (stored only after this runs).
 pub fn end_relations_losing_evidence(db: &Db, memory: i64, at: i64) -> Result<()> {
     for rid in relations_losing_their_last_evidence(db, memory)? {
+        let latest: Option<i64> = db.sql().query_row(
+            "SELECT MAX(m.valid_to) FROM relation_evidence e
+             JOIN memories m ON m.id=e.memory_id WHERE e.relation_id=?1",
+            [rid],
+            |r| r.get(0),
+        )?;
+        let end = latest.map_or(at, |v| v.max(at));
         db.sql().execute(
             "UPDATE relations SET valid_to=MIN(COALESCE(valid_to,?1),?1)
              WHERE id=?2 AND expired_at IS NULL",
-            params![at, rid],
+            params![end, rid],
         )?;
     }
     Ok(())
