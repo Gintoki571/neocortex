@@ -278,12 +278,14 @@ fn time_tail(words: &[(usize, usize, &str)], i: usize) -> bool {
     match word {
         "yesterday" | "today" | "tomorrow" | "tonight" | "ago" => true,
         "last" | "this" | "next" => next.is_some_and(|n| TIME_WORDS.contains(&n)),
-        "in" | "on" => {
-            next.is_some_and(|n| TIME_WORDS.contains(&n) || n.chars().all(|c| c.is_ascii_digit()))
-        }
+        "in" | "on" => next.is_some_and(|n| {
+            TIME_WORDS.contains(&n)
+                || n.chars().all(|c| c.is_ascii_digit())
+                || temporal::is_iso_date_token(n)
+        }),
         "as" => next == Some("of"),
         // "no longer reviews X since August 2026": a date opens a time tail.
-        "since" | "until" | "from" => {
+        "since" | "until" | "from" | "after" => {
             next.is_some_and(|n| TIME_WORDS.contains(&n) || n.chars().any(|c| c.is_ascii_digit()))
         }
         "at" => next.is_some_and(|n| {
