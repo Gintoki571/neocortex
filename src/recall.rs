@@ -4848,5 +4848,4 @@ mod tests {
         );
         assert!(sources[0].contains("memories_fts"), "{plan:?}");
     }
-
 }
