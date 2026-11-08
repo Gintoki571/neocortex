@@ -2473,6 +2473,10 @@ struct TextRetraction {
     candidate: bool,
 }
 
+/// "there" as a pronoun-like object: resolved at end time to the subject's
+/// single live place for the matching predicate group. Never a real norm.
+const THERE: &str = "\x00there";
+
 /// Spans where a name occurs as whole words in the content, as
 /// (start, end, normalized name). The name is lower-cased first, so offsets
 /// index the lower-cased copy used by the caller.
@@ -2703,14 +2707,14 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
             }
             let phrase_start = words[p].0;
             let phrase_end = words[p + plen - 1].1;
-            // The object may start up to three words after the cue; an -ly
-            // adverb modifies the verb and does not use up the lookahead
-            // ("no longer works remotely at Acme").
+            // The object may start up to four words after the cue (verb +
+            // noun + prep + target, "supplies parts to Globex"); an -ly
+            // adverb modifies the verb and does not use up the lookahead.
             let max_end = words
                 .iter()
                 .skip(p + plen)
                 .filter(|w| !adverb(w.2))
-                .nth(2)
+                .nth(3)
                 .map(|w| w.1)
                 .unwrap_or(usize::MAX);
             let mut object_span = spans
@@ -2748,6 +2752,22 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
             if there_match {
                 let vwords = &words[p + plen..there_pos];
                 if vwords.iter().any(|w| scope_word(w.2, no_longer)) {
+                    continue;
+                }
+                let there_end = words[there_pos].1;
+                // A scope after "there" ("on Fridays") means a partial
+                // retraction: nothing ends. Reuse the normal tail rule.
+                if matches!(
+                    object_tail(
+                        &lower,
+                        there_end,
+                        &words,
+                        there_pos + 1,
+                        group,
+                        &spans.spans
+                    ),
+                    ObjectTail::Noun
+                ) {
                     continue;
                 }
                 if group.is_empty() {
@@ -2810,27 +2830,42 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
                 }
             }
             let min_start = words.get(p.saturating_sub(10)).map(|w| w.0).unwrap_or(0);
-            let Some((subject_start, subject_end, subject)) = spans
+            let subject_found = spans
                 .spans
                 .iter()
                 .rev()
                 .find(|(s, e, name)| *e <= phrase_start && *s >= min_start && *name != object)
-                .cloned()
-            else {
-                continue;
-            };
-            candidate |= spans.ambiguous.contains(&(subject_start, subject_end));
-            found.push((
-                phrase_start,
-                TextRetraction {
-                    subject,
-                    object,
-                    group,
-                    verb,
-                    noun: None,
-                    candidate,
-                },
-            ));
+                .cloned();
+            if let Some((subject_start, subject_end, subject)) = subject_found {
+                candidate |= spans.ambiguous.contains(&(subject_start, subject_end));
+                found.push((
+                    phrase_start,
+                    TextRetraction {
+                        subject,
+                        object,
+                        group,
+                        verb,
+                        noun: None,
+                        candidate,
+                    },
+                ));
+            } else if there_match {
+                // "X no longer works there" with no other prior entity: X is the
+                // subject and "there" resolves to X's single live place for
+                // this verb/group (brief nc-h312r).
+                candidate |= spans.ambiguous.contains(&(object_start, object_end));
+                found.push((
+                    phrase_start,
+                    TextRetraction {
+                        subject: object,
+                        object: THERE.to_string(),
+                        group,
+                        verb,
+                        noun: None,
+                        candidate,
+                    },
+                ));
+            }
         }
     }
     found.extend(pair_retractions(&lower, &words, spans));
@@ -2993,7 +3028,7 @@ fn end_text_retractions(
         return Ok(());
     }
     let spans = retraction_spans(db, content, entities)?;
-    for retraction in text_retractions(content, &spans) {
+    for mut retraction in text_retractions(content, &spans) {
         let group_id: Option<i64> = if retraction.group.is_empty() {
             None
         } else {
@@ -3011,6 +3046,37 @@ fn end_text_retractions(
                 None => continue,
             }
         };
+        if retraction.object == THERE {
+            let places = there_places(
+                db,
+                &retraction.subject,
+                group_id,
+                retraction.verb.as_deref(),
+                at,
+            )?;
+            let distinct: HashSet<&str> = places.iter().map(|(_, _, _, n)| n.as_str()).collect();
+            match distinct.len() {
+                1 => {
+                    retraction.object = places[0].3.clone();
+                }
+                0 => continue,
+                _ => {
+                    // Two+ live places: conflict candidates, end nothing.
+                    for (rid, fact, valid_from, _) in &places {
+                        if !sink.exclude.contains(rid)
+                            && !sink.conflicts.iter().any(|c| c.relation_id == *rid)
+                        {
+                            sink.conflicts.push(crate::engine::Conflict {
+                                relation_id: *rid,
+                                fact: fact.clone(),
+                                valid_from: *valid_from,
+                            });
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
         // A live fact recorded at ingest time may start after the retraction's
         // inferred date ("divorced ... in 2024"): match it and let the
         // correction branch retire it. Ended rows still need to contain the
@@ -3086,6 +3152,57 @@ fn end_text_retractions(
         }
     }
     Ok(())
+}
+
+/// Live relation places of `subject_norm` matching `group_id`/`verb`, for a
+/// "there" retraction: (relation id, fact, valid_from, other-end norm).
+fn there_places(
+    db: &Db,
+    subject_norm: &str,
+    group_id: Option<i64>,
+    verb: Option<&str>,
+    at: i64,
+) -> Result<Vec<(i64, String, i64, String)>> {
+    let mut st = db.sql().prepare(
+        "SELECT r.id, r.fact, r.valid_from, p.canonical, COALESCE(NULLIF(p.group_id,0),p.id),
+                s.norm, d.norm
+         FROM relations r
+         JOIN predicates p ON p.id=r.predicate_id
+         JOIN entities s ON s.id=r.src
+         JOIN entities d ON d.id=r.dst
+         WHERE r.expired_at IS NULL AND r.polarity=1
+           AND (s.norm=?1 OR d.norm=?1)
+           AND (r.valid_to IS NULL OR (r.valid_from<=?2 AND r.valid_to>?2))
+           AND (?3 IS NULL OR COALESCE(NULLIF(p.group_id,0),p.id)=?3)",
+    )?;
+    let rows: Vec<(i64, String, i64, String, i64, String, String)> = st
+        .query_map(params![subject_norm, at, group_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut out = Vec::new();
+    for (rid, fact, valid_from, pred_canonical, pred_group_id, s_norm, d_norm) in rows {
+        if let Some(v) = verb {
+            if !verb_matches_relation(db, v, &pred_canonical, pred_group_id).unwrap_or(false) {
+                continue;
+            }
+        }
+        let other = if s_norm == subject_norm {
+            d_norm
+        } else {
+            s_norm
+        };
+        out.push((rid, fact, valid_from, other));
+    }
+    Ok(out)
 }
 
 /// Check if the verb in a generic text retraction matches the relation's predicate:

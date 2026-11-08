@@ -1272,3 +1272,185 @@ fn h3_12_hasnt_stopped_using_keeps_uses_live() {
         assert_eq!(relation_end(&e, rid), None, "{text}");
     }
 }
+
+// ============================================================ nc-h312r remainder
+
+/// "X no longer works there" resolves "there" to X's single live work place.
+#[test]
+fn h3_12r_no_longer_works_there_ends_single_work_place() {
+    let e = engine();
+    let rid = tomasz_works_at_acme(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak no longer works there.",
+        vec![person("Tomasz Nowak")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "works there did not end: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// Adverb between verb and "there": "works remotely there".
+#[test]
+fn h3_12r_no_longer_works_remotely_there_ends_single_work_place() {
+    let e = engine();
+    let rid = tomasz_works_at_acme(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak no longer works remotely there.",
+        vec![person("Tomasz Nowak")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "works remotely there did not end: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// "on Fridays" is a scope clause: the general fact stays live.
+#[test]
+fn h3_12r_works_there_on_fridays_scope_ends_nothing() {
+    let e = engine();
+    let rid = tomasz_works_at_acme(&e);
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak no longer works there on Fridays.",
+        vec![person("Tomasz Nowak")],
+    );
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "scope clause ended fact: {out:?}"
+    );
+    assert!(
+        out.conflicts.is_empty(),
+        "scope clause produced conflicts: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+/// No live work place for the subject: nothing ends, no conflict.
+#[test]
+fn h3_12r_works_there_with_no_work_place_ends_nothing() {
+    let e = engine();
+    let out = retract_with(
+        &e,
+        "Ana Silva no longer works there.",
+        vec![person("Ana Silva")],
+    );
+    assert!(
+        out.invalidated_relations.is_empty(),
+        "ended without a place: {out:?}"
+    );
+    assert!(
+        out.conflicts.is_empty(),
+        "conflicted without a place: {out:?}"
+    );
+}
+
+/// Two live work places: conflict candidates, end nothing.
+#[test]
+fn h3_12r_works_there_two_live_work_places_is_conflict() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak works at Acme.".into(),
+            valid_from: Some("2026-01-04".into()),
+            entities: vec![person("Tomasz Nowak"), org("Acme")],
+            relations: vec![rel("Tomasz Nowak", "works at", "Acme", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid1 = out1.relations[0].id;
+    let out2 = e
+        .remember(RememberInput {
+            content: "Tomasz Nowak works at Brightline.".into(),
+            valid_from: Some("2026-01-05".into()),
+            entities: vec![person("Tomasz Nowak"), org("Brightline")],
+            relations: vec![rel("Tomasz Nowak", "works at", "Brightline", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid2 = out2.relations[0].id;
+    let out = retract_with(
+        &e,
+        "Tomasz Nowak no longer works there.",
+        vec![person("Tomasz Nowak")],
+    );
+    assert!(
+        !out.invalidated_relations.contains(&rid1),
+        "ended rid1 with two places: {out:?}"
+    );
+    assert!(
+        !out.invalidated_relations.contains(&rid2),
+        "ended rid2 with two places: {out:?}"
+    );
+    assert!(
+        !out.conflicts.is_empty(),
+        "two places did not conflict: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid1), None);
+    assert_eq!(relation_end(&e, rid2), None);
+}
+
+/// "verb + object noun + preposition + target": "supplies parts to Globex".
+#[test]
+fn h3_12r_supplies_parts_to_ends_fact() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Acme supplies parts to Globex.".into(),
+            valid_from: Some("2026-01-04".into()),
+            entities: vec![org("Acme"), org("Globex")],
+            relations: vec![rel("Acme", "supplies parts to", "Globex", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let canon: String = e
+        .db
+        .sql()
+        .query_row(
+            "SELECT p.canonical FROM relations r JOIN predicates p ON p.id=r.predicate_id WHERE r.id=?1",
+            [rid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let out = retract_with(
+        &e,
+        "Acme no longer supplies parts to Globex.",
+        vec![org("Acme"), org("Globex")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "supplies parts to not ended (canon={canon}): {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
+
+/// Retraction verb "supplies parts to" also ends a stored "supplies" fact.
+#[test]
+fn h3_12r_supplies_parts_to_ends_simple_supplies() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Acme supplies Globex.".into(),
+            valid_from: Some("2026-01-04".into()),
+            entities: vec![org("Acme"), org("Globex")],
+            relations: vec![rel("Acme", "supplies", "Globex", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    let out = retract_with(
+        &e,
+        "Acme no longer supplies parts to Globex.",
+        vec![org("Acme"), org("Globex")],
+    );
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "supplies parts to did not end supplies: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(NOW));
+}
