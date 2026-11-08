@@ -88,8 +88,8 @@ pub struct Config {
     pub w_causal: f64,
     /// H2-16: on a why-question, follow the stored cause relations of the top
     /// answering memories (an anchored endpoint, or a specific entity shared
-    /// with another answer) and add their cause memory and fact. 0 disables
-    /// the follow step.
+    /// with another answer) and add their cause memory and fact. `false`
+    /// disables the follow step.
     pub cause_follow: bool,
     /// H2-15: on a question that names a defect and asks whether it is still
     /// open, rank open bug reports above bugs a later memory fixes: every open
@@ -139,7 +139,6 @@ pub struct Config {
     /// Infinity (default) = off: measured +1 mh2 query at 0, no gain on a blind set.
     pub prose_margin: f64,
     /// Pull up to two answer-typed relations from returned bridge entities.
-    /// Off by default because this is an experimental retrieval channel.
     pub bridge_pull: bool,
     /// Rerank the top N fused memory candidates with the cross-encoder
     /// (0 = off). Without a model directory `recall` ignores it.

@@ -1100,9 +1100,7 @@ fn link_name_parts(db: &Db, id: i64, name: &str, norm: &str, kind: &str) -> Resu
     if tokens.is_empty() || norm.chars().filter(|c| c.is_alphabetic()).count() < 3 {
         return Ok(());
     }
-    let marks = std::iter::repeat_n("?", tokens.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let marks = vec!["?"; tokens.len()].join(",");
     let ids: Vec<i64> = {
         let sql = format!(
             "SELECT DISTINCT entity_id FROM name_tokens WHERE token IN ({marks})
