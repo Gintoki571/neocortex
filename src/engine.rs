@@ -193,6 +193,17 @@ pub struct Config {
     /// anchored answer needs a channel that no word in the question can crowd
     /// out).
     pub w_anchor: f64,
+    /// RRF weight of the category-tag memory channel (`recall.rs`): the
+    /// members of a rare tag a list question names by word ("my vacations" ->
+    /// `vacation`, "the equipment" -> `equipment`), ranked by query cosine.
+    /// Only a tag on at most `TAG_CATEGORY_MAX` memories counts, so the
+    /// world's hub tags ("travel", "employment") are never a category; the
+    /// channel runs only on an `aggregate_intent` question (a single-answer
+    /// preference that names the same tag would be flooded, and so would a
+    /// habitual "every winter"/"after each show", which is not a list), and
+    /// only at `ANCHOR_MIN_MEMORIES` or more, so small stores and every other
+    /// question stay byte-identical. 0 disables it for A/B measurement.
+    pub w_tag: f64,
 }
 
 impl Default for Config {
@@ -248,6 +259,7 @@ impl Default for Config {
             correction_hints: false,
             rel_prefilter: false,
             w_anchor: 2.5,
+            w_tag: 4.0,
         }
     }
 }

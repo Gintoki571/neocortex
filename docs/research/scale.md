@@ -807,6 +807,106 @@ on mh1. Context +1.5% fixtures / +4.2% holdout / +10.9% mh1 / +5.7% mh2 (cap
 noisy shared disk). Keep bar met on mh1 (0.925); alone gates per common.md
 pass. See `loop/reports/nc-hay3.md`.
 
+## After nc-agg: the category-tag channel for list questions (2026-11-08)
+
+Same 108,667-memory world-10000 store. An aggregation question needs ALL its gold
+memories in the top k, and inside the crowd it kept only part of them: fixtures
+aggregation recall 0.450, holdout 0.347 (`--load-db` on saved copies,
+`--failures`). The diagnosis table (`examples/hay_diag.rs`, now with per-gold
+BM25/vector/PPR/k50/k8 ranks, logs `tmp/nc-agg/diag-hay-{fixtures,holdout}-base.log`)
+classifies every aggregation loss as a **pool loss**: the golds sit at BM25/vec/graph
+ranks 50-2000 (e.g. fixtures "all personal vacations": m026 and m080 outside every
+channel's top 2000, m028 at vec#21, 3/5 in k50 and 2/5 in k8) while the world's
+near-identical distractor sentences ("Vivek Barrao spent a week in Naples for
+work") fill the top of the fused list. Holdout "family members and their news"
+loses 6/6 even at k=50. Widening the pools or the beam made other categories worse
+(nc-hay2), so the fix had to add a channel, not a wider scan.
+
+`tag` channel (`Config.w_tag` 4.0, the same `ANCHOR_MIN_MEMORIES` 50k gate): a list
+question (`paths::aggregate_intent`: an all/every/each/list cue, a partitive plural
+head, two coordinated plural heads, or "who works in/at/for") names a category, and
+the tags the caller stored are that category. `rare_tag_ids` looks up the question's
+content words in `memories_fts` (tags column) and keeps the memories whose tags
+match exactly or through `text::singularize` ("vacations" -> `vacation`), never by
+prefix ("care" must not name `career`, "back" not `backup` - the earlier prefix
+build cost holdout preference MRR 1.0 -> 0.797 for exactly that reason). A tag on
+more than `TAG_CATEGORY_MAX` 200 memories is a hub every member shares and names no
+category, so the world's generic tags are skipped. The members (at most 128) are
+ranked by query cosine like the anchor channel.
+
+| inside the 108k store (`--load-db`, real model) | main | nc-agg |
+|---|---|---|
+| fixtures aggregation recall / MRR | 0.4497 / 0.8776 | **0.6497 / 1.000** |
+| fixtures overall recall / MRR | 0.869 / 0.842 | 0.885 / 0.852 |
+| holdout aggregation recall / MRR | 0.3469 / 0.4286 | **0.5020 / 0.5833** |
+| holdout overall recall / MRR | 0.834 / 0.703 | 0.847 / 0.715 |
+| mh1 acc@10 | 0.900 | 0.900 (per category identical) |
+| mh2 (blind) acc@10 | 0.650 | 0.650 (per category identical) |
+| fixtures p50, tag off / on, interleaved 3x (`--set w_tag=0`) | 299.6 / 290.9 / 299.7 ms | 300.3 / 287.7 / 300.2 ms |
+
+Every other category (as-of, current-vs-superseded, history, keyword, multi-hop,
+paraphrase, preference, procedure/lesson, synonym, temporal-window) is byte-identical
+between the two runs in both haystack sets; only `aggregation` moves. Alone (below the
+50k gate) the channel never runs, so the gate sets are unchanged: fixtures 0.953 /
+0.901, holdout 0.914 / 0.793, mh1 0.912, blind 0.820, world-300 acc@10 0.998
+(recall 0.969, MRR 0.883), and `--failures` output is identical to main at every
+small store (only the pre-existing nondeterministic `context tokens/query` wobbles,
+351.6/351.9 with the same binary).
+
+Reproduce: `neocortex eval eval/fixtures.json --load-db <haystack copy> --failures`,
+then the same with `--set w_tag=0` for the A/B.
+
+## After nc-agg round 2: a habitual every/each is not a list question (2026-11-09)
+
+The round-1 shape fired on any `all`/`every`/`each`, so a habitual single-answer
+question ("... each evening?", "... after each show?", "... every year?")
+pushed the whole tag category into its top 10 and cost a blind-set two-hop
+answer (acc@10 -1, MRR down). Fix (`src/paths.rs`): an `all`/`every`/`each`
+cue counts as a list cue only when the next word (through a `single`/`other`
+modifier, and deferring a chained `each and every` to the later cue) is not a
+time/occasion noun or weekday (`OCCASIONS`, 52 entries: day..decade,
+morning..night, weekend, seasons, time, show, visit, occasion, monday..sunday);
+`everything`/`everyone`/`list` are unchanged. An `all/every/each` whose next
+word is `of`/`the`/a noun stays a list cue, as are the pre-existing
+partitive/coordinated-plural/membership shapes. Comment: `cue_quantifies_list`
+in `src/paths.rs`.
+
+Aggregation-category queries in the two gate sets still trigger, and habitual
+paraphrases no longer do (`habitual_every_each_is_not_a_list_question`,
+`aggregate_intent_names_the_list_questions`, both in `src/paths.rs`). Trigger
+counts before vs after the fix are identical (`examples/agg_intent_counts.rs`,
+logs `lanes/tmp/nc-agg/r2-count-before.log` / `r2-count-after.log`):
+
+| set | fired | aggregation fired |
+|---|---|---|
+| fixtures | 9/84 | 7/7 |
+| holdout | 5/88 | 5/7 ("major equipment in the lab", "family members and their news" are bare plural noun phrases with no cue and never fired) |
+| multihop-holdout | 0/80 | - |
+| multihop-holdout2 | 0/100 | - |
+
+`tests/recall.rs` `the_tag_channel_is_shape_gated_and_exact` now also pins a
+habitual "which vacation did Ana take every winter" query byte-identical with
+`w_tag=0` at the 50k store-size gate. Inside the 108k haystack (real model,
+`NEOCORTEX_VEC=int8`, `--haystack w10k-int8.db`, logs `lanes/tmp/nc-agg/r2-hay-*.log`):
+
+| inside the 108k store | w_tag=4.0 (fix) | w_tag=0 |
+|---|---|---|
+| fixtures aggregation recall / MRR | **0.6497 / 1.000** | 0.4497 / 0.878 |
+| holdout aggregation recall / MRR | **0.5020 / 0.583** | 0.3469 / 0.429 |
+| mh1 acc@10 | 0.900 (per category identical to round 1) | - |
+| mh2 (blind) acc@10 | **0.650** (per category identical to round 1) | - |
+
+A scripted per-category diff of `def` vs `ctl` in both haystack sets shows
+`aggregation` is the ONLY category that moves (fixtures overall 0.885/0.852 vs
+0.869/0.842; holdout overall 0.847/0.715 vs 0.834/0.703, as in round 1). One
+caveat: the first `fixtures-def` run ingested onto a cold page cache while the
+machine was otherwise busy and reported p50 929 ms vs ctl 294 ms; query
+latency is not a gate for `--haystack` runs (the paired round-1 measurement
+stands at +0.2% median). The mh2 attempt failed once with "database or disk is
+full" (the shared E partition hit 96-98% during another lane's build) and was
+re-run successfully; the numbers above are from the successful retry (log
+`r2-hay-mh2-def2.log`).
+
 ## Reproduce
 
 ```bash
