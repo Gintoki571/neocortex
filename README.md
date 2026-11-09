@@ -301,8 +301,10 @@ its prose): "Ivan left Acme; he no longer works there" ends the one live
 relation of that kind it names at the memory's `valid_from` and reports it in
 `invalidated`; when several relations match it reports `conflicts` and ends
 nothing. First names resolve through the write's entities and stored people
-("Maria divorced Tom" with Maria Duarte and Tom Duarte supplied), and a first
-name shared by several people only reports a conflict. A coordinated pair
+("Maria divorced Tom" with Maria Duarte and Tom Duarte supplied). A first
+name shared by several people only reports a conflict, unless exactly one
+of them holds the fact named, in which case that fact ends with a hint
+naming the holder. A coordinated pair
 before the cue ("Acme and Northwind are no longer partners") ends the pair's
 relation. A live fact recorded at ingest time is retired even when the sentence
 dates the retraction earlier ("Maria divorced Tom in 2024"). The name must be

@@ -2482,6 +2482,13 @@ struct TextRetraction {
     /// The sentence hedges or reports the event, or a name it uses is
     /// ambiguous: offer the relation as a conflict candidate, never end it.
     candidate: bool,
+    /// The clause hedges/reports the event ("almost quit"): a candidate,
+    /// never an end, even when the shared-first-name expansion finds one row.
+    hedged: bool,
+    /// Stored people sharing the subject's first name (H4-03), when the
+    /// subject mention is a bare first name no supplied entity resolves: the
+    /// end step tries each person's relation for the object.
+    subject_alts: Vec<String>,
 }
 
 /// "there" as a pronoun-like object: resolved at end time to the subject's
@@ -2531,6 +2538,11 @@ struct RetractionSpans {
     /// A first name shared by several known people ("Maria" with two stored
     /// Marias): a retraction on it is reported as a conflict, never ended.
     ambiguous: HashSet<(usize, usize)>,
+    /// The shared-first-name candidates for a bare mention (H4-03), only
+    /// when no supplied entity resolves the mention: at end time each
+    /// candidate is tried for the object, so a fact only one of them holds
+    /// still ends.
+    subject_alts: HashMap<(usize, usize), Vec<String>>,
 }
 
 /// What a text retraction may end and what it must leave alone: `exclude` is
@@ -2539,6 +2551,7 @@ struct RetractionSink<'a> {
     exclude: &'a [i64],
     invalidated: &'a mut Vec<i64>,
     conflicts: &'a mut Vec<crate::engine::Conflict>,
+    hints: &'a mut Vec<String>,
 }
 
 /// Every name span in the text that names a known entity: this memory's
@@ -2571,10 +2584,15 @@ fn retraction_spans(db: &Db, content: &str, entities: &[EntityIn]) -> Result<Ret
     spans.retain(|(s, e, _)| !extra.spans.iter().any(|(xs, xe, _)| *xs <= *s && *xe >= *e));
     spans.extend(extra.spans);
     let ambiguous = extra.ambiguous;
+    let subject_alts = extra.subject_alts;
     // Longest span first at the same start, so "New York City" beats "New".
     spans.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     spans.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
-    Ok(RetractionSpans { spans, ambiguous })
+    Ok(RetractionSpans {
+        spans,
+        ambiguous,
+        subject_alts,
+    })
 }
 
 /// Spans for first names the text uses on their own ("Maria divorced Tom"):
@@ -2606,6 +2624,7 @@ fn first_name_spans(
     let supplied: HashSet<String> = entities.iter().map(|e| text::norm_name(&e.name)).collect();
     let mut extra = Vec::new();
     let mut ambiguous = HashSet::new();
+    let mut subject_alts: HashMap<(usize, usize), Vec<String>> = HashMap::new();
     for (first, mut candidates) in by_first {
         candidates.sort();
         candidates.dedup();
@@ -2618,13 +2637,16 @@ fn first_name_spans(
                 continue;
             }
             // Prefer the person this write supplied when the name is shared.
-            let norm = candidates
-                .iter()
-                .find(|n| supplied.contains(n.as_str()))
-                .unwrap_or(&candidates[0])
-                .clone();
+            let supplied_choice = candidates.iter().find(|n| supplied.contains(n.as_str()));
+            let norm = supplied_choice.unwrap_or(&candidates[0]).clone();
             if candidates.len() > 1 {
                 ambiguous.insert((start, end));
+                // A bare mention with no supplied full name: every stored
+                // person sharing the first name is a candidate at end time,
+                // so the holder of the mentioned object is found (H4-03).
+                if supplied_choice.is_none() {
+                    subject_alts.insert((start, end), candidates.clone());
+                }
             }
             extra.push((start, end, norm));
         }
@@ -2632,6 +2654,7 @@ fn first_name_spans(
     Ok(RetractionSpans {
         spans: extra,
         ambiguous,
+        subject_alts,
     })
 }
 
@@ -2728,154 +2751,175 @@ fn text_retractions(content: &str, spans: &RetractionSpans) -> Vec<TextRetractio
                 .nth(3)
                 .map(|w| w.1)
                 .unwrap_or(usize::MAX);
-            let mut object_span = spans
+            let mut object_candidates: Vec<(usize, usize, String)> = spans
                 .spans
                 .iter()
-                .find(|(s, _, _)| *s >= phrase_end && *s <= max_end)
-                .cloned();
+                .filter(|(s, _, _)| *s >= phrase_end && *s <= max_end)
+                .cloned()
+                .collect();
             let mut there_match = false;
             let mut there_pos = 0;
-            if object_span.is_none() {
-                if let Some(pos) = words
+            if object_candidates.is_empty() {
+                let there_span = words
                     .iter()
                     .skip(p + plen)
                     .take(4)
                     .position(|w| w.2 == "there")
-                {
-                    object_span = spans
-                        .spans
-                        .iter()
-                        .rev()
-                        .find(|(_, e, _)| *e <= phrase_start)
-                        .cloned();
-                    if object_span.is_some() {
-                        there_match = true;
-                        there_pos = p + plen + pos;
-                    }
+                    .and_then(|pos| {
+                        spans
+                            .spans
+                            .iter()
+                            .rev()
+                            .find(|(_, e, _)| *e <= phrase_start)
+                            .cloned()
+                            .map(|span| (span, p + plen + pos))
+                    });
+                if let Some((span, pos)) = there_span {
+                    object_candidates = vec![span];
+                    there_match = true;
+                    there_pos = pos;
                 }
             }
-            let Some((object_start, object_end, object)) = object_span else {
-                continue;
-            };
-            let mut candidate = spans.ambiguous.contains(&(object_start, object_end));
-            let mut verb: Option<String> = None;
-            let no_longer = phrase.last().is_some_and(|w| *w == "longer");
-            if there_match {
-                let vwords = &words[p + plen..there_pos];
-                if vwords.iter().any(|w| scope_word(w.2, no_longer)) {
-                    continue;
-                }
-                let there_end = words[there_pos].1;
-                // A scope after "there" ("on Fridays") means a partial
-                // retraction: nothing ends. Reuse the normal tail rule.
-                if matches!(
-                    object_tail(
-                        &lower,
-                        there_end,
-                        &words,
-                        there_pos + 1,
-                        group,
-                        &spans.spans
-                    ),
-                    ObjectTail::Noun
-                ) {
-                    continue;
-                }
-                if group.is_empty() {
-                    verb = verb_phrase(vwords);
-                }
-            } else if object_start >= phrase_end {
-                // A span may start before the name it normalises to ("the
-                // Acme" from the alias n-grams), so the gap and the tail are
-                // measured from different edges.
-                let gap_end = words.partition_point(|w| w.0 < object_start);
-                let next_word = words.partition_point(|w| w.0 < object_end);
-                let gap = &words[p + plen..gap_end];
-                // "no longer only" / "not only" ends nothing. The scope word
-                // must sit between the cue and the object, or immediately
-                // before the cue; one after the object is a trailing clause
-                // stating the new state ("no longer works at Acme, only at
-                // Brightline"), not a scope on the retracted assertion.
-                if gap.iter().any(|w| scope_word(w.2, no_longer))
-                    || (p > 0 && scope_word(words[p - 1].2, no_longer))
-                {
-                    continue;
-                }
-                let earlier = gap.split_last().map_or(gap, |(_, rest)| rest);
-                if earlier.iter().any(|w| OBJECT_DETERMINERS.contains(&w.2)) {
-                    continue;
-                }
-                // Rules 1+2: the object must be the whole object. A bare
-                // "left" also means "departed from" or "left behind", so it
-                // ends nothing unless a clause boundary, a time expression or
-                // an employment tail follows (rule 4).
-                if object_tail(&lower, object_end, &words, next_word, group, &spans.spans)
-                    == ObjectTail::Noun
-                {
-                    continue;
-                }
-                // Rule 3: a hedge or report before the cue ("almost quit",
-                // "thinks Bob left") is a candidate, not an end.
-                let clause = lower[..phrase_start]
-                    .char_indices()
-                    .rev()
-                    .find(|(_, c)| matches!(c, '.' | ';' | '!' | '?' | '\n'))
-                    .map(|(i, c)| i + c.len_utf8())
-                    .unwrap_or(0);
-                let from = words.partition_point(|w| w.0 < clause);
-                candidate |= hedged(&words, from, p);
-
-                if group.is_empty() {
-                    let vwords = if gap
-                        .last()
-                        .is_some_and(|w| OBJECT_DETERMINERS.contains(&w.2))
-                    {
-                        &gap[..gap.len() - 1]
-                    } else {
-                        gap
-                    };
-                    verb = verb_phrase(vwords);
-                    if verb.is_none() && VERB_REQUIRED_CUES.contains(phrase) {
+            // The nearest span can be a namesake of the object type ("IP" in
+            // "has IP address 10.0.0.1" is not the target): a span that fails
+            // the object rules for this candidate is skipped for the next one,
+            // so the real target further along still ends (H5-02).
+            for (object_start, object_end, object) in object_candidates {
+                let mut candidate = spans.ambiguous.contains(&(object_start, object_end));
+                let mut is_hedged = false;
+                let mut verb: Option<String> = None;
+                let no_longer = phrase.last().is_some_and(|w| *w == "longer");
+                if there_match {
+                    let vwords = &words[p + plen..there_pos];
+                    if vwords.iter().any(|w| scope_word(w.2, no_longer)) {
                         continue;
                     }
+                    let there_end = words[there_pos].1;
+                    // A scope after "there" ("on Fridays") means a partial
+                    // retraction: nothing ends. Reuse the normal tail rule.
+                    if matches!(
+                        object_tail(
+                            &lower,
+                            there_end,
+                            &words,
+                            there_pos + 1,
+                            group,
+                            &spans.spans
+                        ),
+                        ObjectTail::Noun
+                    ) {
+                        continue;
+                    }
+                    if group.is_empty() {
+                        verb = verb_phrase(vwords);
+                    }
+                } else if object_start >= phrase_end {
+                    // A span may start before the name it normalises to ("the
+                    // Acme" from the alias n-grams), so the gap and the tail are
+                    // measured from different edges.
+                    let gap_end = words.partition_point(|w| w.0 < object_start);
+                    let next_word = words.partition_point(|w| w.0 < object_end);
+                    let gap = &words[p + plen..gap_end];
+                    // "no longer only" / "not only" ends nothing. The scope word
+                    // must sit between the cue and the object, or immediately
+                    // before the cue; one after the object is a trailing clause
+                    // stating the new state ("no longer works at Acme, only at
+                    // Brightline"), not a scope on the retracted assertion.
+                    if gap.iter().any(|w| scope_word(w.2, no_longer))
+                        || (p > 0 && scope_word(words[p - 1].2, no_longer))
+                    {
+                        continue;
+                    }
+                    let earlier = gap.split_last().map_or(gap, |(_, rest)| rest);
+                    if earlier.iter().any(|w| OBJECT_DETERMINERS.contains(&w.2)) {
+                        continue;
+                    }
+                    // Rules 1+2: the object must be the whole object. A bare
+                    // "left" also means "departed from" or "left behind", so it
+                    // ends nothing unless a clause boundary, a time expression or
+                    // an employment tail follows (rule 4).
+                    if object_tail(&lower, object_end, &words, next_word, group, &spans.spans)
+                        == ObjectTail::Noun
+                    {
+                        continue;
+                    }
+                    // Rule 3: a hedge or report before the cue ("almost quit",
+                    // "thinks Bob left") is a candidate, not an end.
+                    let clause = lower[..phrase_start]
+                        .char_indices()
+                        .rev()
+                        .find(|(_, c)| matches!(c, '.' | ';' | '!' | '?' | '\n'))
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(0);
+                    let from = words.partition_point(|w| w.0 < clause);
+                    is_hedged = hedged(&words, from, p);
+                    candidate |= is_hedged;
+
+                    if group.is_empty() {
+                        let vwords = if gap
+                            .last()
+                            .is_some_and(|w| OBJECT_DETERMINERS.contains(&w.2))
+                        {
+                            &gap[..gap.len() - 1]
+                        } else {
+                            gap
+                        };
+                        verb = verb_phrase(vwords);
+                        if verb.is_none() && VERB_REQUIRED_CUES.contains(phrase) {
+                            continue;
+                        }
+                    }
                 }
-            }
-            let min_start = words.get(p.saturating_sub(10)).map(|w| w.0).unwrap_or(0);
-            let subject_found = spans
-                .spans
-                .iter()
-                .rev()
-                .find(|(s, e, name)| *e <= phrase_start && *s >= min_start && *name != object)
-                .cloned();
-            if let Some((subject_start, subject_end, subject)) = subject_found {
-                candidate |= spans.ambiguous.contains(&(subject_start, subject_end));
-                found.push((
-                    phrase_start,
-                    TextRetraction {
+                let min_start = words.get(p.saturating_sub(10)).map(|w| w.0).unwrap_or(0);
+                let subject_found = spans
+                    .spans
+                    .iter()
+                    .rev()
+                    .find(|(s, e, name)| *e <= phrase_start && *s >= min_start && *name != object)
+                    .cloned();
+                if let Some((subject_start, subject_end, subject)) = subject_found {
+                    candidate |= spans.ambiguous.contains(&(subject_start, subject_end));
+                    let subject_alts = spans
+                        .subject_alts
+                        .get(&(subject_start, subject_end))
+                        .cloned()
+                        .unwrap_or_default();
+                    let clone = TextRetraction {
                         subject,
                         object,
                         group,
                         verb,
                         noun: None,
                         candidate,
-                    },
-                ));
-            } else if there_match {
-                // "X no longer works there" with no other prior entity: X is the
-                // subject and "there" resolves to X's single live place for
-                // this verb/group (brief nc-h312r).
-                candidate |= spans.ambiguous.contains(&(object_start, object_end));
-                found.push((
-                    phrase_start,
-                    TextRetraction {
-                        subject: object,
-                        object: THERE.to_string(),
-                        group,
-                        verb,
-                        noun: None,
-                        candidate,
-                    },
-                ));
+                        hedged: is_hedged,
+                        subject_alts,
+                    };
+                    found.push((phrase_start, clone));
+                    break;
+                } else if there_match {
+                    // "X no longer works there" with no other prior entity: X is the
+                    // subject and "there" resolves to X's single live place for
+                    // this verb/group (brief nc-h312r).
+                    candidate |= spans.ambiguous.contains(&(object_start, object_end));
+                    found.push((
+                        phrase_start,
+                        TextRetraction {
+                            subject: object,
+                            object: THERE.to_string(),
+                            group,
+                            verb,
+                            noun: None,
+                            candidate,
+                            hedged: false,
+                            subject_alts: spans
+                                .subject_alts
+                                .get(&(object_start, object_end))
+                                .cloned()
+                                .unwrap_or_default(),
+                        },
+                    ));
+                    break;
+                }
             }
         }
     }
@@ -3012,6 +3056,8 @@ fn pair_retractions(
                     // Only the generic group needs the fact-noun filter.
                     noun: group.is_empty().then_some(noun),
                     candidate,
+                    hedged: false,
+                    subject_alts: Vec::new(),
                 },
             ));
         }
@@ -3092,44 +3138,93 @@ fn end_text_retractions(
         // inferred date ("divorced ... in 2024"): match it and let the
         // correction branch retire it. Ended rows still need to contain the
         // retraction date.
-        let mut st = db.sql().prepare(
-            "SELECT r.id, r.fact, r.valid_from, p.canonical, COALESCE(NULLIF(p.group_id,0),p.id)
-             FROM relations r
-             JOIN predicates p ON p.id=r.predicate_id
-             JOIN entities s ON s.id=r.src
-             JOIN entities d ON d.id=r.dst
-             WHERE r.expired_at IS NULL AND r.polarity=1
-               AND ((s.norm=?1 AND d.norm=?2) OR (s.norm=?2 AND d.norm=?1))
-               AND (r.valid_to IS NULL OR (r.valid_from<=?3 AND r.valid_to>?3))
-               AND (?4 IS NULL OR COALESCE(NULLIF(p.group_id,0),p.id)=?4)",
-        )?;
-        let rows: Vec<(i64, String, i64, String, i64)> = st
-            .query_map(
-                params![retraction.subject, retraction.object, at, group_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )?
-            .collect::<rusqlite::Result<_>>()?;
-        let rows: Vec<(i64, String, i64)> = rows
-            .into_iter()
-            .filter(|(rid, _, _, _, _)| !sink.exclude.contains(rid))
-            .filter(|(_, fact, _, _, _)| {
-                retraction.noun.is_none_or(|noun| {
-                    words_of(fact)
-                        .iter()
-                        .any(|w| w == noun || text::singularize(w) == noun)
+        let match_subject = |subject: &str| -> Result<Vec<(i64, String, i64)>> {
+            let mut st = db.sql().prepare(
+                "SELECT r.id, r.fact, r.valid_from, p.canonical, COALESCE(NULLIF(p.group_id,0),p.id)
+                 FROM relations r
+                 JOIN predicates p ON p.id=r.predicate_id
+                 JOIN entities s ON s.id=r.src
+                 JOIN entities d ON d.id=r.dst
+                 WHERE r.expired_at IS NULL AND r.polarity=1
+                   AND ((s.norm=?1 AND d.norm=?2) OR (s.norm=?2 AND d.norm=?1))
+                   AND (r.valid_to IS NULL OR (r.valid_from<=?3 AND r.valid_to>?3))
+                   AND (?4 IS NULL OR COALESCE(NULLIF(p.group_id,0),p.id)=?4)",
+            )?;
+            let rows: Vec<(i64, String, i64, String, i64)> = st
+                .query_map(params![subject, retraction.object, at, group_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(rows
+                .into_iter()
+                .filter(|(rid, _, _, _, _)| !sink.exclude.contains(rid))
+                .filter(|(_, fact, _, _, _)| {
+                    retraction.noun.is_none_or(|noun| {
+                        words_of(fact)
+                            .iter()
+                            .any(|w| w == noun || text::singularize(w) == noun)
+                    })
                 })
-            })
-            .filter(|(_, _, _, pred_canonical, pred_group_id)| {
-                if let Some(ref verb) = retraction.verb {
-                    verb_matches_relation(db, verb, pred_canonical, *pred_group_id).unwrap_or(false)
-                } else {
-                    true
+                .filter(|(_, _, _, pred_canonical, pred_group_id)| {
+                    if let Some(ref verb) = retraction.verb {
+                        verb_matches_relation(db, verb, pred_canonical, *pred_group_id)
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    }
+                })
+                .map(|(rid, fact, valid_from, _, _)| (rid, fact, valid_from))
+                .collect())
+        };
+        // A bare first name shared by several people (H4-03): the stated
+        // holder is only one candidate, so try every person behind the name.
+        // Exactly one of them holding the fact ends it (with a hint naming
+        // the full name); two or more conflict; none is a quiet no-op.
+        let (rows, chosen): (Vec<(i64, String, i64)>, Option<String>) =
+            if !retraction.subject_alts.is_empty() && !retraction.hedged {
+                let mut matched: Vec<(i64, String, i64, String)> = Vec::new();
+                let mut holders: Vec<String> = Vec::new();
+                for alt in &retraction.subject_alts {
+                    for (rid, fact, valid_from) in match_subject(alt)? {
+                        if !matched.iter().any(|(r, _, _, _)| *r == rid) {
+                            matched.push((rid, fact, valid_from, alt.clone()));
+                            if !holders.contains(alt) {
+                                holders.push(alt.clone());
+                            }
+                        }
+                    }
                 }
-            })
-            .map(|(rid, fact, valid_from, _, _)| (rid, fact, valid_from))
-            .collect();
+                if holders.len() == 1 {
+                    let holder = holders[0].clone();
+                    let display: String = db
+                        .sql()
+                        .query_row(
+                            "SELECT name FROM entities WHERE norm=?1 LIMIT 1",
+                            [&holder],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or_else(|_| holder.clone());
+                    (
+                        matched
+                            .into_iter()
+                            .map(|(rid, fact, valid_from, _)| (rid, fact, valid_from))
+                            .collect(),
+                        Some(display),
+                    )
+                } else {
+                    (
+                        matched
+                            .into_iter()
+                            .map(|(rid, fact, valid_from, _)| (rid, fact, valid_from))
+                            .collect(),
+                        None,
+                    )
+                }
+            } else {
+                (match_subject(&retraction.subject)?, None)
+            };
         match rows.as_slice() {
-            [(rid, _, old_from)] if !retraction.candidate => {
+            [(rid, _, old_from)] if !retraction.candidate || chosen.is_some() => {
                 if *old_from >= at {
                     // The recorded start is at or after the retraction date
                     // (ingest-time recording): retire the row as a correction
@@ -3146,6 +3241,11 @@ fn end_text_retractions(
                 }
                 if !sink.invalidated.contains(rid) {
                     sink.invalidated.push(*rid);
+                }
+                if let Some(full) = &chosen {
+                    sink.hints.push(format!(
+                        "first name is shared by several people: ended r{rid} held by {full}"
+                    ));
                 }
             }
             [] => {}
@@ -3218,8 +3318,9 @@ fn there_places(
 
 /// Check if the verb in a generic text retraction matches the relation's predicate:
 /// same predicate canonical, same predicate group in the database ontology,
-/// the same verb lemma (with compatible prepositions), or a retraction
-/// synonym pair ("heads"/"leads").
+/// the same verb lemma (with compatible prepositions), a retraction synonym
+/// pair ("heads"/"leads"), or a one-word prefix relation to the predicate's
+/// written surface ("has" ~ "has ip", "has ip address" ~ "has ip").
 fn verb_matches_relation(
     db: &Db,
     retract_verb: &str,
@@ -3246,17 +3347,54 @@ fn verb_matches_relation(
         }
     }
     let rv_words = words_of(retract_verb);
-    let pv_words = words_of(pred_canonical);
-    if rv_words.is_empty() || pv_words.is_empty() {
+    if rv_words.is_empty() {
         return Ok(false);
     }
-    if !same_verb(&rv_words[0], &pv_words[0]) {
-        return Ok(false);
+    // One is a prefix of the other: the bare verb of a multi-word predicate
+    // ("has" ~ "has ip"), or the predicate with the object's type noun after
+    // it ("has ip address" ~ "has ip": exactly one trailing noun). A longer
+    // phrase that continues into other words matches nothing.
+    let fits = |pv: &[String]| -> bool {
+        if pv.is_empty() || !same_verb(&rv_words[0], &pv[0]) {
+            return false;
+        }
+        if rv_words.len() <= 1 || pv.len() <= 1 {
+            return true;
+        }
+        if rv_words.len() <= pv.len() {
+            rv_words[..] == pv[..rv_words.len()]
+        } else {
+            pv[..] == rv_words[..pv.len()] && rv_words.len() == pv.len() + 1
+        }
+    };
+    if fits(&words_of(pred_canonical)) {
+        return Ok(true);
     }
-    if rv_words.len() > 1 && pv_words.len() > 1 {
-        return Ok(rv_words[1..] == pv_words[1..]);
+    // The canonical key drops auxiliaries ("has ip" -> "ip"), so also try the
+    // surfaces the predicate was written with ("has"): the bare verb above
+    // then matches through its display.
+    let mut st = db.sql().prepare(
+        "SELECT canonical, display FROM predicates
+         WHERE COALESCE(NULLIF(group_id,0),id)=?1",
+    )?;
+    let surfaces: Vec<(String, String)> = st
+        .query_map([pred_group_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (canonical, display) in &surfaces {
+        let base = if display.is_empty() {
+            canonical
+        } else {
+            display
+        };
+        let pv: Vec<String> = words_of(base)
+            .into_iter()
+            .map(|w| text::lemma_verb(&w))
+            .collect();
+        if fits(&pv) {
+            return Ok(true);
+        }
     }
-    Ok(true)
+    Ok(false)
 }
 
 pub fn check_embedder(db: &Db, emb: &dyn Embedder) -> Result<()> {
@@ -4485,6 +4623,11 @@ fn write_prepared(
     // relation the sentence names, or report candidates when the pair is
     // ambiguous. The relations this memory just evidenced are its own
     // assertion and are never retracted by its prose.
+    let mut hints = if content.len() > 2000 {
+        vec!["long content: consider splitting into atomic memories".into()]
+    } else {
+        Vec::new()
+    };
     if duplicate_of.is_none() && valid_to.is_none() {
         crate::wtiming::begin(crate::wtiming::RETRACTIONS);
         let own: Vec<i64> = rel_results.iter().map(|r: &RelationResult| r.id).collect();
@@ -4492,6 +4635,7 @@ fn write_prepared(
             exclude: &own,
             invalidated: &mut invalidated,
             conflicts: &mut conflicts,
+            hints: &mut hints,
         };
         end_text_retractions(db, &content, &entities, valid_from, now, &mut sink)?;
         crate::wtiming::end(crate::wtiming::RETRACTIONS);
@@ -4520,11 +4664,6 @@ fn write_prepared(
     crate::wtiming::end(crate::wtiming::FINALIZE);
     let possible_supersedes = if cfg.correction_hints && duplicate_of.is_none() {
         crate::correction::possible_supersedes(db, id, &content, valid_from)?
-    } else {
-        Vec::new()
-    };
-    let mut hints = if content.len() > 2000 {
-        vec!["long content: consider splitting into atomic memories".into()]
     } else {
         Vec::new()
     };

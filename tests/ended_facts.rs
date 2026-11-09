@@ -1545,3 +1545,235 @@ fn h4_02_year_and_date_tails_still_end_the_fact() {
 fn h4_02_count_before_a_time_unit_still_ends_the_fact() {
     assert!(figma_ended_by("Ivy Moss no longer uses Figma in 3 days."));
 }
+
+// ------------------------------------------------------------- nc-h5w
+
+fn host(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("host".into()),
+        ..Default::default()
+    }
+}
+
+fn ip(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("ip".into()),
+        ..Default::default()
+    }
+}
+
+fn server_has_ip(e: &Engine) -> i64 {
+    let out = e
+        .remember(RememberInput {
+            content: "Host server-01 has IP address 10.0.0.1.".into(),
+            valid_from: Some("2025-01-01".into()),
+            entities: vec![host("server-01"), ip("10.0.0.1")],
+            relations: vec![rel("server-01", "has ip", "10.0.0.1", true)],
+            ..Default::default()
+        })
+        .unwrap();
+    out.relations[0].id
+}
+
+#[test]
+fn h5_02_has_ip_address_retraction_ends_has_ip() {
+    let e = engine();
+    let rid = server_has_ip(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "server-01 no longer has IP address 10.0.0.1 on 2025-03-01.".into(),
+            valid_from: Some("2025-03-01".into()),
+            entities: vec![host("server-01"), ip("10.0.0.1")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "has IP address did not end has ip: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(1_740_787_200));
+}
+
+#[test]
+fn h5_02_bare_has_retraction_ends_has_ip() {
+    let e = engine();
+    let rid = server_has_ip(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "server-01 no longer has 10.0.0.1.".into(),
+            valid_from: Some("2025-03-01".into()),
+            entities: vec![host("server-01"), ip("10.0.0.1")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "bare has did not end has ip: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(1_740_787_200));
+}
+
+#[test]
+fn h5_02_has_a_car_does_not_end_has_ip() {
+    let e = engine();
+    let rid = server_has_ip(&e);
+    let out = e
+        .remember(RememberInput {
+            content: "server-01 no longer has a car.".into(),
+            valid_from: Some("2025-03-01".into()),
+            entities: vec![host("server-01"), tool("car")],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        !out.invalidated_relations.contains(&rid),
+        "has a car ended has ip: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}
+
+fn team(name: &str) -> EntityIn {
+    EntityIn {
+        name: name.into(),
+        kind: Some("team".into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn h4_03_only_one_priya_holds_the_payments_fact_so_it_ends() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Priya Raman leads the payments team.".into(),
+            valid_from: Some("2025-01-01".into()),
+            entities: vec![person("Priya Raman"), team("payments team")],
+            relations: vec![rel("Priya Raman", "leads", "payments team", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    e.remember(RememberInput {
+        content: "Priya Nandakumar leads the SRE group.".into(),
+        valid_from: Some("2025-01-02".into()),
+        entities: vec![person("Priya Nandakumar"), team("SRE group")],
+        relations: vec![rel("Priya Nandakumar", "leads", "SRE group", false)],
+        ..Default::default()
+    })
+    .unwrap();
+    let out = e
+        .remember(RememberInput {
+            content: "Priya no longer leads the payments team.".into(),
+            valid_from: Some("2025-03-01".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.contains(&rid),
+        "shared first name ended nothing: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), Some(1_740_787_200));
+    let fact: String =
+        e.db.sql()
+            .query_row("SELECT fact FROM relations WHERE id=?1", [rid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+    assert!(fact.contains("Priya Raman"), "wrong holder: {fact}");
+    assert!(
+        out.hints.iter().any(|h| h.contains("Priya Raman")),
+        "ending did not name the chosen holder: {out:?}"
+    );
+}
+
+#[test]
+fn h4_03_two_priyas_holding_the_fact_conflict_and_end_nothing() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Priya Raman leads the payments team.".into(),
+            valid_from: Some("2025-01-01".into()),
+            entities: vec![person("Priya Raman"), team("payments team")],
+            relations: vec![rel("Priya Raman", "leads", "payments team", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let out2 = e
+        .remember(RememberInput {
+            content: "Priya Nandakumar leads the payments team.".into(),
+            valid_from: Some("2025-01-02".into()),
+            entities: vec![person("Priya Nandakumar"), team("payments team")],
+            relations: vec![rel("Priya Nandakumar", "leads", "payments team", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let out = e
+        .remember(RememberInput {
+            content: "Priya no longer leads the payments team.".into(),
+            valid_from: Some("2025-03-01".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.is_empty(),
+        "both held, yet something ended: {out:?}"
+    );
+    assert_eq!(
+        out.conflicts.len(),
+        2,
+        "both holders must be named as conflicts: {out:?}"
+    );
+    assert_eq!(relation_end(&e, out1.relations[0].id), None);
+    assert_eq!(relation_end(&e, out2.relations[0].id), None);
+}
+
+#[test]
+fn h4_03_no_priya_holding_the_fact_is_a_quiet_no_op() {
+    let e = engine();
+    let out1 = e
+        .remember(RememberInput {
+            content: "Priya Raman leads the payments team.".into(),
+            valid_from: Some("2025-01-01".into()),
+            entities: vec![person("Priya Raman"), team("payments team")],
+            relations: vec![rel("Priya Raman", "leads", "payments team", false)],
+            ..Default::default()
+        })
+        .unwrap();
+    let rid = out1.relations[0].id;
+    e.remember(RememberInput {
+        content: "Priya Nandakumar leads the SRE group.".into(),
+        valid_from: Some("2025-01-02".into()),
+        entities: vec![person("Priya Nandakumar"), team("SRE group")],
+        relations: vec![rel("Priya Nandakumar", "leads", "SRE group", false)],
+        ..Default::default()
+    })
+    .unwrap();
+    e.remember(RememberInput {
+        content: "Tomasz Duda leads the database team.".into(),
+        valid_from: Some("2025-01-03".into()),
+        entities: vec![person("Tomasz Duda"), team("database team")],
+        relations: vec![rel("Tomasz Duda", "leads", "database team", false)],
+        ..Default::default()
+    })
+    .unwrap();
+    let out = e
+        .remember(RememberInput {
+            content: "Priya no longer leads the database team.".into(),
+            valid_from: Some("2025-03-01".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        out.invalidated_relations.is_empty(),
+        "object no Priya holds ended something: {out:?}"
+    );
+    assert!(
+        out.hints
+            .iter()
+            .all(|h| !h.contains("Priya Raman") && !h.contains("Priya Nandakumar")),
+        "quiet no-op named a holder: {out:?}"
+    );
+    assert_eq!(relation_end(&e, rid), None);
+}

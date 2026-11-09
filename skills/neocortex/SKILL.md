@@ -137,10 +137,13 @@ Store something when it will still matter next week:
   is never retracted by the same sentence. Cues that end a relation: "left his
   job at X", "left X" (work at), "quit X", "resigned from X", "moved out of X"
   (lives in), "divorced" / "broke up with" (married to), "sold X" (own),
-  "stopped using X", "gave up X", "no longer ..." (any predicate). A first name
+  "stopped using X", "gave up X", "no longer ..." (any predicate, including
+  multi-word ones: "no longer has IP address 10.0.0.1" ends "has ip
+  10.0.0.1"). A first name
   resolves through the entities you supplied and the stored people ("Maria
-  divorced Tom" with Maria Duarte and Tom Duarte), and a first name shared by
-  several people only returns a conflict. A pair before the cue ("Acme and
+  divorced Tom" with Maria Duarte and Tom Duarte). A first name shared by
+  several people only returns a conflict, unless exactly one of them holds
+  the fact named: that fact ends, with a hint naming the holder. A pair before the cue ("Acme and
   Northwind are no longer partners") ends the pair's relation. The name must be
   the whole object of the cue: "left the Acme office", "left Acme a voicemail"
   and "Acme's parking lot" end nothing, while a trailing date ("... no longer
