@@ -2836,6 +2836,134 @@ fn anchored_gold_reaches_top_k_despite_dense_crowding() {
     );
 }
 
+// A list question names a category by the tags the caller stored: its members
+// must reach the answer even when every one of them ranks far behind the
+// crowd's memories (nc-agg). Scale-gated (50k) and shape-gated like the anchor
+// channel, so the same store answers the same way with the channel off.
+fn tag_store(e: &Engine) -> Vec<i64> {
+    // The crowd: memories that repeat the question's words but are not the
+    // category (a policy note about vacations, not a trip taken).
+    for n in 0..12 {
+        remember(
+            e,
+            &format!(
+                "Personal vacation policy note {n}: request recreational days through the portal."
+            ),
+            |_| {},
+        );
+    }
+    let mut golds = Vec::new();
+    for (text, tag) in [
+        (
+            "Spent seven days in Paris during spring, admiring Impressionist masterpieces.",
+            "vacation",
+        ),
+        (
+            "Drove up Trail Ridge Road above twelve thousand feet during a camping trip.",
+            "vacation",
+        ),
+        (
+            "Took a five-day autumn vacation to London, staying in Covent Garden.",
+            "vacation",
+        ),
+        (
+            "Caught a Broadway performance of Hadestown and walked the High Line.",
+            "vacation",
+        ),
+    ] {
+        golds.push(remember(e, text, |i| i.tags = vec![tag.into()]));
+    }
+    // A career note that a loose prefix match ("care") would collect.
+    remember(
+        e,
+        "Sarah Mercer is a landscape painter and botanist.",
+        |i| i.tags = vec!["career".into()],
+    );
+    golds
+}
+
+#[test]
+fn a_list_question_reaches_its_tagged_members_at_scale() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    e.cfg.w_retention = 0.0;
+    at_scale(&e);
+    let golds = tag_store(&e);
+    let query = RecallInput {
+        query: "all personal vacations and recreational trips taken".into(),
+        k: Some(8),
+        ..Default::default()
+    };
+    e.cfg.w_tag = 0.0;
+    let off = e.recall(&query).unwrap();
+    let reached = golds.iter().filter(|g| ids(&off).contains(g)).count();
+    e.cfg.w_tag = 4.0;
+    let on = e.recall(&query).unwrap();
+    let on_reached = golds.iter().filter(|g| ids(&on).contains(g)).count();
+    assert!(
+        on_reached >= 3 && on_reached > reached,
+        "tag members must answer a list question: off {reached}/4, on {on_reached}/4"
+    );
+    assert!(
+        has_reason(&on, golds[0], "tag#"),
+        "a tagged member should carry the tag channel: {:?}",
+        on.memories
+            .iter()
+            .find(|m| m.id == golds[0])
+            .map(|m| &m.reasons)
+    );
+}
+
+#[test]
+fn the_tag_channel_is_shape_gated_and_exact() {
+    let mut e = engine(Arc::new(HashEmbedder));
+    e.cfg.w_retention = 0.0;
+    at_scale(&e);
+    tag_store(&e);
+    // A single-answer question that names the same tag word keeps the plain
+    // ranking: the category would flood it.
+    let single = RecallInput {
+        query: "which vacation trip was the longest".into(),
+        k: Some(5),
+        ..Default::default()
+    };
+    e.cfg.w_tag = 0.0;
+    let base = e.recall(&single).unwrap();
+    e.cfg.w_tag = 4.0;
+    let gated = e.recall(&single).unwrap();
+    assert_eq!(ids(&base), ids(&gated));
+    assert!(gated
+        .memories
+        .iter()
+        .all(|m| !m.reasons.iter().any(|r| r.starts_with("tag#"))));
+    // A habitual "every <occasion>" asks for one member too: the tag word it
+    // names ("vacation") must not collect the whole category (round 2).
+    let habitual = RecallInput {
+        query: "which vacation did Ana take every winter".into(),
+        k: Some(5),
+        ..Default::default()
+    };
+    e.cfg.w_tag = 0.0;
+    let habitual_base = serde_json::to_string(&e.recall(&habitual).unwrap()).unwrap();
+    e.cfg.w_tag = 4.0;
+    let habitual_on = serde_json::to_string(&e.recall(&habitual).unwrap()).unwrap();
+    assert_eq!(
+        habitual_base, habitual_on,
+        "a habitual every <occasion> question must be byte-identical with w_tag=0"
+    );
+    // A list question whose word only prefixes a tag ("care" / `career`) does
+    // not collect that category.
+    let prefix = RecallInput {
+        query: "all personal care arrangements".into(),
+        k: Some(8),
+        ..Default::default()
+    };
+    let out = e.recall(&prefix).unwrap();
+    assert!(out
+        .memories
+        .iter()
+        .all(|m| !m.reasons.iter().any(|r| r.starts_with("tag#"))));
+}
+
 #[test]
 fn anchor_knob_parses_and_defaults_on() {
     let mut cfg = Config::default();

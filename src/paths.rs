@@ -479,6 +479,124 @@ fn memory_verb_negation(words: &[&str], i: usize) -> bool {
     matches!(words[i + 1], "remember" | "recall" | "recollect")
 }
 
+/// A time or occasion after "all"/"every"/"each" makes the cue habitual
+/// ("every winter", "after each show", "all evening"), not a request for a
+/// whole category; "every single day" and "each and every day" reach it
+/// through one modifier.
+const OCCASIONS: [&str; 52] = [
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "year",
+    "years",
+    "hour",
+    "hours",
+    "minute",
+    "minutes",
+    "second",
+    "seconds",
+    "decade",
+    "decades",
+    "morning",
+    "mornings",
+    "afternoon",
+    "afternoons",
+    "evening",
+    "evenings",
+    "night",
+    "nights",
+    "weekend",
+    "weekends",
+    "spring",
+    "springs",
+    "summer",
+    "summers",
+    "autumn",
+    "autumns",
+    "fall",
+    "winter",
+    "winters",
+    "season",
+    "seasons",
+    "time",
+    "times",
+    "show",
+    "shows",
+    "visit",
+    "visits",
+    "occasion",
+    "occasions",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+];
+
+/// True when the cue at `tokens[i]` quantifies the asked-for thing rather than
+/// an occasion: "all personal vacations", "every X that", "each of the X" are
+/// lists; "every winter", "after each show" are habitual.
+fn cue_quantifies_list(tokens: &[String], i: usize) -> bool {
+    let mut j = i + 1;
+    match tokens.get(j).map(String::as_str) {
+        Some("single" | "other") => j += 1,
+        // "each and every day": the later cue decides.
+        Some("and")
+            if matches!(
+                tokens.get(j + 1).map(String::as_str),
+                Some("all" | "every" | "each")
+            ) =>
+        {
+            return false;
+        }
+        _ => {}
+    }
+    match tokens.get(j).map(String::as_str) {
+        Some(word) => !OCCASIONS.contains(&word),
+        None => false,
+    }
+}
+
+/// True when the question asks for a whole category rather than one member
+/// ("all personal vacations", "grants and funding sources", "who works in the
+/// Solberg Lab"). The `tag` channel (`recall.rs`) names a category by the tags
+/// the caller stored, which answers a list question and floods a single-answer
+/// one ("does she prefer rowing or kayaking now" names the `rowing` tag but
+/// wants one of the two), so it runs only on this shape.
+pub fn aggregate_intent(query: &str) -> bool {
+    let tokens: Vec<String> = text::tokens(query)
+        .into_iter()
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.iter().enumerate().any(|(i, t)| match t.as_str() {
+        // "list everything" / "what does everyone use" never quantify time.
+        "everything" | "everyone" | "list" => true,
+        "all" | "every" | "each" => cue_quantifies_list(&tokens, i),
+        _ => false,
+    }) {
+        return true;
+    }
+    let plural =
+        |t: &str| t.chars().count() >= 3 && !text::is_stopword(t) && text::singularize(t) != t;
+    let partitive =
+        tokens.first().is_some_and(|t| plural(t)) && tokens.get(1).is_some_and(|t| t == "of");
+    let coordinated = tokens.iter().filter(|t| plural(t)).count() >= 2
+        && tokens.iter().any(|t| t == "and" || t.ends_with(','));
+    // "who works in the lab" asks for the members of one group.
+    let membership = tokens.first().is_some_and(|t| t == "who")
+        && tokens.iter().take(5).any(|t| t == "work" || t == "works")
+        && tokens
+            .iter()
+            .take(5)
+            .any(|t| t == "in" || t == "at" || t == "for");
+    partitive || coordinated || membership
+}
+
 /// True when the question asks for a cause ("why did X happen", "what caused
 /// X", "reason for X"). E4b uses this to surface causal evidence first.
 pub fn causal_intent(query: &str) -> bool {
@@ -2769,6 +2887,69 @@ mod tests {
             }],
             coverage: 1,
             score,
+        }
+    }
+
+    #[test]
+    fn aggregate_intent_names_the_list_questions() {
+        // The eval/fixtures.json and eval/holdout.json aggregation queries that
+        // this shape recognises (the two holdout misses - "major equipment in
+        // the lab", "family members and their news" - are unchanged: turning
+        // them on would activate the tag channel and move the measured holdout
+        // number).
+        for q in [
+            "all personal vacations and recreational trips taken",
+            "members of Alex's immediate and extended family",
+            "friends and running partners in Alex's social circle",
+            "technical outages, incidents, and engineering mistakes",
+            "all computing hardware and mobile tech devices owned",
+            "database engines used or managed across all projects",
+            "running milestones, race completions, and athletic gear purchases",
+            "who works in the Solberg Lab",
+            "external collaborators and partner groups",
+            "grants and funding sources",
+            "papers and written outputs",
+            "lab mishaps and lessons",
+            "list the employers Carla Bischand has had",
+            // The cue quantifies the asked-for thing, not an occasion.
+            "list all the tools the lab owns",
+            "every paper that cites the Krios",
+            "what are all the databases in use",
+            "each of the projects I led",
+            "all the hardware I own",
+        ] {
+            assert!(aggregate_intent(q), "{q:?}");
+        }
+        // A single member is not a category: the tag channel would flood it.
+        for q in [
+            "does she prefer rowing or kayaking now",
+            "which conferences did Ingrid attend this year",
+            "what database does my sister's team use",
+            "which microscope came before the Krios",
+            "father's teaching career",
+            "who is Alex's employer",
+            "what is the home ground of the club where Rui's son plays",
+        ] {
+            assert!(!aggregate_intent(q), "{q:?}");
+        }
+    }
+
+    #[test]
+    fn habitual_every_each_is_not_a_list_question() {
+        // Round 2: a habitual "every/each <time or occasion>" asks for one
+        // member; the tag channel would flood it with the whole category.
+        for q in [
+            "Where does Ola Berg live and mend nets each evening?",
+            "Which fair does the employer of Kim Ruud run every year?",
+            "Which stall does Ana Lima's son visit every winter?",
+            "Which song does Tom Reed play after each show?",
+            "Which team does Priya coach every summer?",
+            "What does the crew inspect each morning?",
+            "Who does Marta meet for coffee every Friday?",
+            "Which route does the courier take every single day?",
+            "What does she practise each and every evening?",
+        ] {
+            assert!(!aggregate_intent(q), "{q:?}");
         }
     }
 
