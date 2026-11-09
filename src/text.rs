@@ -93,27 +93,23 @@ fn drop_caps_plurals(s: &str) -> String {
 /// "c plus plus" (see `expand_symbols`), so a tool named "C#" never shares a
 /// card with "C", "C++" or "F#".
 pub fn norm_name(s: &str) -> String {
-    norm_name_inner(s, true)
-}
-
-/// Comparison-only key that keeps the last token's surface form (no singular).
-/// Person surnames ("Parks", "Leeds") are names; singularising them collapses
-/// distinct people (H4-01). The stored/lookup key remains `norm_name` for DB
-/// compatibility; resolution uses this only to detect a collapsed surname.
-pub(crate) fn identity_norm(s: &str) -> String {
-    norm_name_inner(s, false)
-}
-
-fn norm_name_inner(s: &str, singular_last: bool) -> String {
     let folded = fold(&expand_symbols(&drop_caps_plurals(strip_possessive(s))));
     let mut words = name_words(&folded);
     if words.is_empty() {
         return folded;
     }
-    if singular_last {
-        if let Some(last) = words.last_mut() {
-            *last = singularize(last);
-        }
+    if let Some(last) = words.last_mut() {
+        *last = singularize(last);
+    }
+    canon_versions(&words.join(" "))
+}
+
+/// Comparison-only key that does not singularise the last token (H4-01).
+pub(crate) fn identity_norm(s: &str) -> String {
+    let folded = fold(&expand_symbols(&drop_caps_plurals(strip_possessive(s))));
+    let words = name_words(&folded);
+    if words.is_empty() {
+        return folded;
     }
     canon_versions(&words.join(" "))
 }

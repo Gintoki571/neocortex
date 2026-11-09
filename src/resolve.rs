@@ -27,13 +27,6 @@ fn type_key(kind: Option<&str>) -> String {
     kind.map(|k| k.trim().to_lowercase()).unwrap_or_default()
 }
 
-/// Stored identity key: always the canonical singularized norm so read-side
-/// lookups, alias storage and existing databases stay consistent. Person
-/// surname-collapse merges are blocked in resolution, not by changing keys.
-fn norm_for(s: &str, _kind: &str) -> String {
-    text::norm_name(s)
-}
-
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -516,10 +509,7 @@ fn folded_surname(name: &str) -> String {
         .to_string()
 }
 
-/// H4-01: ER-08 evidence for a person surname-collapsed exact match, judged on
-/// identity norms (unsingularised last token). The translit-key shortcut is
-/// skipped when the collapsed singularised norms would falsely match; only a
-/// shared person/org neighbour in the same write corroborates.
+/// H4-01: a surname-collapsed person pair is corroborated by translit-equal norms or an ER-08 shared neighbour.
 fn person_corroborated(
     db: &Db,
     a_id: &str,
@@ -527,8 +517,6 @@ fn person_corroborated(
     entity_id: i64,
     write_names: &[String],
 ) -> Result<bool> {
-    // If the identity norms are translit-equal, it is the same spelling in
-    // different scripts/orthography - not a surname collapse.
     if text::translit_norm(a_id) == text::translit_norm(b_id) {
         return Ok(true);
     }
@@ -666,16 +654,16 @@ pub fn resolve_entity(
     semantic: bool,
     write_names: &[String],
 ) -> Result<Resolved> {
-    let kind = type_key(item.kind.as_deref());
-    let norm = norm_for(&item.name, &kind);
+    let norm = text::norm_name(&item.name);
     if norm.is_empty() {
         return Err(crate::err!("entity name cannot be empty"));
     }
+    let kind = type_key(item.kind.as_deref());
     let exclude = resolve_distinct_from(db, &item.distinct_from)?;
 
     if let Some(forced) = item.same_as.as_deref() {
         let id = resolve_same_as(db, forced)?;
-        add_aliases(db, id, item, &kind, "agent")?;
+        add_aliases(db, id, item, "agent")?;
         enrich(db, id, item, now)?;
         return Ok(Resolved {
             id,
@@ -687,19 +675,13 @@ pub fn resolve_entity(
 
     let mut norms = vec![norm.clone()];
     for alias in &item.aliases {
-        let alias_norm = norm_for(alias, &kind);
+        let alias_norm = text::norm_name(alias);
         if !alias_norm.is_empty() && !norms.contains(&alias_norm) {
             norms.push(alias_norm);
         }
     }
     let mut exact = exact_match(db, &norms, &kind, &exclude)?;
-    // H4-01: a person exact-norm hit can be a different surname hidden by
-    // singularisation ("Parks"/"Park") because the stored key stays singularised
-    // for DB compatibility. Only block when the collision is on the candidate's
-    // primary name (its stored norm == the mention norm): an alias match (e.g. a
-    // merged former name) is a legitimate resolution, not a surname collapse.
-    // Without ER-08 corroboration the collapsed form is a different person:
-    // create a new entity reported ambiguous with the collided candidate.
+    // H4-01: a singularised key hides a different surname ("Parks"/"Park"); require ER-08 corroboration.
     if !exact.is_empty() && PERSON_TYPES.contains(&kind.as_str()) {
         let placeholders = vec!["?"; exact.len()].join(",");
         let sql = format!("SELECT id,norm,name FROM entities WHERE id IN ({placeholders})");
@@ -711,30 +693,25 @@ pub fn resolve_entity(
                 r.get::<_, String>(2)?,
             ))
         })?;
-        let mut keep = Vec::with_capacity(exact.len());
         let mut collided: Vec<i64> = Vec::new();
         for row in rows {
             let (id, cand_norm, cand_name) = row?;
-            let primary_collision = cand_norm == norm;
-            let same_surname = folded_surname(&item.name) == folded_surname(&cand_name);
-            let blocked = primary_collision
-                && !same_surname
+            let surname_collision =
+                cand_norm == norm && folded_surname(&item.name) != folded_surname(&cand_name);
+            if surname_collision
                 && !person_corroborated(
                     db,
                     &text::identity_norm(&item.name),
                     &text::identity_norm(&cand_name),
                     id,
                     write_names,
-                )?;
-            if blocked {
+                )?
+            {
                 collided.push(id);
-            } else {
-                keep.push(id);
             }
         }
-        // keep ids that weren't in the entities table (shouldn't happen) out of
-        // collided handling; preserve original order where possible.
-        if keep.is_empty() && !collided.is_empty() {
+        exact.retain(|id| !collided.contains(id));
+        if exact.is_empty() && !collided.is_empty() {
             let id = insert_entity(db, item, &norm, &kind, embedding, now)?;
             let meta = entity_meta(db, &collided)?;
             let scores = score_against(db, &collided, embedding)?;
@@ -744,14 +721,6 @@ pub fn resolve_entity(
                 similar: Vec::new(),
                 candidates: candidates_with_scores(&collided, &meta, &scores),
             });
-        }
-        // If some kept, some collided: drop collided (different collapsed person),
-        // keep legitimate matches. If a collision was dropped but others kept,
-        // we still resolve to the kept one(s).
-        if !collided.is_empty() {
-            exact.retain(|id| !collided.contains(id));
-        } else {
-            exact = keep;
         }
     }
     if !exact.is_empty() {
@@ -774,7 +743,7 @@ pub fn resolve_entity(
                     r.get(0)
                 })?;
         let name_matched = canonical == norm;
-        add_aliases(db, chosen, item, &kind, "agent")?;
+        add_aliases(db, chosen, item, "agent")?;
         let conflict = description_conflict(db, chosen, item, embedding, cfg, semantic)?;
         if ambiguous || conflict {
             if conflict && candidates.is_empty() {
@@ -801,7 +770,7 @@ pub fn resolve_entity(
 
     // EX-04: a unique alias prefix resolves on write as it does on read.
     if let Some(id) = unique_prefix(db, &norm, &item.name, &kind, &exclude)? {
-        add_aliases(db, id, item, &kind, "prefix")?;
+        add_aliases(db, id, item, "prefix")?;
         enrich(db, id, item, now)?;
         return Ok(Resolved {
             id,
@@ -869,10 +838,9 @@ pub fn resolve_entity(
         if PERSON_TYPES.contains(&kind.as_str())
             && !near_corroborated(db, &norm, &entity_norm, id, write_names)?
         {
-            // A typo-sized near-name of a person merges only with ER-08
-            // corroboration; fall through to ER-07/ambiguous.
+            // A typo-sized person near-name merges only with ER-08 corroboration; fall through.
         } else {
-            add_aliases(db, id, item, &kind, "lexical")?;
+            add_aliases(db, id, item, "lexical")?;
             enrich(db, id, item, now)?;
             return Ok(Resolved {
                 id,
@@ -883,7 +851,7 @@ pub fn resolve_entity(
         }
     }
     if let Some((id, _)) = acronym {
-        add_aliases(db, id, item, &kind, "acronym")?;
+        add_aliases(db, id, item, "acronym")?;
         enrich(db, id, item, now)?;
         return Ok(Resolved {
             id,
@@ -933,7 +901,7 @@ pub fn resolve_entity(
         }
     }
     if let Some((id, _)) = merged {
-        add_aliases(db, id, item, &kind, "near")?;
+        add_aliases(db, id, item, "near")?;
         enrich(db, id, item, now)?;
         return Ok(Resolved {
             id,
@@ -1108,7 +1076,7 @@ fn insert_entity(
         params![norm, id],
     )?;
     for alias in &item.aliases {
-        let alias_norm = norm_for(alias, kind);
+        let alias_norm = text::norm_name(alias);
         if alias_norm.is_empty() {
             continue;
         }
@@ -1440,11 +1408,7 @@ fn unique_prefix(
 /// Record one more name for an entity, e.g. the nickname a relation would
 /// otherwise store as a self-loop (H2-18).
 pub(crate) fn add_alias(db: &Db, id: i64, alias: &str, origin: &str) -> Result<()> {
-    let kind: String = db
-        .sql()
-        .query_row("SELECT type FROM entities WHERE id=?1", [id], |r| r.get(0))
-        .unwrap_or_default();
-    let norm = norm_for(alias, &kind);
+    let norm = text::norm_name(alias);
     if norm.is_empty() {
         return Ok(());
     }
@@ -1460,10 +1424,10 @@ pub(crate) fn add_alias(db: &Db, id: i64, alias: &str, origin: &str) -> Result<(
 
 /// Add the mention's name and aliases to an entity. Never touches
 /// `mention_count` (the caller counts mention rows).
-fn add_aliases(db: &Db, id: i64, item: &EntityIn, kind: &str, origin: &str) -> Result<()> {
+fn add_aliases(db: &Db, id: i64, item: &EntityIn, origin: &str) -> Result<()> {
     let mut changed = false;
     for alias in std::iter::once(&item.name).chain(item.aliases.iter()) {
-        let norm = norm_for(alias, kind);
+        let norm = text::norm_name(alias);
         if norm.is_empty() {
             continue;
         }
