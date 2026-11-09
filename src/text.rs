@@ -104,6 +104,16 @@ pub fn norm_name(s: &str) -> String {
     canon_versions(&words.join(" "))
 }
 
+/// Comparison-only key that does not singularise the last token (H4-01).
+pub(crate) fn identity_norm(s: &str) -> String {
+    let folded = fold(&expand_symbols(&drop_caps_plurals(strip_possessive(s))));
+    let words = name_words(&folded);
+    if words.is_empty() {
+        return folded;
+    }
+    canon_versions(&words.join(" "))
+}
+
 /// A version token: an optional `v` before digits (and dots), "v16", "016",
 /// "3.12". VERSIONS-V1 folds the spelling before any name comparison, so
 /// "Postgres 16", "Postgres v16" and "Postgres 016" share one key; "v2 API"

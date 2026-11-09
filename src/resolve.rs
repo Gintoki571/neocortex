@@ -501,6 +501,28 @@ pub(crate) fn near_name(
     }
 }
 
+fn folded_surname(name: &str) -> String {
+    text::fold(text::strip_possessive(name))
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// H4-01: a surname-collapsed person pair is corroborated by translit-equal norms or an ER-08 shared neighbour.
+fn person_corroborated(
+    db: &Db,
+    a_id: &str,
+    b_id: &str,
+    entity_id: i64,
+    write_names: &[String],
+) -> Result<bool> {
+    if text::translit_norm(a_id) == text::translit_norm(b_id) {
+        return Ok(true);
+    }
+    shared_neighbour(db, a_id, entity_id, write_names)
+}
+
 /// True when the two names differ only in version or number tokens: "Postgres
 /// 14"/"Postgres 16", "Python 3.12"/"3.13", "API v1"/"v2". A letter label
 /// ("Apt 3B"/"Apt 3C") is not a version token and stays a digit blocker.
@@ -658,7 +680,49 @@ pub fn resolve_entity(
             norms.push(alias_norm);
         }
     }
-    let exact = exact_match(db, &norms, &kind, &exclude)?;
+    let mut exact = exact_match(db, &norms, &kind, &exclude)?;
+    // H4-01: a singularised key hides a different surname ("Parks"/"Park"); require ER-08 corroboration.
+    if !exact.is_empty() && PERSON_TYPES.contains(&kind.as_str()) {
+        let placeholders = vec!["?"; exact.len()].join(",");
+        let sql = format!("SELECT id,norm,name FROM entities WHERE id IN ({placeholders})");
+        let mut st = db.sql().prepare(&sql)?;
+        let rows = st.query_map(params_from_iter(exact.iter()), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut collided: Vec<i64> = Vec::new();
+        for row in rows {
+            let (id, cand_norm, cand_name) = row?;
+            let surname_collision =
+                cand_norm == norm && folded_surname(&item.name) != folded_surname(&cand_name);
+            if surname_collision
+                && !person_corroborated(
+                    db,
+                    &text::identity_norm(&item.name),
+                    &text::identity_norm(&cand_name),
+                    id,
+                    write_names,
+                )?
+            {
+                collided.push(id);
+            }
+        }
+        exact.retain(|id| !collided.contains(id));
+        if exact.is_empty() && !collided.is_empty() {
+            let id = insert_entity(db, item, &norm, &kind, embedding, now)?;
+            let meta = entity_meta(db, &collided)?;
+            let scores = score_against(db, &collided, embedding)?;
+            return Ok(Resolved {
+                id,
+                status: "ambiguous".into(),
+                similar: Vec::new(),
+                candidates: candidates_with_scores(&collided, &meta, &scores),
+            });
+        }
+    }
     if !exact.is_empty() {
         let (chosen, ambiguous, mut candidates) =
             choose_exact(db, &exact, &kind, embedding, context)?;
@@ -769,17 +833,29 @@ pub fn resolve_entity(
             acronym = Some((*id, *score));
         }
     }
-    if let Some((id, _)) = lexical.or(acronym) {
-        let status = if lexical.is_some() {
-            "lexical"
+    if let Some((id, _)) = lexical {
+        let entity_norm = norms.get(&id).cloned().unwrap_or_default();
+        if PERSON_TYPES.contains(&kind.as_str())
+            && !near_corroborated(db, &norm, &entity_norm, id, write_names)?
+        {
+            // A typo-sized person near-name merges only with ER-08 corroboration; fall through.
         } else {
-            "acronym"
-        };
-        add_aliases(db, id, item, status)?;
+            add_aliases(db, id, item, "lexical")?;
+            enrich(db, id, item, now)?;
+            return Ok(Resolved {
+                id,
+                status: "lexical".into(),
+                similar: Vec::new(),
+                candidates: Vec::new(),
+            });
+        }
+    }
+    if let Some((id, _)) = acronym {
+        add_aliases(db, id, item, "acronym")?;
         enrich(db, id, item, now)?;
         return Ok(Resolved {
             id,
-            status: status.into(),
+            status: "acronym".into(),
             similar: Vec::new(),
             candidates: Vec::new(),
         });
