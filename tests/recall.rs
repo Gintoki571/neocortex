@@ -2794,6 +2794,21 @@ fn the_tag_channel_is_shape_gated_and_exact() {
         .memories
         .iter()
         .all(|m| !m.reasons.iter().any(|r| r.starts_with("tag#"))));
+    // A habitual "every <occasion>" asks for one member too: the tag word it
+    // names ("vacation") must not collect the whole category (round 2).
+    let habitual = RecallInput {
+        query: "which vacation did Ana take every winter".into(),
+        k: Some(5),
+        ..Default::default()
+    };
+    e.cfg.w_tag = 0.0;
+    let habitual_base = serde_json::to_string(&e.recall(&habitual).unwrap()).unwrap();
+    e.cfg.w_tag = 4.0;
+    let habitual_on = serde_json::to_string(&e.recall(&habitual).unwrap()).unwrap();
+    assert_eq!(
+        habitual_base, habitual_on,
+        "a habitual every <occasion> question must be byte-identical with w_tag=0"
+    );
     // A list question whose word only prefixes a tag ("care" / `career`) does
     // not collect that category.
     let prefix = RecallInput {

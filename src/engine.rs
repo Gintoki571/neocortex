@@ -185,9 +185,10 @@ pub struct Config {
     /// Only a tag on at most `TAG_CATEGORY_MAX` memories counts, so the
     /// world's hub tags ("travel", "employment") are never a category; the
     /// channel runs only on an `aggregate_intent` question (a single-answer
-    /// preference that names the same tag would be flooded) and only at
-    /// `ANCHOR_MIN_MEMORIES` or more, so small stores and every other question
-    /// stay byte-identical. 0 disables it for A/B measurement.
+    /// preference that names the same tag would be flooded, and so would a
+    /// habitual "every winter"/"after each show", which is not a list), and
+    /// only at `ANCHOR_MIN_MEMORIES` or more, so small stores and every other
+    /// question stay byte-identical. 0 disables it for A/B measurement.
     pub w_tag: f64,
 }
 

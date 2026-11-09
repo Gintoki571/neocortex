@@ -717,6 +717,57 @@ small store (only the pre-existing nondeterministic `context tokens/query` wobbl
 Reproduce: `neocortex eval eval/fixtures.json --load-db <haystack copy> --failures`,
 then the same with `--set w_tag=0` for the A/B.
 
+## After nc-agg round 2: a habitual every/each is not a list question (2026-11-09)
+
+The round-1 shape fired on any `all`/`every`/`each`, so a habitual single-answer
+question ("... each evening?", "... after each show?", "... every year?")
+pushed the whole tag category into its top 10 and cost a blind-set two-hop
+answer (acc@10 -1, MRR down). Fix (`src/paths.rs`): an `all`/`every`/`each`
+cue counts as a list cue only when the next word (through a `single`/`other`
+modifier, and deferring a chained `each and every` to the later cue) is not a
+time/occasion noun or weekday (`OCCASIONS`, 52 entries: day..decade,
+morning..night, weekend, seasons, time, show, visit, occasion, monday..sunday);
+`everything`/`everyone`/`list` are unchanged. An `all/every/each` whose next
+word is `of`/`the`/a noun stays a list cue, as are the pre-existing
+partitive/coordinated-plural/membership shapes. Comment: `cue_quantifies_list`
+in `src/paths.rs`.
+
+Aggregation-category queries in the two gate sets still trigger, and habitual
+paraphrases no longer do (`habitual_every_each_is_not_a_list_question`,
+`aggregate_intent_names_the_list_questions`, both in `src/paths.rs`). Trigger
+counts before vs after the fix are identical (`examples/agg_intent_counts.rs`,
+logs `lanes/tmp/nc-agg/r2-count-before.log` / `r2-count-after.log`):
+
+| set | fired | aggregation fired |
+|---|---|---|
+| fixtures | 9/84 | 7/7 |
+| holdout | 5/88 | 5/7 ("major equipment in the lab", "family members and their news" are bare plural noun phrases with no cue and never fired) |
+| multihop-holdout | 0/80 | - |
+| multihop-holdout2 | 0/100 | - |
+
+`tests/recall.rs` `the_tag_channel_is_shape_gated_and_exact` now also pins a
+habitual "which vacation did Ana take every winter" query byte-identical with
+`w_tag=0` at the 50k store-size gate. Inside the 108k haystack (real model,
+`NEOCORTEX_VEC=int8`, `--haystack w10k-int8.db`, logs `lanes/tmp/nc-agg/r2-hay-*.log`):
+
+| inside the 108k store | w_tag=4.0 (fix) | w_tag=0 |
+|---|---|---|
+| fixtures aggregation recall / MRR | **0.6497 / 1.000** | 0.4497 / 0.878 |
+| holdout aggregation recall / MRR | **0.5020 / 0.583** | 0.3469 / 0.429 |
+| mh1 acc@10 | 0.900 (per category identical to round 1) | - |
+| mh2 (blind) acc@10 | **0.650** (per category identical to round 1) | - |
+
+A scripted per-category diff of `def` vs `ctl` in both haystack sets shows
+`aggregation` is the ONLY category that moves (fixtures overall 0.885/0.852 vs
+0.869/0.842; holdout overall 0.847/0.715 vs 0.834/0.703, as in round 1). One
+caveat: the first `fixtures-def` run ingested onto a cold page cache while the
+machine was otherwise busy and reported p50 929 ms vs ctl 294 ms; query
+latency is not a gate for `--haystack` runs (the paired round-1 measurement
+stands at +0.2% median). The mh2 attempt failed once with "database or disk is
+full" (the shared E partition hit 96-98% during another lane's build) and was
+re-run successfully; the numbers above are from the successful retry (log
+`r2-hay-mh2-def2.log`).
+
 ## Reproduce
 
 ```bash
